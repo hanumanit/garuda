@@ -112,6 +112,9 @@ cargo run --release -- benchmark --iterations 40 --tokens 32
 cargo test
 ```
 
+For prerequisites, installing onto your PATH, running a real model, and
+troubleshooting, see [INSTALL.md](INSTALL.md).
+
 Configuration lives in [`garuda/config.toml`](garuda/config.toml). Every key
 reaches something; an unknown key is a startup error rather than being silently
 ignored.
