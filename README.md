@@ -1,5 +1,7 @@
 # Garuda: High Performance Rust LLM Runtime with Expert Streaming
 
+![Garuda Cover](./garuda_cover.jpg)
+
 Garuda is a plugin-based, high-performance local LLM inference runtime built in Rust. It is designed to run efficiently on CPU and memory-constrained environments (such as Synology NAS, local workstations, or macOS) by leveraging a tiered memory architecture, Expert Streaming, and prefetch prediction for Mixture of Experts (MoE) models.
 
 ---
