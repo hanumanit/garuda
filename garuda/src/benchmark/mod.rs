@@ -1,67 +1,180 @@
-use std::time::Instant;
-use std::sync::Arc;
-use crate::memory::MemoryManager;
-use crate::runtime::InferenceRuntime;
-use crate::moe::MoeEngine;
-use crate::tokenizer::Tokenizer;
-use crate::predictor::ExpertPredictor;
-use crate::prefetch::PrefetchEngine;
+//! Microbenchmarks.
+//!
+//! Every number printed here is measured. The previous version printed
+//! `Cache Hit  >95%  100.0%  PASS` as a string literal — it never looked at the
+//! cache. Where a figure cannot be measured, it is not printed.
+//!
+//! Throughput figures describe *this* model: a one-block, 128-dim MoE with
+//! untrained weights. They say something about the runtime's overhead and nothing
+//! at all about how a real 8x7B checkpoint would perform.
 
-pub async fn run_benchmarks(iterations: usize) {
-    println!("=== Starting Garuda High Performance Benchmarks ===");
-    
-    let start_time = Instant::now();
-    let l1_capacity = 32;
-    let ssd_path = std::env::temp_dir().join("garuda_ssd_cache");
-    let hdd_path = std::env::temp_dir().join("garuda_hdd_archive");
-    let _ = std::fs::create_dir_all(&ssd_path);
-    let _ = std::fs::create_dir_all(&hdd_path);
+use crate::config::AppConfig;
+use crate::core::ExpertLoader;
+use crate::runtime::{SamplingParams, StopReason};
+use crate::server::Engine;
+use std::time::{Duration, Instant};
 
-    let memory_manager = Arc::new(MemoryManager::new(l1_capacity, ssd_path, hdd_path));
-    let tokenizer = Tokenizer::new();
-    let predictor = ExpertPredictor::new(8);
-    let prefetch_engine = PrefetchEngine::new(memory_manager.clone(), predictor);
-    let moe_engine = Arc::new(MoeEngine::new(crate::router::RouterType::Mixtral, 8, 2, memory_manager.clone()));
-    let runtime = Arc::new(InferenceRuntime::new(tokenizer, moe_engine, prefetch_engine));
-    let startup_dur = start_time.elapsed();
-    println!("Startup Time: {:.2?}", startup_dur);
+pub fn run(config: &AppConfig, iterations: usize, tokens_per_iter: usize) -> anyhow::Result<()> {
+    let iterations = iterations.max(1);
+    let tokens_per_iter = tokens_per_iter.max(1);
 
-    let load_start = Instant::now();
-    let _ = memory_manager.get_expert(1);
-    let load_dur = load_start.elapsed();
-    println!("Load Expert Latency (cold/simulated): {:.2?}", load_dur);
+    println!("=== Garuda benchmark ===");
+    println!(
+        "model: {} experts, top-{}, d_model {}, vocab {} (untrained weights)",
+        config.model.experts,
+        config.model.top_k,
+        crate::core::ModelDims::default().d_model,
+        crate::tokenizer::VOCAB_SIZE,
+    );
+    println!();
 
-    let load_start_warm = Instant::now();
-    let _ = memory_manager.get_expert(1);
-    let load_dur_warm = load_start_warm.elapsed();
-    println!("Load Expert Latency (L1 Cache hit): {:.2?}", load_dur_warm);
+    let t0 = Instant::now();
+    let engine = Engine::build(config)?;
+    let startup = t0.elapsed();
+    println!("startup                {startup:>12.2?}");
 
-    let prompt = "Garuda is a high performance LLM Runtime with Expert Streaming.";
-    let tokens = runtime.tokenizer.encode(prompt).unwrap_or_default();
-    
-    let mut total_latency = std::time::Duration::default();
-    let mut hits = 0;
-    
-    for _ in 0..iterations {
-        let step_start = Instant::now();
-        let _ = runtime.forward(&tokens);
-        total_latency += step_start.elapsed();
-        hits += 1;
+    // Cold: nothing is in L1 and no expert file exists yet, so this is synthesis
+    // plus a write to L2. Warm: straight out of L1.
+    let t = Instant::now();
+    engine.memory.load(0)?;
+    let cold = t.elapsed();
+
+    let t = Instant::now();
+    engine.memory.load(0)?;
+    let warm = t.elapsed();
+
+    // Evict it, then measure the real L2 read path.
+    engine.memory.unload(0);
+    let t = Instant::now();
+    engine.memory.load(0)?;
+    let from_l2 = t.elapsed();
+
+    println!("expert load (cold)     {cold:>12.2?}");
+    println!("expert load (L2 read)  {from_l2:>12.2?}");
+    println!("expert load (L1 hit)   {warm:>12.2?}");
+    println!();
+
+    let params = SamplingParams {
+        max_tokens: tokens_per_iter,
+        seed: Some(0xBEEF),
+        ..config.sampling()?
+    };
+
+    let prompt = engine
+        .runtime
+        .tokenizer
+        .encode("Garuda is an inference runtime with tiered expert storage.");
+
+    // Warm the pipeline so the first iteration's expert synthesis does not skew the
+    // decode numbers.
+    {
+        let mut s = engine.runtime.start(&prompt, &params)?;
+        while engine.runtime.next_token(&mut s, &params).is_ok() {}
     }
 
-    let avg_latency = total_latency / (iterations as u32);
-    let token_count = tokens.len() * iterations;
-    let tokens_per_sec = (token_count as f32) / total_latency.as_secs_f32();
+    let mut total = Duration::ZERO;
+    let mut generated = 0usize;
+    let mut first_token = Duration::ZERO;
+    let mut stops = (0usize, 0usize);
 
-    println!("Avg Step Latency: {:.2?}", avg_latency);
-    println!("Token Throughput: {:.2} tok/s", tokens_per_sec);
-    println!("Cache hit ratio (L1 RAM): {:.1}%", (hits as f32 / iterations as f32) * 100.0);
+    for _ in 0..iterations {
+        let start = Instant::now();
+        let mut session = engine.runtime.start(&prompt, &params)?;
 
-    println!("=== Benchmark Target Comparison ===");
-    println!("Metric\t\tTarget\t\tActual\t\tStatus");
-    println!("Startup\t\t< 1 sec\t\t{:.2?}\t\t{}", startup_dur, if startup_dur.as_secs() < 1 { "PASS" } else { "FAIL" });
-    println!("Load Expert\t< 5 ms\t\t{:.2?}\t\t{}", load_dur_warm, if load_dur_warm.as_millis() < 5 { "PASS" } else { "FAIL" });
-    println!("Cache Hit\t>95%\t\t100.0%\t\tPASS");
-    println!("Token Latency\t< 25 ms\t\t{:.2?}\t\t{}", avg_latency / (tokens.len() as u32), if (avg_latency / (tokens.len() as u32)).as_millis() < 25 { "PASS" } else { "FAIL" });
-    println!("Throughput\t>300 tok/s\t{:.2} tok/s\t{}", tokens_per_sec, if tokens_per_sec >= 300.0 { "PASS" } else { "FAIL" });
+        let mut n = 0;
+        loop {
+            let step = Instant::now();
+            match engine.runtime.next_token(&mut session, &params) {
+                Ok(_) => {
+                    if n == 0 {
+                        first_token += step.elapsed();
+                    }
+                    n += 1;
+                }
+                Err(StopReason::Eos) => {
+                    stops.0 += 1;
+                    break;
+                }
+                Err(_) => {
+                    stops.1 += 1;
+                    break;
+                }
+            }
+        }
+        total += start.elapsed();
+        generated += n;
+    }
+
+    let per_token = if generated > 0 {
+        total / generated as u32
+    } else {
+        Duration::ZERO
+    };
+    let tok_per_sec = generated as f64 / total.as_secs_f64();
+
+    println!("prompt                 {:>12} tokens", prompt.len());
+    println!("generated              {generated:>12} tokens over {iterations} runs");
+    println!(
+        "time to first token    {:>12.2?}",
+        first_token / iterations as u32
+    );
+    println!("per-token latency      {per_token:>12.2?}");
+    println!("throughput             {tok_per_sec:>12.1} tok/s");
+    println!(
+        "stopped on eos/length  {:>12}",
+        format!("{} / {}", stops.0, stops.1)
+    );
+    println!();
+
+    let l1 = engine.memory.l1_stats();
+    let tiers = engine.memory.tier_counts();
+    println!("--- expert cache (measured) ---");
+    println!("l1 hit ratio           {:>12.1}%", l1.hit_ratio() * 100.0);
+    println!(
+        "l1 hits / misses       {:>12}",
+        format!("{} / {}", l1.hits, l1.misses)
+    );
+    println!("l1 evictions           {:>12}", l1.evictions);
+    println!(
+        "l1 resident            {:>12}",
+        format!("{} experts, {} KiB", l1.entries, l1.bytes / 1024)
+    );
+    println!(
+        "loads by tier          {:>12}",
+        format!(
+            "l1 {} / l2 {} / l3 {} / synth {}",
+            tiers.l1, tiers.l2, tiers.l3, tiers.synthesised
+        )
+    );
+
+    let prompt_cache = engine.runtime.prompt_cache_stats();
+    println!(
+        "prompt cache           {:>12}",
+        format!(
+            "{:.0}% hit ({} / {})",
+            prompt_cache.hit_ratio() * 100.0,
+            prompt_cache.hits,
+            prompt_cache.hits + prompt_cache.misses
+        )
+    );
+
+    if let Some(pf) = &engine.prefetch {
+        let s = pf.predictor_stats();
+        println!();
+        println!("--- prefetch (measured) ---");
+        println!(
+            "launched / skipped     {:>12}",
+            format!("{} / {}", pf.launched(), pf.skipped())
+        );
+        if s.correct + s.wasted > 0 {
+            println!("precision              {:>12.1}%", s.precision() * 100.0);
+            println!("recall                 {:>12.1}%", s.recall() * 100.0);
+        } else {
+            println!("precision              {:>12}", "n/a (no predictions made)");
+        }
+    } else {
+        println!("prefetch               {:>12}", "disabled");
+    }
+
+    Ok(())
 }

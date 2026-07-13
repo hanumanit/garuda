@@ -1,34 +1,37 @@
 [package]
 name = "garuda"
-version = "0.1.0"
-edition = "2024"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Rust MoE inference runtime with tiered expert storage (no trained weights)"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
-tokio = { version = "1.38", features = ["full"] }
+tokio = { version = "1.38", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
 axum = { version = "0.7", features = ["ws", "macros"] }
-dashmap = "5.5"
-rayon = "1.10"
-memmap2 = "0.9"
-bytes = "1.6"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+async-stream = "0.3"
+futures-util = { version = "0.3", default-features = false }
+
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+toml = "0.8"
+
+rayon = "1.10"
 parking_lot = "0.12"
+blake3 = "1.5"
+
+clap = { version = "4.5", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "1.0"
-clap = { version = "4.5", features = ["derive"] }
-uuid = { version = "1.8", features = ["v4"] }
-crossbeam = "0.8"
-lru = "0.12"
-blake3 = "1.5"
-zstd = "0.13"
 anyhow = "1.0"
-tower-http = { version = "0.5", features = ["cors", "trace"] }
-futures-util = "0.3"
-tokio-stream = "0.1"
-headers = "0.4"
-toml = "0.8"
-async-stream = "0.3"
+uuid = { version = "1.8", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { version = "1.38", features = ["full", "test-util"] }
+tower = { version = "0.4", features = ["util"] }
+http-body-util = "0.1"
 
 [profile.dev]
 debug = 0
@@ -36,5 +39,11 @@ debug = 0
 [profile.test]
 debug = 0
 
-
-
+# The forward pass is a tight loop over f32 slices; without these it is not worth
+# measuring. `lto = "fat"` with a single codegen unit lets LLVM inline the kernels
+# in `simd` into their call sites and vectorise them.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true

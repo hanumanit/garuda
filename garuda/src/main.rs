@@ -1,72 +1,153 @@
-use std::sync::Arc;
-use std::net::SocketAddr;
+use anyhow::Context;
 use clap::Parser;
-use tracing::{info, Level};
-use tracing_subscriber::FmtSubscriber;
-use garuda::config::AppConfig;
-use garuda::cli::{Cli, Commands};
-use garuda::memory::MemoryManager;
-use garuda::tokenizer::Tokenizer;
-use garuda::predictor::ExpertPredictor;
-use garuda::prefetch::PrefetchEngine;
-use garuda::moe::MoeEngine;
-use garuda::runtime::InferenceRuntime;
-use garuda::scheduler::Scheduler;
 use garuda::api::{create_router, ApiState};
+use garuda::cli::{Cli, Commands};
+use garuda::config::AppConfig;
+use garuda::scheduler::Scheduler;
+use garuda::server::{configure_thread_pool, Engine};
 use garuda::websocket::create_ws_router;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tracing::{info, warn};
+use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)?;
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_env("GARUDA_LOG").unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
 
     let args = Cli::parse();
-    info!("Garuda LLM Runtime starting up...");
 
-    let config = if args.config.exists() {
-        info!("Loading configuration from {:?}", args.config);
-        AppConfig::load_from_toml(&args.config)?
+    let mut config = if args.config.exists() {
+        info!(path = %args.config.display(), "loading configuration");
+        AppConfig::load(&args.config)?
     } else {
-        info!("Configuration file {:?} not found, using defaults", args.config);
+        info!(path = %args.config.display(), "no configuration file; using defaults");
         AppConfig::default()
     };
 
-    if let Some(Commands::Benchmark { iterations }) = args.command {
-        garuda::benchmark::run_benchmarks(iterations).await;
-        return Ok(());
+    if let Some(host) = args.host {
+        config.server.host = host;
     }
+    if let Some(port) = args.port {
+        config.server.port = port;
+    }
+    config.validate()?;
+    configure_thread_pool(config.runtime.threads);
 
-    let l1_capacity = 32;
-    let ssd_path = std::path::PathBuf::from(&config.model.path).join("ssd_cache");
-    let hdd_path = std::path::PathBuf::from(&config.model.path).join("hdd_archive");
-    let _ = std::fs::create_dir_all(&ssd_path);
-    let _ = std::fs::create_dir_all(&hdd_path);
+    match args.command {
+        Some(Commands::Benchmark { iterations, tokens }) => {
+            garuda::benchmark::run(&config, iterations, tokens)
+        }
+        Some(Commands::Inspect { file }) => inspect(&file),
+        Some(Commands::Serve) | None => serve(config).await,
+    }
+}
 
-    let memory_manager = Arc::new(MemoryManager::new(l1_capacity, ssd_path, hdd_path));
-    let tokenizer = Tokenizer::new();
-    let predictor = ExpertPredictor::new(8);
-    let prefetch_engine = PrefetchEngine::new(memory_manager.clone(), predictor);
-    let moe_engine = Arc::new(MoeEngine::new(garuda::router::RouterType::Mixtral, 8, 2, memory_manager.clone()));
-    
-    let runtime = Arc::new(InferenceRuntime::new(tokenizer, moe_engine, prefetch_engine));
-    let scheduler = Arc::new(Scheduler::new(runtime.clone()));
+fn inspect(path: &std::path::Path) -> anyhow::Result<()> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let gguf = garuda::gguf::Gguf::parse(&bytes)?;
+
+    println!("file          {}", path.display());
+    println!("gguf version  {}", gguf.version);
+    println!(
+        "architecture  {}",
+        gguf.architecture().unwrap_or("(unknown)")
+    );
+    if let Some(n) = gguf.expert_count() {
+        println!(
+            "experts       {n} (top-{})",
+            gguf.expert_used_count().unwrap_or(0)
+        );
+    }
+    println!("tensors       {}", gguf.tensors.len());
+    println!("metadata keys {}", gguf.metadata.len());
+    println!("data offset   {}", gguf.data_offset);
+    println!();
+    println!("Garuda can read this file's metadata but cannot load its weights:");
+    println!("nothing dequantises GGUF tensors into experts yet.");
+    Ok(())
+}
+
+async fn serve(config: AppConfig) -> anyhow::Result<()> {
+    let engine = Engine::build(&config)?;
+    info!(
+        experts = config.model.experts,
+        top_k = config.model.top_k,
+        context = config.model.context,
+        router = %config.model.router,
+        prefetch = engine.prefetch.is_some(),
+        "engine ready"
+    );
+    warn!(
+        "this runtime has no trained weights: generated text is meaningless. \
+         it also has no authentication."
+    );
+
+    let scheduler = Scheduler::new(engine.runtime.clone(), config.scheduler());
 
     let state = Arc::new(ApiState {
-        runtime,
+        runtime: engine.runtime.clone(),
         scheduler,
+        defaults: config.sampling()?,
+        request_timeout: config.request_timeout(),
+        started: std::time::Instant::now(),
     });
 
-    let app = create_router(state.clone())
-        .merge(create_ws_router())
-        .layer(axum::Extension(state));
+    let mut app = create_router(state.clone()).merge(create_ws_router(state));
 
-    let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
-    info!("Garuda API Server listening on {}", addr);
-    
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
+    if config.server.cors {
+        warn!("permissive CORS is enabled and this server has no auth");
+        app = app.layer(tower_http::cors::CorsLayer::permissive());
+    }
+    app = app.layer(tower_http::trace::TraceLayer::new_for_http());
 
+    let addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port)
+        .parse()
+        .with_context(|| {
+            format!(
+                "invalid bind address {}:{}",
+                config.server.host, config.server.port
+            )
+        })?;
+
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("binding {addr}"))?;
+    info!(%addr, "listening");
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .context("server error")?;
+
+    info!("shut down");
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install the ctrl-c handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install the SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    info!("shutdown signal received");
 }

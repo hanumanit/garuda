@@ -1,122 +1,159 @@
-# Garuda: High Performance Rust LLM Runtime with Expert Streaming
+# Garuda — a Rust MoE inference runtime with tiered expert storage
 
 ![Garuda Cover](./garuda_cover.jpg)
 
-Garuda is a plugin-based, high-performance local LLM inference runtime built in Rust. It is designed to run efficiently on CPU and memory-constrained environments by leveraging a tiered memory architecture, Expert Streaming, and prefetch prediction for Mixture of Experts (MoE) models.
+Garuda is an inference **engine** for Mixture-of-Experts models: a scheduler, a
+tiered expert cache, a paged KV cache, and an OpenAI-compatible API, written in
+Rust.
+
+## Read this first
+
+**Garuda has no trained model.** It cannot load one yet. The transformer
+arithmetic is real — causal multi-head attention with RoPE, top-k MoE routing,
+SwiGLU experts, a KV cache that spills to disk, temperature/top-k/top-p sampling
+— but it runs over weights that are pseudo-random and deterministic. **The text it
+generates is meaningless.** That is by construction, not a bug.
+
+What is real is everything *around* the weights: the scheduling, the memory
+tiering, the caching, the streaming, the cancellation, the load shedding. That is
+what this codebase is for. It is an honest skeleton with a real skeleton's
+mechanics — and a clearly marked hole where the model goes.
+
+| | Status |
+|---|---|
+| Transformer forward pass (attention, RoPE, MoE, SwiGLU, sampling) | Real, tested |
+| Tiered expert storage (L1 RAM → L2 disk → L3 archive) | Real, tested |
+| Paged KV cache with disk spill | Real, tested |
+| Scheduler (priority, concurrency limits, cancellation, timeouts, backpressure) | Real, tested |
+| OpenAI-compatible API + SSE + WebSocket | Real, tested |
+| GGUF metadata + tensor descriptors | Parsed correctly |
+| **Loading GGUF weights (dequantisation)** | **Not implemented** |
+| **Trained model / meaningful output** | **Not implemented** |
+| **GPU backend** | **Not implemented** (`gpu = true` is a startup error) |
+| **Authentication** | **Not implemented** — do not expose this to a network |
+
+The gap between this and a usable runtime is one thing: turning GGUF's quantised
+tensor blocks into `weights::Expert`. Everything else is waiting for it.
 
 ---
 
-## Architecture Diagram
+## Architecture
 
 ```mermaid
 graph TD
-    User([Client / Coding Agent]) -->|REST / SSE / WS| API[API layer: Axum Server]
-    API -->|Submit Request| Sched[Scheduler: Priority Queue]
-    Sched -->|Batch & Stream| Engine[Inference Runtime]
-    
-    subgraph Engine Pipeline
-        Tokenizer[Tokenizer] --> PromptCache[Prompt Cache]
-        PromptCache --> KVCache[Paged KV Cache / Disk Spill]
-        KVCache --> Router[Router: Mixtral/DeepSeek/Qwen]
-        Router --> ExpertLoader[Expert Loader]
-        ExpertLoader --> Inference[Inference Core]
-        Inference --> Sampler[Sampler]
+    Client([Client]) -->|REST / SSE / WS| API[axum API]
+    API -->|submit| Sched[Scheduler: priority heap,<br/>bounded concurrency]
+    Sched -->|one token at a time| RT[Runtime: decode loop + sampler]
+
+    subgraph Forward pass
+        RT --> Embed[Embedding]
+        Embed --> Attn[Causal MHA + RoPE]
+        Attn --> Router[Router: mixtral / deepseek / qwen]
+        Router --> Experts[Top-k SwiGLU experts]
+        Experts --> Logits[Tied output head]
     end
-    
-    subgraph Memory Manager
-        L1[L1 RAM: Hot Experts / KV Cache] <--> L2[L2 SSD: Warm Experts / GGUF]
-        L2 <--> L3[L3 HDD: Cold Experts / Archive]
-    end
-    
-    Inference -->|Async Request| L1
-    Predictor[Predictor] -->|Pre-loads predicted experts| Prefetch[Prefetch Engine]
-    Prefetch -->|Async load L2/L3 to L1| L1
+
+    Attn <-->|read / append| KV[Paged KV cache]
+    KV -.->|spill / reload| Disk[(Disk)]
+
+    Experts -->|load| MM[Memory manager]
+    MM --> L1[L1 RAM: byte-budgeted LRU]
+    L1 -.->|miss| L2[L2 disk cache]
+    L2 -.->|miss| L3[L3 archive]
+
+    Experts -->|experts used| Pred[Markov predictor]
+    Pred -->|likely next experts| Pre[Prefetcher]
+    Pre -.->|warm in background| L1
 ```
+
+**Expert streaming** means what it says: a token pulls in only the `top_k` experts
+it routes to, through the tiered cache — not the whole layer. The predictor learns
+a first-order Markov model over which experts actually fire, and the prefetcher
+warms its guesses on a background thread while the current token is still
+computing. A wrong guess costs one wasted load and can never change the output.
 
 ---
 
-## Core Features
+## Getting started
 
-- **OpenAI Compatible API**: Fully compatible with OpenAI REST specifications, including Server-Sent Events (SSE) chat streaming.
-- **WebSocket Streaming**: Exposes `/v1/ws` for low-latency bi-directional token streaming and client-side cancellation.
-- **Plugin-Based Trait System**: Abstracted core engine traits (`StorageBackend`, `InferenceBackend`) allow hot-swapping computational backends (CPU, CUDA, Vulkan, Metal) without changing the core scheduler or router.
-- **Expert Streaming**: Sequentially loads and processes MoE experts one token-step at a time, preventing RAM bandwidth bottlenecks.
-- **Tiered Memory Manager**: Automatically tiers model weights across L1 (RAM), L2 (SSD Cache), and L3 (HDD/NAS Archive) utilizing memory mapping (`mmap()`).
-- **Expert Prefetch Engine**: Employs a state transition predictor to look ahead and load required experts asynchronously from L2/L3 to L1 RAM before execution.
-- **Multi-user Priority Scheduler**: Implements a concurrent scheduler with priority-sorted queuing, batch merging, cancellation propagation, timeouts, and rate limits.
-
----
-
-## Getting Started
-
-### 1. Configuration (`config.toml`)
-Configure the system by creating a configuration file:
-```toml
-[model]
-path = "/models"
-context = 32768
-gpu = false
-threads = 8
-expert_cache = "256GB"
-prefetch = true
-predictor = true
-```
-
-### 2. Running the API Server
-Start the REST API and WebSocket streaming gateways:
 ```bash
-cargo run --bin garuda -- serve --port 8080 --host 127.0.0.1
-```
+cd garuda
 
-### 3. Running Microbenchmarks
-Evaluate startup times, expert loading latencies, memory cache hits, and token generation throughput:
-```bash
-cargo run --bin garuda -- benchmark --iterations 100
-```
+# Run the API server (config.toml is read if present)
+cargo run --release -- serve
 
-### 4. Running Integration Tests
-Validate the tokenizer, MoE execution pipeline, and scheduler:
-```bash
+# Measure startup, expert-load latency, cache behaviour and decode throughput
+cargo run --release -- benchmark --iterations 40 --tokens 32
+
+# Read a GGUF file's metadata (weights cannot be loaded yet)
+cargo run --release -- inspect model.gguf
+
 cargo test
 ```
 
+Configuration lives in [`garuda/config.toml`](garuda/config.toml). Every key
+reaches something; an unknown key is a startup error rather than being silently
+ignored.
+
 ---
 
-## API Endpoints
+## API
 
-### 1. Chat Completions (REST & SSE)
-- **Endpoint**: `POST /v1/chat/completions`
-- **Body**:
-```json
-{
-  "model": "garuda-moe-v1",
-  "messages": [
-    { "role": "user", "content": "Explain Mixture of Experts." }
-  ],
-  "stream": true
-}
+OpenAI-compatible where it counts: `created` is a real timestamp, streams end with
+the `data: [DONE]` sentinel SDKs wait for, `usage` is reported, `finish_reason`
+says what actually happened, and errors arrive in OpenAI's error envelope with the
+status code clients act on — `429` for rate limits, `503` when the queue is full.
+
+| Endpoint | Notes |
+|---|---|
+| `POST /v1/chat/completions` | `stream: true` for SSE |
+| `POST /v1/completions` | |
+| `POST /v1/embeddings` | Real pooled hidden states. Untrained, so they carry no meaning — see below |
+| `GET /v1/models` | |
+| `GET /v1/stats` | Measured scheduler and cache counters |
+| `GET /health` | |
+| `WS /v1/ws` | Bidirectional streaming with `{"cancel": true}` |
+
+```bash
+curl -s localhost:8080/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"messages":[{"role":"user","content":"hello"}],"max_tokens":16,"stream":true}'
 ```
 
-### 2. WebSocket Streaming (WS)
-- **Endpoint**: `WS /v1/ws`
-- **Client payload**:
-```json
-{
-  "prompt": "Explain Mixture of Experts.",
-  "priority": "high"
-}
-```
-- **Server response**:
-```json
-{
-  "token": "Explain",
-  "error": null,
-  "done": false
-}
-```
+Two extensions beyond the OpenAI shape:
 
-### 3. Models List
-- **Endpoint**: `GET /v1/models`
+- `X-Garuda-User` identifies the caller for per-user concurrency limits. Absent, everyone
+  shares the `anonymous` bucket. **This is not authentication** — anyone can claim any
+  name. It is a fairness knob, not a security control.
+- `"priority": "low" | "normal" | "high"` on any request.
 
-### 4. Embeddings
-- **Endpoint**: `POST /v1/embeddings`
+**About `/v1/embeddings`:** the vectors are genuine — a real forward pass, mean
+of the final hidden state, L2-normalised. They are also *useless*, because the
+weights are untrained: two similar sentences have no reason to land near each
+other. The endpoint returns the right shape, computed the right way, from a model
+that knows nothing. It exists so the plumbing is exercised, not so you can search
+with it.
+
+---
+
+## Where the model would go
+
+1. **Dequantise GGUF tensors.** [`gguf`](garuda/src/gguf/mod.rs) already reads the
+   header, metadata and tensor descriptors correctly, with every length bounds-checked.
+   What is missing is the block-format decoders (`Q4_K`, `Q6_K`, …) that turn tensor
+   data into `f32`.
+2. **Replace weight synthesis.** [`weights::ModelWeights::synthesize`](garuda/src/weights/mod.rs)
+   and `synthesize_expert` are the only two functions that invent values. Point them
+   at the dequantised tensors and the rest of the pipeline does not move.
+3. **Load the real tokenizer.** [`tokenizer`](garuda/src/tokenizer/mod.rs) is byte-level:
+   lossless and bounded, but not the BPE the checkpoint was trained with. The merge table
+   is in the GGUF metadata.
+4. **Support more than one block.** [`moe`](garuda/src/moe/mod.rs) runs a single
+   transformer block. Real models stack dozens; the loop is the easy part, the weight
+   layout is the work.
+
+---
+
+## Licence
+
+MIT OR Apache-2.0

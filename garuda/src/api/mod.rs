@@ -1,14 +1,130 @@
+//! OpenAI-compatible HTTP API.
+//!
+//! Compatible in the ways that make clients work: `created` is a real timestamp,
+//! streaming ends with the `data: [DONE]` sentinel the SDKs wait for, `usage` is
+//! reported, `finish_reason` says what actually happened, and errors come back in
+//! OpenAI's error envelope with the status code clients retry on (429 for rate
+//! limits, 503 when the queue is full).
+//!
+//! The one place it deliberately differs: there is no authentication. Do not put
+//! this on a public interface.
+
+use crate::core::GarudaError;
+use crate::runtime::{InferenceRuntime, SamplingParams};
+use crate::scheduler::{Priority, RequestSpec, Scheduler, StreamEvent};
+use crate::tokenizer::StreamDecoder;
 use axum::{
+    extract::State,
+    http::StatusCode,
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     routing::{get, post},
-    Router, Json, Extension,
-    response::{sse::{Event, Sse}, IntoResponse},
+    Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot};
-use uuid::Uuid;
-use crate::runtime::InferenceRuntime;
-use crate::scheduler::{Scheduler, Request, Priority};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+pub const MODEL_ID: &str = "garuda-moe-v1";
+
+pub struct ApiState {
+    pub runtime: Arc<InferenceRuntime>,
+    pub scheduler: Arc<Scheduler>,
+    /// Applied when the request does not override them.
+    pub defaults: SamplingParams,
+    pub request_timeout: Duration,
+    pub started: std::time::Instant,
+}
+
+pub type SharedState = Arc<ApiState>;
+
+pub fn create_router(state: SharedState) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/v1/models", get(models))
+        .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/completions", post(completions))
+        .route("/v1/embeddings", post(embeddings))
+        .route("/v1/stats", get(stats))
+        .with_state(state)
+}
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+struct ErrorBody {
+    message: String,
+    r#type: String,
+    code: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ErrorEnvelope {
+    error: ErrorBody,
+}
+
+/// Map a domain error onto the status code a client should act on.
+fn error_response(e: &GarudaError) -> Response {
+    let (status, kind, code) = match e {
+        GarudaError::RateLimit => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            "rate_limit_exceeded",
+        ),
+        GarudaError::Busy => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "queue_full",
+        ),
+        GarudaError::Timeout => (StatusCode::GATEWAY_TIMEOUT, "server_error", "timeout"),
+        GarudaError::Cancelled => (
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "cancelled",
+        ),
+        GarudaError::Config(_) | GarudaError::InvalidToken(_) | GarudaError::Inference(_) => (
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "invalid_request",
+        ),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "internal_error",
+        ),
+    };
+
+    (
+        status,
+        Json(ErrorEnvelope {
+            error: ErrorBody {
+                message: e.to_string(),
+                r#type: kind.to_owned(),
+                code: code.to_owned(),
+            },
+        }),
+    )
+        .into_response()
+}
+
+fn bad_request(msg: impl Into<String>) -> Response {
+    error_response(&GarudaError::Inference(msg.into()))
+}
+
+// ---------------------------------------------------------------------------
+// Wire types
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -16,328 +132,547 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+/// The sampling knobs every OpenAI-shaped request may carry.
+#[derive(Debug, Default, Deserialize)]
+struct SamplingOverrides {
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<usize>,
+    max_tokens: Option<usize>,
+    seed: Option<u64>,
+    /// Garuda extension: `low`, `normal`, `high`.
+    priority: Option<String>,
+}
+
+impl SamplingOverrides {
+    fn apply(&self, base: SamplingParams) -> Result<SamplingParams, GarudaError> {
+        let p = SamplingParams {
+            temperature: self.temperature.unwrap_or(base.temperature),
+            top_p: self.top_p.unwrap_or(base.top_p),
+            top_k: self.top_k.unwrap_or(base.top_k),
+            max_tokens: self.max_tokens.unwrap_or(base.max_tokens),
+            seed: self.seed.or(base.seed),
+        };
+        p.validate()?;
+        Ok(p)
+    }
+
+    fn priority(&self) -> Result<Priority, GarudaError> {
+        match &self.priority {
+            Some(s) => s.parse(),
+            None => Ok(Priority::Normal),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
-    pub model: String,
+    #[serde(default)]
+    pub model: Option<String>,
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
     pub stream: bool,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ChatChoice {
-    pub index: usize,
-    pub message: ChatMessage,
-    pub finish_reason: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ChatCompletionResponse {
-    pub id: String,
-    pub object: String,
-    pub created: u64,
-    pub model: String,
-    pub choices: Vec<ChatChoice>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ChatChunkChoice {
-    pub index: usize,
-    pub delta: ChatMessageDelta,
-    pub finish_reason: Option<String>,
-}
-
-#[derive(Debug, Serialize, Default)]
-pub struct ChatMessageDelta {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub role: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ChatCompletionChunk {
-    pub id: String,
-    pub object: String,
-    pub created: u64,
-    pub model: String,
-    pub choices: Vec<ChatChunkChoice>,
+    #[serde(flatten)]
+    sampling: SamplingOverrides,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct CompletionRequest {
-    pub model: String,
+    #[serde(default)]
+    pub model: Option<String>,
     pub prompt: String,
     #[serde(default)]
     pub stream: bool,
+    #[serde(flatten)]
+    sampling: SamplingOverrides,
 }
 
 #[derive(Debug, Serialize)]
-pub struct CompletionChoice {
-    pub text: String,
-    pub index: usize,
-    pub finish_reason: Option<String>,
+pub struct Usage {
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub total_tokens: usize,
 }
 
 #[derive(Debug, Serialize)]
-pub struct CompletionResponse {
-    pub id: String,
-    pub object: String,
-    pub created: u64,
-    pub model: String,
-    pub choices: Vec<CompletionChoice>,
+struct ChatChoice {
+    index: usize,
+    message: ChatMessage,
+    finish_reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatCompletionResponse {
+    id: String,
+    object: &'static str,
+    created: u64,
+    model: String,
+    choices: Vec<ChatChoice>,
+    usage: Usage,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct Delta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChunkChoice {
+    index: usize,
+    delta: Delta,
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatChunk {
+    id: String,
+    object: &'static str,
+    created: u64,
+    model: String,
+    choices: Vec<ChunkChoice>,
+}
+
+#[derive(Debug, Serialize)]
+struct CompletionChoice {
+    text: String,
+    index: usize,
+    finish_reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CompletionResponse {
+    id: String,
+    object: &'static str,
+    created: u64,
+    model: String,
+    choices: Vec<CompletionChoice>,
+    usage: Usage,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct EmbeddingRequest {
-    pub model: String,
-    pub input: serde_json::Value, // String or Vec<String>
+    #[serde(default)]
+    pub model: Option<String>,
+    /// A string or an array of strings, as OpenAI allows.
+    pub input: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
-pub struct EmbeddingData {
-    pub object: String,
-    pub index: usize,
-    pub embedding: Vec<f32>,
+struct EmbeddingData {
+    object: &'static str,
+    index: usize,
+    embedding: Vec<f32>,
 }
 
 #[derive(Debug, Serialize)]
-pub struct EmbeddingResponse {
-    pub object: String,
-    pub data: Vec<EmbeddingData>,
-    pub model: String,
+struct EmbeddingResponse {
+    object: &'static str,
+    data: Vec<EmbeddingData>,
+    model: String,
+    usage: Usage,
 }
 
-#[derive(Debug, Serialize)]
-pub struct ModelInfo {
-    pub id: String,
-    pub object: String,
-    pub created: u64,
-    pub owned_by: String,
-}
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
 
-#[derive(Debug, Serialize)]
-pub struct ModelsResponse {
-    pub object: String,
-    pub data: Vec<ModelInfo>,
-}
-
-pub struct ApiState {
-    pub runtime: Arc<InferenceRuntime>,
-    pub scheduler: Arc<Scheduler>,
-}
-
-pub fn create_router(state: Arc<ApiState>) -> Router {
-    Router::new()
-        .route("/v1/chat/completions", post(chat_completions))
-        .route("/v1/completions", post(completions))
-        .route("/v1/embeddings", post(embeddings))
-        .route("/v1/models", get(models))
-        .layer(Extension(state))
-}
-
-async fn chat_completions(
-    Extension(state): Extension<Arc<ApiState>>,
-    Json(req): Json<ChatCompletionRequest>,
-) -> impl IntoResponse {
-    let mut combined_prompt = String::new();
-    for msg in &req.messages {
-        combined_prompt.push_str(&format!("{}: {}\n", msg.role, msg.content));
-    }
-    
-    let tokens = match state.runtime.tokenizer.encode(&combined_prompt) {
-        Ok(t) => t,
-        Err(e) => return (axum::http::StatusCode::BAD_REQUEST, e.to_string()).into_response(),
-    };
-
-    let req_id = Uuid::new_v4();
-    let (response_tx, mut response_rx) = mpsc::unbounded_channel();
-    let (_cancel_tx, cancel_rx) = oneshot::channel();
-
-    let scheduler_req = Request {
-        id: req_id,
-        user_id: "default_user".to_string(),
-        tokens,
-        priority: Priority::Normal,
-        timeout: std::time::Duration::from_secs(30),
-        response_tx,
-        cancel_rx,
-    };
-
-    if let Err(e) = state.scheduler.submit_request(scheduler_req) {
-        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-    }
-
-    let model_name = req.model.clone();
-
-    if req.stream {
-        let stream = async_stream::stream! {
-            let mut index = 0;
-            while let Some(res) = response_rx.recv().await {
-                match res {
-                    Ok(tok) => {
-                        let decoded = state.runtime.tokenizer.decode(&[tok]).unwrap_or_default();
-                        let chunk = ChatCompletionChunk {
-                            id: req_id.to_string(),
-                            object: "chat.completion.chunk".to_string(),
-                            created: 1234567890,
-                            model: model_name.clone(),
-                            choices: vec![ChatChunkChoice {
-                                index,
-                                delta: ChatMessageDelta {
-                                    role: if index == 0 { Some("assistant".to_string()) } else { None },
-                                    content: Some(decoded),
-                                },
-                                finish_reason: None,
-                            }],
-                        };
-                        index += 1;
-                        yield Ok::<_, axum::BoxError>(Event::default().json_data(&chunk).unwrap());
-                    }
-                    Err(e) => {
-                        yield Err::<_, axum::BoxError>(Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())));
-                    }
-                }
-            }
-            state.scheduler.release_rate_limit("default_user");
-            
-            // Send final stop chunk
-            let final_chunk = ChatCompletionChunk {
-                id: req_id.to_string(),
-                object: "chat.completion.chunk".to_string(),
-                created: 1234567890,
-                model: model_name.clone(),
-                choices: vec![ChatChunkChoice {
-                    index,
-                    delta: ChatMessageDelta::default(),
-                    finish_reason: Some("stop".to_string()),
-                }],
-            };
-            yield Ok::<_, axum::BoxError>(Event::default().json_data(&final_chunk).unwrap());
-        };
-
-        Sse::new(stream).into_response()
-    } else {
-        // Collect all tokens
-        let mut out_tokens = Vec::new();
-        while let Some(res) = response_rx.recv().await {
-            match res {
-                Ok(tok) => out_tokens.push(tok),
-                Err(e) => {
-                    state.scheduler.release_rate_limit("default_user");
-                    return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-                }
-            }
-        }
-        state.scheduler.release_rate_limit("default_user");
-
-        let content = state.runtime.tokenizer.decode(&out_tokens).unwrap_or_default();
-        let response = ChatCompletionResponse {
-            id: req_id.to_string(),
-            object: "chat.completion".to_string(),
-            created: 1234567890,
-            model: req.model,
-            choices: vec![ChatChoice {
-                index: 0,
-                message: ChatMessage {
-                    role: "assistant".to_string(),
-                    content,
-                },
-                finish_reason: Some("stop".to_string()),
-            }],
-        };
-        Json(response).into_response()
-    }
-}
-
-async fn completions(
-    Extension(state): Extension<Arc<ApiState>>,
-    Json(req): Json<CompletionRequest>,
-) -> impl IntoResponse {
-    let tokens = match state.runtime.tokenizer.encode(&req.prompt) {
-        Ok(t) => t,
-        Err(e) => return (axum::http::StatusCode::BAD_REQUEST, e.to_string()).into_response(),
-    };
-
-    let req_id = Uuid::new_v4();
-    let (response_tx, mut response_rx) = mpsc::unbounded_channel();
-    let (_cancel_tx, cancel_rx) = oneshot::channel();
-
-    let scheduler_req = Request {
-        id: req_id,
-        user_id: "default_user".to_string(),
-        tokens,
-        priority: Priority::Normal,
-        timeout: std::time::Duration::from_secs(30),
-        response_tx,
-        cancel_rx,
-    };
-
-    if let Err(e) = state.scheduler.submit_request(scheduler_req) {
-        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-    }
-
-    let mut out_tokens = Vec::new();
-    while let Some(res) = response_rx.recv().await {
-        match res {
-            Ok(tok) => out_tokens.push(tok),
-            Err(e) => {
-                state.scheduler.release_rate_limit("default_user");
-                return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-            }
-        }
-    }
-    state.scheduler.release_rate_limit("default_user");
-
-    let text = state.runtime.tokenizer.decode(&out_tokens).unwrap_or_default();
-    let response = CompletionResponse {
-        id: req_id.to_string(),
-        object: "text_completion".to_string(),
-        created: 1234567890,
-        model: req.model,
-        choices: vec![CompletionChoice {
-            text,
-            index: 0,
-            finish_reason: Some("stop".to_string()),
-        }],
-    };
-    Json(response).into_response()
-}
-
-async fn embeddings(
-    Extension(_state): Extension<Arc<ApiState>>,
-    Json(req): Json<EmbeddingRequest>,
-) -> impl IntoResponse {
-    // Return dummy 128-dimensional embeddings for demonstration
-    let response = EmbeddingResponse {
-        object: "list".to_string(),
-        data: vec![EmbeddingData {
-            object: "embedding".to_string(),
-            index: 0,
-            embedding: vec![0.1; 128],
-        }],
-        model: req.model,
-    };
-    Json(response)
+async fn health() -> impl IntoResponse {
+    Json(serde_json::json!({ "status": "ok" }))
 }
 
 async fn models() -> impl IntoResponse {
-    let response = ModelsResponse {
-        object: "list".to_string(),
-        data: vec![
-            ModelInfo {
-                id: "garuda-moe-v1".to_string(),
-                object: "model".to_string(),
-                created: 1718000000,
-                owned_by: "garuda".to_string(),
-            },
-            ModelInfo {
-                id: "garuda-dense-v1".to_string(),
-                object: "model".to_string(),
-                created: 1718000000,
-                owned_by: "garuda".to_string(),
-            },
-        ],
+    Json(serde_json::json!({
+        "object": "list",
+        "data": [{
+            "id": MODEL_ID,
+            "object": "model",
+            "created": now(),
+            "owned_by": "garuda",
+        }],
+    }))
+}
+
+async fn stats(State(state): State<SharedState>) -> impl IntoResponse {
+    let s = state.scheduler.stats();
+    let prompt = state.runtime.prompt_cache_stats();
+
+    Json(serde_json::json!({
+        "uptime_secs": state.started.elapsed().as_secs(),
+        "scheduler": {
+            "submitted": s.submitted,
+            "completed": s.completed,
+            "cancelled": s.cancelled,
+            "timed_out": s.timed_out,
+            "failed": s.failed,
+            "rejected_busy": s.rejected_busy,
+            "rejected_rate_limit": s.rejected_rate_limit,
+        },
+        "prompt_cache": {
+            "hits": prompt.hits,
+            "misses": prompt.misses,
+            "entries": prompt.entries,
+            "hit_ratio": prompt.hit_ratio(),
+        },
+        "context_window": state.runtime.max_context(),
+    }))
+}
+
+/// Flatten chat messages into a prompt.
+fn render_chat(messages: &[ChatMessage]) -> String {
+    let mut out = String::new();
+    for m in messages {
+        out.push_str(&m.role);
+        out.push_str(": ");
+        out.push_str(&m.content);
+        out.push('\n');
+    }
+    out.push_str("assistant: ");
+    out
+}
+
+/// Caller identity. There is no auth, so everyone shares one bucket unless they
+/// name themselves — which is a scaffold's honest answer, not a security control.
+fn user_id(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get("x-garuda-user")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty() && s.len() <= 128)
+        .unwrap_or("anonymous")
+        .to_owned()
+}
+
+async fn chat_completions(
+    State(state): State<SharedState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<ChatCompletionRequest>,
+) -> Response {
+    if req.messages.is_empty() {
+        return bad_request("messages must not be empty");
+    }
+
+    let params = match req.sampling.apply(state.defaults) {
+        Ok(p) => p,
+        Err(e) => return error_response(&e),
     };
-    Json(response)
+    let priority = match req.sampling.priority() {
+        Ok(p) => p,
+        Err(e) => return error_response(&e),
+    };
+
+    let prompt = state.runtime.tokenizer.encode(&render_chat(&req.messages));
+    let prompt_tokens = prompt.len();
+    let model = req.model.unwrap_or_else(|| MODEL_ID.to_owned());
+
+    let spec = RequestSpec {
+        user_id: user_id(&headers),
+        prompt,
+        params,
+        priority,
+        timeout: state.request_timeout,
+    };
+
+    let handle = match state.scheduler.submit(spec) {
+        Ok(h) => h,
+        Err(e) => return error_response(&e),
+    };
+    let id = format!("chatcmpl-{}", handle.id);
+
+    if req.stream {
+        stream_chat(state, handle, id, model).into_response()
+    } else {
+        collect_chat(state, handle, id, model, prompt_tokens).await
+    }
+}
+
+async fn collect_chat(
+    state: SharedState,
+    mut handle: crate::scheduler::Handle,
+    id: String,
+    model: String,
+    prompt_tokens: usize,
+) -> Response {
+    let mut tokens = Vec::new();
+    let mut finish = None;
+
+    while let Some(ev) = handle.events.recv().await {
+        match ev {
+            StreamEvent::Token(t) => tokens.push(t),
+            StreamEvent::Done(reason) => {
+                finish = Some(reason);
+                break;
+            }
+            StreamEvent::Error(e) => return error_response(&e),
+        }
+    }
+
+    let Some(finish) = finish else {
+        return error_response(&GarudaError::Scheduler(
+            "stream ended without a result".into(),
+        ));
+    };
+
+    let content = match state.runtime.tokenizer.decode(&tokens) {
+        Ok(c) => c,
+        Err(e) => return error_response(&e),
+    };
+
+    Json(ChatCompletionResponse {
+        id,
+        object: "chat.completion",
+        created: now(),
+        model,
+        choices: vec![ChatChoice {
+            index: 0,
+            message: ChatMessage {
+                role: "assistant".to_owned(),
+                content,
+            },
+            finish_reason: finish.as_openai().to_owned(),
+        }],
+        usage: Usage {
+            prompt_tokens,
+            completion_tokens: tokens.len(),
+            total_tokens: prompt_tokens + tokens.len(),
+        },
+    })
+    .into_response()
+}
+
+fn stream_chat(
+    state: SharedState,
+    mut handle: crate::scheduler::Handle,
+    id: String,
+    model: String,
+) -> Sse<impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let stream = async_stream::stream! {
+        // `handle` is moved in here, so when the client disconnects and axum drops
+        // this stream, the handle drops with it — which cancels the request. That is
+        // the whole disconnect path: no bookkeeping, nothing to leak.
+        let _keep = &state;
+        let mut decoder = StreamDecoder::new();
+        let mut first = true;
+
+        let chunk = |delta: Delta, finish: Option<String>| {
+            Event::default().json_data(ChatChunk {
+                id: id.clone(),
+                object: "chat.completion.chunk",
+                created: now(),
+                model: model.clone(),
+                choices: vec![ChunkChoice { index: 0, delta, finish_reason: finish }],
+            })
+        };
+
+        while let Some(ev) = handle.events.recv().await {
+            match ev {
+                StreamEvent::Token(t) => {
+                    let text = decoder.push(t);
+                    // A byte that does not yet complete a character emits nothing;
+                    // sending an empty delta would just be noise on the wire.
+                    if text.is_empty() && !first {
+                        continue;
+                    }
+                    let delta = Delta {
+                        role: first.then(|| "assistant".to_owned()),
+                        content: Some(text),
+                    };
+                    first = false;
+                    if let Ok(e) = chunk(delta, None) {
+                        yield Ok(e);
+                    }
+                }
+                StreamEvent::Done(reason) => {
+                    let tail = decoder.finish();
+                    if !tail.is_empty() {
+                        if let Ok(e) = chunk(Delta { role: None, content: Some(tail) }, None) {
+                            yield Ok(e);
+                        }
+                    }
+                    if let Ok(e) = chunk(Delta::default(), Some(reason.as_openai().to_owned())) {
+                        yield Ok(e);
+                    }
+                    break;
+                }
+                StreamEvent::Error(e) => {
+                    // The stream has already begun; the status line is long gone, so
+                    // the error has to travel as an SSE event.
+                    if let Ok(ev) = Event::default().json_data(ErrorEnvelope {
+                        error: ErrorBody {
+                            message: e.to_string(),
+                            r#type: "server_error".to_owned(),
+                            code: "stream_error".to_owned(),
+                        },
+                    }) {
+                        yield Ok(ev);
+                    }
+                    break;
+                }
+            }
+        }
+
+        // The sentinel every OpenAI client waits for. The old implementation never
+        // sent it, so well-behaved SDKs hung until their own timeout.
+        yield Ok(Event::default().data("[DONE]"));
+    };
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+async fn completions(
+    State(state): State<SharedState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<CompletionRequest>,
+) -> Response {
+    if req.prompt.is_empty() {
+        return bad_request("prompt must not be empty");
+    }
+
+    let params = match req.sampling.apply(state.defaults) {
+        Ok(p) => p,
+        Err(e) => return error_response(&e),
+    };
+    let priority = match req.sampling.priority() {
+        Ok(p) => p,
+        Err(e) => return error_response(&e),
+    };
+
+    let prompt = state.runtime.tokenizer.encode(&req.prompt);
+    let prompt_tokens = prompt.len();
+    let model = req.model.unwrap_or_else(|| MODEL_ID.to_owned());
+
+    let handle = match state.scheduler.submit(RequestSpec {
+        user_id: user_id(&headers),
+        prompt,
+        params,
+        priority,
+        timeout: state.request_timeout,
+    }) {
+        Ok(h) => h,
+        Err(e) => return error_response(&e),
+    };
+
+    let id = format!("cmpl-{}", handle.id);
+    if req.stream {
+        return stream_chat(state, handle, id, model).into_response();
+    }
+
+    let mut handle = handle;
+    let mut tokens = Vec::new();
+    let mut finish = None;
+    while let Some(ev) = handle.events.recv().await {
+        match ev {
+            StreamEvent::Token(t) => tokens.push(t),
+            StreamEvent::Done(r) => {
+                finish = Some(r);
+                break;
+            }
+            StreamEvent::Error(e) => return error_response(&e),
+        }
+    }
+
+    let Some(finish) = finish else {
+        return error_response(&GarudaError::Scheduler(
+            "stream ended without a result".into(),
+        ));
+    };
+    let text = match state.runtime.tokenizer.decode(&tokens) {
+        Ok(t) => t,
+        Err(e) => return error_response(&e),
+    };
+
+    Json(CompletionResponse {
+        id,
+        object: "text_completion",
+        created: now(),
+        model,
+        choices: vec![CompletionChoice {
+            text,
+            index: 0,
+            finish_reason: finish.as_openai().to_owned(),
+        }],
+        usage: Usage {
+            prompt_tokens,
+            completion_tokens: tokens.len(),
+            total_tokens: prompt_tokens + tokens.len(),
+        },
+    })
+    .into_response()
+}
+
+/// Embeddings from the model's real pooled hidden state.
+///
+/// These are genuine forward passes, not the constant vector the previous version
+/// returned. They are still not *useful*: the weights are untrained, so the vectors
+/// carry no semantic structure. The endpoint is here because the shape and the cost
+/// are real; treat the values as noise until a trained checkpoint is loaded.
+async fn embeddings(
+    State(state): State<SharedState>,
+    Json(req): Json<EmbeddingRequest>,
+) -> Response {
+    let inputs: Vec<String> = match &req.input {
+        serde_json::Value::String(s) => vec![s.clone()],
+        serde_json::Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for i in items {
+                match i.as_str() {
+                    Some(s) => out.push(s.to_owned()),
+                    None => return bad_request("input array must contain only strings"),
+                }
+            }
+            out
+        }
+        _ => return bad_request("input must be a string or an array of strings"),
+    };
+
+    if inputs.is_empty() || inputs.iter().all(|s| s.is_empty()) {
+        return bad_request("input must not be empty");
+    }
+
+    let runtime = state.runtime.clone();
+    let model = req.model.unwrap_or_else(|| MODEL_ID.to_owned());
+
+    // Forward passes are CPU-bound; keep them off the async executor.
+    let computed = tokio::task::spawn_blocking(move || {
+        let mut out = Vec::with_capacity(inputs.len());
+        let mut total = 0usize;
+        for text in &inputs {
+            let tokens = runtime.tokenizer.encode(text);
+            total += tokens.len();
+            out.push(runtime.embed(&tokens)?);
+        }
+        Ok::<_, GarudaError>((out, total))
+    })
+    .await;
+
+    let (vectors, prompt_tokens) = match computed {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return error_response(&e),
+        Err(e) => {
+            return error_response(&GarudaError::Inference(format!(
+                "embedding task failed: {e}"
+            )))
+        }
+    };
+
+    Json(EmbeddingResponse {
+        object: "list",
+        data: vectors
+            .into_iter()
+            .enumerate()
+            .map(|(index, embedding)| EmbeddingData {
+                object: "embedding",
+                index,
+                embedding,
+            })
+            .collect(),
+        model,
+        usage: Usage {
+            prompt_tokens,
+            completion_tokens: 0,
+            total_tokens: prompt_tokens,
+        },
+    })
+    .into_response()
 }

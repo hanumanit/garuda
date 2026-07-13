@@ -1,134 +1,230 @@
+//! WebSocket streaming at `/v1/ws`.
+//!
+//! One request at a time per socket. Cancellation is real: a `{"cancel": true}`
+//! message, or the socket closing, drops the scheduler handle, and generation stops
+//! at the next token boundary.
+
+use crate::api::SharedState;
+use crate::scheduler::{Priority, RequestSpec, StreamEvent};
+use crate::tokenizer::StreamDecoder;
 use axum::{
-    extract::ws::{Message, WebSocket, WebSocketUpgrade},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        State,
+    },
     response::IntoResponse,
     routing::get,
-    Router, Extension,
+    Router,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot};
-use uuid::Uuid;
-use crate::api::ApiState;
-use crate::scheduler::{Request, Priority};
+
+pub fn create_ws_router(state: SharedState) -> Router {
+    Router::new()
+        .route("/v1/ws", get(ws_handler))
+        .with_state(state)
+}
 
 #[derive(Debug, Deserialize)]
 struct WsRequest {
     prompt: String,
     #[serde(default)]
     priority: Option<String>,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    top_p: Option<f32>,
+    #[serde(default)]
+    top_k: Option<usize>,
+    #[serde(default)]
+    max_tokens: Option<usize>,
+    #[serde(default)]
+    seed: Option<u64>,
+    /// Cancel whatever is currently generating on this socket.
+    #[serde(default)]
+    cancel: bool,
 }
 
 #[derive(Debug, Serialize)]
 struct WsResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
     token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    finish_reason: Option<String>,
     done: bool,
 }
 
-pub fn create_ws_router() -> Router {
-    Router::new().route("/v1/ws", get(ws_handler))
+impl WsResponse {
+    fn token(text: String) -> Self {
+        Self {
+            token: Some(text),
+            error: None,
+            finish_reason: None,
+            done: false,
+        }
+    }
+    fn done(reason: &str) -> Self {
+        Self {
+            token: None,
+            error: None,
+            finish_reason: Some(reason.to_owned()),
+            done: true,
+        }
+    }
+    fn error(msg: String) -> Self {
+        Self {
+            token: None,
+            error: Some(msg),
+            finish_reason: None,
+            done: true,
+        }
+    }
 }
 
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    Extension(state): Extension<Arc<ApiState>>,
-) -> impl IntoResponse {
-    ws.on_upgrade(|socket| handle_socket(socket, state))
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<SharedState>) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
-async fn handle_socket(mut socket: WebSocket, state: Arc<ApiState>) {
+/// Send `resp`; `false` means the socket is gone.
+async fn send(socket: &mut WebSocket, resp: &WsResponse) -> bool {
+    let Ok(text) = serde_json::to_string(resp) else {
+        return false;
+    };
+    socket.send(Message::Text(text)).await.is_ok()
+}
+
+async fn handle_socket(mut socket: WebSocket, state: SharedState) {
     while let Some(Ok(msg)) = socket.recv().await {
-        if let Message::Text(text) = msg {
-            let req_data: WsRequest = match serde_json::from_str(&text) {
-                Ok(d) => d,
-                Err(e) => {
-                    let err_resp = WsResponse {
-                        token: None,
-                        error: Some(format!("Invalid JSON: {}", e)),
-                        done: true,
-                    };
-                    let _ = socket.send(Message::Text(serde_json::to_string(&err_resp).unwrap())).await;
-                    continue;
+        let text = match msg {
+            Message::Text(t) => t,
+            Message::Close(_) => break,
+            // Ping/Pong are handled by axum; binary frames are not a protocol we speak.
+            _ => continue,
+        };
+
+        let req: WsRequest = match serde_json::from_str(&text) {
+            Ok(r) => r,
+            Err(e) => {
+                if !send(
+                    &mut socket,
+                    &WsResponse::error(format!("invalid JSON: {e}")),
+                )
+                .await
+                {
+                    return;
                 }
-            };
-
-            let tokens = match state.runtime.tokenizer.encode(&req_data.prompt) {
-                Ok(t) => t,
-                Err(e) => {
-                    let err_resp = WsResponse {
-                        token: None,
-                        error: Some(e.to_string()),
-                        done: true,
-                    };
-                    let _ = socket.send(Message::Text(serde_json::to_string(&err_resp).unwrap())).await;
-                    continue;
-                }
-            };
-
-            let priority = match req_data.priority.as_deref() {
-                Some("high") => Priority::High,
-                Some("low") => Priority::Low,
-                _ => Priority::Normal,
-            };
-
-            let req_id = Uuid::new_v4();
-            let (response_tx, mut response_rx) = mpsc::unbounded_channel();
-            let (_cancel_tx, cancel_rx) = oneshot::channel();
-
-            let scheduler_req = Request {
-                id: req_id,
-                user_id: "ws_user".to_string(),
-                tokens,
-                priority,
-                timeout: std::time::Duration::from_secs(30),
-                response_tx,
-                cancel_rx,
-            };
-
-            if let Err(e) = state.scheduler.submit_request(scheduler_req) {
-                let err_resp = WsResponse {
-                    token: None,
-                    error: Some(e.to_string()),
-                    done: true,
-                };
-                let _ = socket.send(Message::Text(serde_json::to_string(&err_resp).unwrap())).await;
                 continue;
             }
+        };
 
-            while let Some(res) = response_rx.recv().await {
-                match res {
-                    Ok(tok) => {
-                        let decoded = state.runtime.tokenizer.decode(&[tok]).unwrap_or_default();
-                        let resp = WsResponse {
-                            token: Some(decoded),
-                            error: None,
-                            done: false,
-                        };
-                        if socket.send(Message::Text(serde_json::to_string(&resp).unwrap())).await.is_err() {
-                            let _ = _cancel_tx.send(());
-                            break;
+        // A cancel with nothing running is a no-op, not an error.
+        if req.cancel {
+            continue;
+        }
+
+        if !run_one(&mut socket, &state, req).await {
+            return;
+        }
+    }
+}
+
+/// Run a single request to completion. Returns `false` if the socket died.
+async fn run_one(socket: &mut WebSocket, state: &SharedState, req: WsRequest) -> bool {
+    let mut params = state.defaults;
+    if let Some(v) = req.temperature {
+        params.temperature = v;
+    }
+    if let Some(v) = req.top_p {
+        params.top_p = v;
+    }
+    if let Some(v) = req.top_k {
+        params.top_k = v;
+    }
+    if let Some(v) = req.max_tokens {
+        params.max_tokens = v;
+    }
+    if req.seed.is_some() {
+        params.seed = req.seed;
+    }
+
+    if let Err(e) = params.validate() {
+        return send(socket, &WsResponse::error(e.to_string())).await;
+    }
+
+    let priority: Priority = match req.priority.as_deref().unwrap_or("normal").parse() {
+        Ok(p) => p,
+        Err(e) => return send(socket, &WsResponse::error(e.to_string())).await,
+    };
+
+    if req.prompt.is_empty() {
+        return send(
+            socket,
+            &WsResponse::error("prompt must not be empty".into()),
+        )
+        .await;
+    }
+
+    let handle = state.scheduler.submit(RequestSpec {
+        user_id: "ws".to_owned(),
+        prompt: state.runtime.tokenizer.encode(&req.prompt),
+        params,
+        priority,
+        timeout: state.request_timeout,
+    });
+
+    let mut handle = match handle {
+        Ok(h) => h,
+        Err(e) => return send(socket, &WsResponse::error(e.to_string())).await,
+    };
+
+    let mut decoder = StreamDecoder::new();
+
+    loop {
+        tokio::select! {
+            // A client that hangs up, closes, or sends `{"cancel": true}` stops the
+            // work: `handle` drops at the end of this function, which cancels it.
+            incoming = socket.recv() => {
+                match incoming {
+                    Some(Ok(Message::Text(t))) => {
+                        let wants_cancel = serde_json::from_str::<WsRequest>(&t)
+                            .map(|r| r.cancel)
+                            .unwrap_or(false);
+                        if wants_cancel {
+                            handle.cancel();
+                            let _ = send(socket, &WsResponse::done("cancelled")).await;
+                            return true;
                         }
                     }
-                    Err(e) => {
-                        let resp = WsResponse {
-                            token: None,
-                            error: Some(e.to_string()),
-                            done: true,
-                        };
-                        let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap())).await;
-                        break;
-                    }
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return false,
+                    _ => {}
                 }
             }
 
-            state.scheduler.release_rate_limit("ws_user");
-
-            let final_resp = WsResponse {
-                token: None,
-                error: None,
-                done: true,
-            };
-            let _ = socket.send(Message::Text(serde_json::to_string(&final_resp).unwrap())).await;
+            event = handle.events.recv() => {
+                match event {
+                    Some(StreamEvent::Token(t)) => {
+                        let text = decoder.push(t);
+                        if text.is_empty() {
+                            continue; // an incomplete UTF-8 character; wait for the rest
+                        }
+                        if !send(socket, &WsResponse::token(text)).await {
+                            return false;
+                        }
+                    }
+                    Some(StreamEvent::Done(reason)) => {
+                        let tail = decoder.finish();
+                        if !tail.is_empty() && !send(socket, &WsResponse::token(tail)).await {
+                            return false;
+                        }
+                        return send(socket, &WsResponse::done(reason.as_openai())).await;
+                    }
+                    Some(StreamEvent::Error(e)) => {
+                        return send(socket, &WsResponse::error(e.to_string())).await;
+                    }
+                    None => return send(socket, &WsResponse::done("stop")).await,
+                }
+            }
         }
     }
 }

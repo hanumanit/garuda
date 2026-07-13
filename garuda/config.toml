@@ -1,8 +1,55 @@
+# Garuda configuration.
+#
+# Every key here reaches something. Unknown keys are a startup error rather than
+# being silently ignored, so a typo cannot quietly disable what you asked for.
+
 [model]
-path = "/tmp/garuda_models"
-context = 32768
+# Root for the L2 expert cache and the KV spill directory.
+path = "./models"
+# Gating strategy: mixtral | deepseek | qwen
+router = "mixtral"
+# Context window, in tokens. A byte-level tokenizer means roughly one token per byte.
+context = 4096
+experts = 8
+top_k = 2
+# Attention window. 0 attends to the whole context.
+sliding_window = 0
+# There is no GPU backend. Setting this to true is a startup error, not a fallback.
 gpu = false
-threads = 8
-expert_cache = "256GB"
+
+[memory]
+# L1 budget for expert weights. With the current dimensions an expert is ~384 KiB,
+# so this holds all eight several times over.
+expert_cache = "512MB"
+# KV blocks held in RAM per sequence before older ones spill to disk.
+kv_resident_blocks = 512
+# Prompt prefixes to remember, so a repeated prompt skips prefill.
+prompt_cache_entries = 64
+# Cold archive tier. Empty disables L3.
+archive_path = ""
+kv_spill = true
+
+[runtime]
+# Compute threads. 0 uses every core.
+threads = 0
 prefetch = true
 predictor = true
+
+[server]
+host = "127.0.0.1"
+port = 8080
+# Sequences decoding at once.
+max_concurrent = 4
+# Requests allowed to wait for a slot before the server sheds load with a 503.
+queue_capacity = 256
+# Concurrent requests one caller may have in flight (identified by X-Garuda-User).
+max_concurrent_per_user = 8
+request_timeout_secs = 120
+# Permissive CORS. Off by default: this server has no authentication.
+cors = false
+
+[sampling]
+temperature = 0.8
+top_p = 0.95
+top_k = 40
+max_tokens = 256

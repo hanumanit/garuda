@@ -2,3 +2,6 @@
 target/
 **/*.rs.bk
 .DS_Store
+
+# Runtime state: the L2 expert cache and KV spill directory (model.path in config.toml)
+/garuda/models/
