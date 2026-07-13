@@ -1,0 +1,8 @@
+[model]
+path = "/tmp/garuda_models"
+context = 32768
+gpu = false
+threads = 8
+expert_cache = "256GB"
+prefetch = true
+predictor = true
