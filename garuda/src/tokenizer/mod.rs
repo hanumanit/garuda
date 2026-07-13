@@ -13,9 +13,27 @@ use crate::core::{GarudaError, Token};
 pub mod spm;
 
 /// A tokenizer the runtime can drive. Implemented by the byte-level [`Tokenizer`]
-/// here and by [`spm::SpmTokenizer`], which loads a real model's vocabulary. The
-/// runtime holds one of these behind a trait object, so swapping the model swaps
-/// the tokenizer without the API or scheduler noticing.
+/// here and by [`spm::SpmTokenizer`], which loads a real model's vocabulary.
+///
+/// # Plugin contract
+///
+/// The runtime holds one of these behind an `Arc<dyn Tokenize>` and shares it across
+/// concurrent requests, so an implementation must uphold:
+///
+/// 1. **`encode` is pure and thread-safe.** No `&mut self`, no shared mutable state,
+///    no failure. Every token it returns must be `< vocab_size()`. (The old byte
+///    tokenizer grew a shared vocabulary from input under a lock — an OOM vector and
+///    a scalability bottleneck. Don't.)
+/// 2. **`decode(encode(s))` round-trips** for valid UTF-8 `s` (exactly for the byte
+///    tokenizer; losslessly via byte fallback for SPM).
+/// 3. **`decode` skips special tokens** — BOS/EOS/control ids must not surface as
+///    text.
+/// 4. **Streaming agrees with batch.** Concatenating [`StreamDecode::push`] over a
+///    token sequence, then [`StreamDecode::finish`], must equal `decode` of the whole
+///    sequence. `push` may return `""` while it holds an incomplete UTF-8 character.
+/// 5. **`vocab_size()` matches the backend** paired with it — see the
+///    [`InferenceBackend`](crate::core::InferenceBackend) contract.
+/// 6. **`eos()`** is the id whose generation ends a sequence.
 pub trait Tokenize: Send + Sync {
     fn encode(&self, text: &str) -> Vec<Token>;
     fn decode(&self, tokens: &[Token]) -> Result<String, GarudaError>;
@@ -26,6 +44,7 @@ pub trait Tokenize: Send + Sync {
 }
 
 /// Incremental decoding: feed tokens as they are generated, receive complete text.
+/// See invariant 4 of the [`Tokenize`] contract.
 pub trait StreamDecode: Send {
     fn push(&mut self, token: Token) -> String;
     fn finish(&mut self) -> String;

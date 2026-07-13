@@ -212,22 +212,49 @@ pub trait ExpertLoader: Send + Sync {
 /// Produces next-token logits for a context. This is the intended extension point
 /// for other compute backends; [`crate::moe::MoeEngine`] is the only implementation
 /// that exists — there is no GPU backend, and this trait is where one would go.
+/// # Plugin contract
+///
+/// This trait is the extension point for compute backends. Implementations get to
+/// pick their own architecture and weights; in return they must uphold the
+/// invariants below, which the runtime relies on and does not re-check:
+///
+/// 1. **Consume only unseen positions.** Process exactly `context[seq.len()..]` and
+///    no more. The runtime calls with a `context` that grows by one token per decode
+///    step; re-processing the whole prefix each time would make decoding O(n²) and
+///    corrupt the KV cache by appending duplicate positions.
+/// 2. **Advance every KV layer by one position per new token.** After consuming `k`
+///    new tokens, every layer of `seq` must be exactly `k` positions longer, so
+///    `seq.len()` (which reads layer 0) stays in lockstep with all layers. Append to
+///    `seq.layer(l)` — do not keep KV state anywhere else.
+/// 3. **`dims()` must agree with the tokenizer.** `dims().vocab_size` must equal the
+///    paired `Tokenize::vocab_size`, and `logits` must return a tensor of that
+///    length. `dims()` must satisfy [`ModelDims::validate`].
+/// 4. **Errors, never panics, on bad input.** An out-of-vocabulary token is
+///    [`GarudaError::InvalidToken`]; an exhausted context window is the
+///    [`GarudaError::Cache`] the KV cache returns — propagate it. An empty `context`
+///    is an error.
+/// 5. **Determinism.** For the same `context` and internal weights, `logits` must be
+///    reproducible. All randomness lives in the sampler, not here — the prompt cache
+///    assumes a cache hit reproduces the same continuation.
+///
+/// See [`crate::moe::MoeEngine`] (synthetic) and [`crate::llama::LlamaBackend`]
+/// (real GGUF model) for two implementations.
 pub trait InferenceBackend: Send + Sync {
+    /// The model's shape. Must satisfy [`ModelDims::validate`] and agree with the
+    /// tokenizer's vocabulary size.
     fn dims(&self) -> ModelDims;
 
-    /// The model's `d_model`-dim hidden state after consuming `context`.
+    /// The model's `d_model`-dim final hidden state after consuming `context`.
     ///
-    /// `seq` carries attention and routing state across calls. The backend consumes
-    /// only the positions of `context` that `seq` has not already seen, so calling
-    /// this repeatedly while appending one token at a time costs one step each time
-    /// rather than re-running the whole prompt.
+    /// Used for embeddings. Subject to every invariant in the trait contract.
     fn hidden(
         &self,
         context: &[Token],
         seq: &mut crate::cache::SeqState,
     ) -> Result<Tensor, GarudaError>;
 
-    /// Logits over the vocabulary for the token that follows `context`.
+    /// Logits over the vocabulary for the token that follows `context`. Length must
+    /// equal `dims().vocab_size`.
     fn logits(
         &self,
         context: &[Token],

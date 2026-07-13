@@ -157,20 +157,68 @@ no semantic structure. Either way the shape and cost are real.
 
 ## Adding a plugin
 
-The two extension points are traits in [`core`](garuda/src/core/mod.rs):
+A plugin is a Rust type that implements one of these traits. There is no separate
+plugin manifest or spec file: **the spec is the trait plus the invariants documented
+on it**, which `cargo doc` renders in full. This section summarises the two that
+matter; read the doc comments in the source for the authoritative contract.
 
-- **`InferenceBackend`** — turns a context into logits. Implemented by
-  [`moe::MoeEngine`](garuda/src/moe/mod.rs) (synthetic) and
-  [`llama::LlamaBackend`](garuda/src/llama/mod.rs) (real GGUF model). A GPU backend
-  or a different architecture goes here.
-- **`Tokenize`** — text ↔ tokens. Implemented by the byte-level
-  [`Tokenizer`](garuda/src/tokenizer/mod.rs) and the GGUF-loaded
-  [`SpmTokenizer`](garuda/src/tokenizer/spm.rs).
+| Extension point | Trait | Job | Implementations |
+|---|---|---|---|
+| Compute backend | [`core::InferenceBackend`](garuda/src/core/mod.rs) | context → logits | `moe::MoeEngine`, `llama::LlamaBackend` |
+| Tokenizer | [`tokenizer::Tokenize`](garuda/src/tokenizer/mod.rs) | text ↔ tokens | `Tokenizer` (byte), `spm::SpmTokenizer` |
+| Storage tier | [`core::StorageBackend`](garuda/src/core/mod.rs) | bytes on some medium | `storage::LocalStorageBackend` |
+| Expert source | [`core::ExpertLoader`](garuda/src/core/mod.rs) | id → expert weights | `memory::MemoryManager` |
 
-`server::Engine::build` is the only place that picks which pair to construct. The
-runtime, scheduler and API depend on the traits, not the implementations, so a new
-backend needs no changes to any of them — the Llama backend was added exactly this
-way.
+### The `InferenceBackend` contract
+
+The trait is three methods (`dims`, `hidden`, `logits`), but the load-bearing part
+is the invariants an implementation must uphold — the runtime relies on them and
+does not re-check:
+
+1. **Consume only unseen positions** — exactly `context[seq.len()..]`. The runtime
+   grows `context` by one token per decode step; reprocessing the prefix would make
+   decoding O(n²) and double-append to the KV cache.
+2. **Advance every KV layer by one position per new token**, so `seq.len()` stays in
+   lockstep across layers. Store KV state only in `seq.layer(l)`.
+3. **`dims().vocab_size` must equal the tokenizer's `vocab_size()`**, and `logits`
+   must return a tensor of that length. `dims()` must pass `ModelDims::validate`.
+4. **Error, never panic, on bad input** — out-of-vocab token, exhausted context
+   window, empty context.
+5. **Determinism** — same context and weights ⇒ same logits. Randomness belongs to
+   the sampler; the prompt cache depends on this.
+
+### A minimal backend
+
+```rust
+use garuda::core::{InferenceBackend, ModelDims, Tensor, Token, GarudaError};
+use garuda::cache::SeqState;
+
+struct MyBackend { dims: ModelDims }
+
+impl InferenceBackend for MyBackend {
+    fn dims(&self) -> ModelDims { self.dims }
+
+    fn hidden(&self, ctx: &[Token], seq: &mut SeqState) -> Result<Tensor, GarudaError> {
+        if ctx.is_empty() { return Err(GarudaError::Inference("empty context".into())); }
+        for &tok in &ctx[seq.len()..] {          // invariant 1: only unseen tokens
+            let (k, v) = /* your attention key/value for this token */;
+            seq.kv().append(&k, &v)?;            // invariant 2: one position appended
+            // … your forward pass …
+        }
+        Tensor::new(vec![self.dims.d_model], /* final hidden state */)
+    }
+
+    fn logits(&self, ctx: &[Token], seq: &mut SeqState) -> Result<Tensor, GarudaError> {
+        let h = self.hidden(ctx, seq)?;
+        Tensor::new(vec![self.dims.vocab_size], /* project h to vocab */) // invariant 3
+    }
+}
+```
+
+Then construct it in [`server::Engine::build`](garuda/src/server/mod.rs) — the one
+place that picks which backend and tokenizer to build. The runtime, scheduler and
+API depend on the traits, not the implementations, so nothing else changes. The
+Llama backend was added exactly this way.
 
 ### What is still missing
 
