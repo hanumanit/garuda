@@ -53,7 +53,26 @@ impl Value {
             _ => None,
         }
     }
+
+    pub fn as_f32(&self) -> Option<f32> {
+        match *self {
+            Value::F32(v) => Some(v),
+            Value::F64(v) => Some(v as f32),
+            _ => self.as_u64().map(|u| u as f32),
+        }
+    }
+
+    pub fn as_array(&self) -> Option<&[Value]> {
+        match self {
+            Value::Array(a) => Some(a),
+            _ => None,
+        }
+    }
 }
+
+/// ggml tensor data types this reader can turn into `f32`.
+const GGML_F32: u32 = 0;
+const GGML_F16: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TensorInfo {
@@ -186,6 +205,25 @@ fn bad(msg: impl Into<String>) -> GarudaError {
     GarudaError::Model(format!("gguf: {}", msg.into()))
 }
 
+/// IEEE-754 half → single precision.
+fn f16_to_f32(h: u16) -> f32 {
+    let sign = (h >> 15) & 1;
+    let exp = (h >> 10) & 0x1f;
+    let mant = h & 0x3ff;
+    let val = match exp {
+        0 if mant == 0 => 0.0,
+        0 => (mant as f32) * 2f32.powi(-24), // subnormal
+        0x1f if mant == 0 => f32::INFINITY,
+        0x1f => f32::NAN,
+        _ => (1.0 + mant as f32 / 1024.0) * 2f32.powi(exp as i32 - 15),
+    };
+    if sign == 1 {
+        -val
+    } else {
+        val
+    }
+}
+
 impl Gguf {
     /// Parse the header, metadata and tensor descriptors from `data`.
     pub fn parse(data: &[u8]) -> Result<Self, GarudaError> {
@@ -279,6 +317,82 @@ impl Gguf {
         self.metadata
             .get(&format!("{arch}.expert_used_count"))
             .and_then(Value::as_u64)
+    }
+
+    /// A metadata value keyed exactly.
+    pub fn get(&self, key: &str) -> Option<&Value> {
+        self.metadata.get(key)
+    }
+
+    /// An `{arch}.{suffix}` metadata integer, e.g. `llama.block_count`.
+    pub fn arch_u64(&self, suffix: &str) -> Option<u64> {
+        let arch = self.architecture()?;
+        self.metadata
+            .get(&format!("{arch}.{suffix}"))
+            .and_then(Value::as_u64)
+    }
+
+    pub fn arch_f32(&self, suffix: &str) -> Option<f32> {
+        let arch = self.architecture()?;
+        self.metadata
+            .get(&format!("{arch}.{suffix}"))
+            .and_then(Value::as_f32)
+    }
+
+    /// A tensor's contents as `f32`, dequantising F16 if needed.
+    ///
+    /// Only F32 and F16 are supported. A quantised tensor (`Q4_K`, `Q8_0`, …) is a
+    /// clear error rather than garbage: block-format dequantisation does not exist
+    /// yet, so those checkpoints cannot be loaded.
+    pub fn tensor_f32(&self, file: &[u8], name: &str) -> Result<Vec<f32>, GarudaError> {
+        let t = self
+            .tensor(name)
+            .ok_or_else(|| bad(format!("tensor '{name}' not found")))?;
+        let n = t.n_elements() as usize;
+
+        let elem_bytes = match t.ggml_type {
+            GGML_F32 => 4,
+            GGML_F16 => 2,
+            other => {
+                return Err(bad(format!(
+                    "tensor '{name}' has ggml type {other}; only F32 and F16 are supported \
+                     (quantised weights need a dequantiser that does not exist yet)"
+                )))
+            }
+        };
+
+        let start = self
+            .data_offset
+            .checked_add(t.offset as usize)
+            .ok_or_else(|| bad("tensor offset overflow"))?;
+        let end = start
+            .checked_add(n * elem_bytes)
+            .ok_or_else(|| bad("tensor length overflow"))?;
+        let raw = file
+            .get(start..end)
+            .ok_or_else(|| bad(format!("tensor '{name}' runs past the end of the file")))?;
+
+        let mut out = Vec::with_capacity(n);
+        match t.ggml_type {
+            GGML_F32 => {
+                for c in raw.chunks_exact(4) {
+                    out.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+                }
+            }
+            GGML_F16 => {
+                for c in raw.chunks_exact(2) {
+                    out.push(f16_to_f32(u16::from_le_bytes([c[0], c[1]])));
+                }
+            }
+            _ => unreachable!("type checked above"),
+        }
+
+        if let Some(bad_idx) = out.iter().position(|v| !v.is_finite()) {
+            return Err(bad(format!(
+                "tensor '{name}' has a non-finite value at {bad_idx}"
+            )));
+        }
+        Ok(out)
     }
 
     pub fn tensor(&self, name: &str) -> Option<&TensorInfo> {

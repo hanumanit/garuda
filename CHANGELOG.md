@@ -2,6 +2,43 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-07-13
+
+Garuda can now load and run a real model. Point it at a GGUF checkpoint and it
+generates real text — the TinyStories 260K model produces coherent children's
+stories through the same runtime, scheduler and API as everything else.
+
+### Added
+
+- **`llama::LlamaBackend`** — a Llama-family dense transformer loaded from GGUF:
+  per-block RMSNorm, grouped-query attention with RoPE, SwiGLU feed-forward, a
+  final norm and an output projection. It implements the existing
+  `core::InferenceBackend`, so it drops into the runtime, scheduler and API with
+  nothing else changed. This is the plugin architecture paying off: the real model
+  is a new backend behind a trait the rest of the system already depended on.
+- **`tokenizer::spm::SpmTokenizer`** — the real SentencePiece tokenizer, loaded from
+  the checkpoint's vocabulary and scores, using llama.cpp's bigram-merge
+  resegmentation with byte fallback. Matching the model's own tokenization is what
+  makes the output coherent instead of noise.
+- **`Tokenize` and `StreamDecode` traits** — the runtime now holds its tokenizer
+  behind a trait, so the byte-level and SentencePiece tokenizers are swappable the
+  same way the backends are.
+- **GGUF weight loading** — `Gguf::tensor_f32` reads F32/F16 tensors (with F16
+  dequantised), bounds-checked, rejecting non-finite values. Quantised formats
+  (`Q4_K`, `Q8_0`, …) are a clear error: their decoders are not written yet.
+- `model.gguf` config key to select a checkpoint; `garuda inspect` now reports a
+  file's architecture, experts and tokenizer.
+
+### Changed
+
+- **The KV cache is now multi-layer and GQA-aware.** `KvConfig` gained `kv_dim`
+  (key/value width, narrower than `d_model` under grouped-query attention) and
+  `n_layers`; `SeqState` holds one cache per transformer block. The synthetic MoE
+  uses a single layer with `kv_dim == d_model` via `KvConfig::mha`, so its
+  behaviour is unchanged.
+- `server::Engine::build` chooses between the synthetic MoE and a loaded checkpoint;
+  it is the only place that knows which backend is running.
+
 ## [0.2.0] - 2026-07-13
 
 An audit of 0.1.0 found that the runtime did not perform inference. Every compute

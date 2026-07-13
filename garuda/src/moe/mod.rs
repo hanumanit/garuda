@@ -117,7 +117,7 @@ impl MoeEngine {
 
         let mut h = x.clone();
         simd::rmsnorm(&mut h, NORM_EPS);
-        let attn = self.attention.forward(&h, &self.weights, &mut seq.kv)?;
+        let attn = self.attention.forward(&h, &self.weights, seq.kv())?;
         simd::add_assign(&mut x, &attn);
 
         let mut h = x.clone();
@@ -219,16 +219,7 @@ mod tests {
     }
 
     fn seq(dims: ModelDims) -> SeqState {
-        SeqState::new(
-            KvConfig {
-                dims,
-                max_positions: 512,
-                max_resident_blocks: 64,
-                sliding_window: None,
-                storage: None,
-            },
-            1,
-        )
+        SeqState::new(KvConfig::mha(dims, 512, 64, None, None), 1)
     }
 
     #[test]
@@ -365,16 +356,7 @@ mod tests {
     #[test]
     fn context_window_exhaustion_is_an_error_not_a_panic() {
         let f = fixture("ctxfull");
-        let mut s = SeqState::new(
-            KvConfig {
-                dims: f.dims,
-                max_positions: 2,
-                max_resident_blocks: 4,
-                sliding_window: None,
-                storage: None,
-            },
-            1,
-        );
+        let mut s = SeqState::new(KvConfig::mha(f.dims, 2, 4, None, None), 1);
         let err = f.engine.logits(&[1, 2, 3], &mut s).unwrap_err();
         assert!(matches!(err, GarudaError::Cache(_)), "got {err:?}");
         let _ = std::fs::remove_dir_all(&f.dir);

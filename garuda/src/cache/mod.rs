@@ -149,16 +149,44 @@ struct KvBlock {
     filled: usize,
 }
 
-/// How a [`KVCacheState`] is sized and where it may spill.
+/// How a sequence's KV state is sized and where it may spill.
 #[derive(Clone)]
 pub struct KvConfig {
     pub dims: ModelDims,
+    /// Width of one stored key/value vector. Equals `d_model` for full multi-head
+    /// attention; for grouped-query attention it is `n_kv_heads * head_dim`, which
+    /// is narrower.
+    pub kv_dim: usize,
+    /// Attention layers, each of which gets its own cache. `1` for the single-block
+    /// MoE engine; a real model has one per transformer block.
+    pub n_layers: usize,
     /// Hard cap on sequence length (the context window).
     pub max_positions: usize,
     /// Blocks kept in RAM before spilling begins.
     pub max_resident_blocks: usize,
     pub sliding_window: Option<usize>,
     pub storage: Option<Arc<dyn StorageBackend>>,
+}
+
+impl KvConfig {
+    /// Full multi-head attention: one layer, key/value width equal to `d_model`.
+    pub fn mha(
+        dims: ModelDims,
+        max_positions: usize,
+        max_resident_blocks: usize,
+        sliding_window: Option<usize>,
+        storage: Option<Arc<dyn StorageBackend>>,
+    ) -> Self {
+        Self {
+            kv_dim: dims.d_model,
+            n_layers: 1,
+            dims,
+            max_positions,
+            max_resident_blocks,
+            sliding_window,
+            storage,
+        }
+    }
 }
 
 /// Attention state for one sequence.
@@ -171,7 +199,8 @@ pub struct KvConfig {
 /// Length is hard-capped at `max_positions` (the context window), so the cache
 /// cannot grow without bound no matter what a client sends.
 pub struct KVCacheState {
-    dims: ModelDims,
+    kv_dim: usize,
+    block_size: usize,
     resident: BTreeMap<usize, KvBlock>,
     spilled: BTreeMap<usize, PathBuf>,
     len: usize,
@@ -179,8 +208,9 @@ pub struct KVCacheState {
     max_resident_blocks: usize,
     sliding_window: Option<usize>,
     storage: Option<Arc<dyn StorageBackend>>,
-    /// Namespaces spill files so two sequences cannot collide.
+    /// Namespaces spill files so two sequences (and two layers) cannot collide.
     seq_id: u64,
+    layer: usize,
     spills: u64,
     reloads: u64,
 }
@@ -190,7 +220,8 @@ impl Clone for KVCacheState {
     /// because a spill file is written once and never mutated afterwards.
     fn clone(&self) -> Self {
         Self {
-            dims: self.dims,
+            kv_dim: self.kv_dim,
+            block_size: self.block_size,
             resident: self.resident.clone(),
             spilled: self.spilled.clone(),
             len: self.len,
@@ -199,6 +230,7 @@ impl Clone for KVCacheState {
             sliding_window: self.sliding_window,
             storage: self.storage.clone(),
             seq_id: self.seq_id,
+            layer: self.layer,
             spills: self.spills,
             reloads: self.reloads,
         }
@@ -219,16 +251,22 @@ impl std::fmt::Debug for KVCacheState {
 
 impl KVCacheState {
     pub fn new(cfg: KvConfig, seq_id: u64) -> Self {
+        Self::for_layer(&cfg, seq_id, 0)
+    }
+
+    fn for_layer(cfg: &KvConfig, seq_id: u64, layer: usize) -> Self {
         Self {
-            dims: cfg.dims,
+            kv_dim: cfg.kv_dim.max(1),
+            block_size: cfg.dims.block_size.max(1),
             resident: BTreeMap::new(),
             spilled: BTreeMap::new(),
             len: 0,
             max_positions: cfg.max_positions.max(1),
             max_resident_blocks: cfg.max_resident_blocks.max(1),
             sliding_window: cfg.sliding_window,
-            storage: cfg.storage,
+            storage: cfg.storage.clone(),
             seq_id,
+            layer,
             spills: 0,
             reloads: 0,
         }
@@ -263,12 +301,15 @@ impl KVCacheState {
     }
 
     fn spill_path(&self, block: usize) -> PathBuf {
-        PathBuf::from(format!("kv/seq_{}/block_{}.bin", self.seq_id, block))
+        PathBuf::from(format!(
+            "kv/seq_{}/layer_{}/block_{}.bin",
+            self.seq_id, self.layer, block
+        ))
     }
 
     /// Append the key/value vectors for the next position.
     pub fn append(&mut self, key: &[f32], value: &[f32]) -> Result<(), GarudaError> {
-        let d = self.dims.d_model;
+        let d = self.kv_dim;
         if key.len() != d || value.len() != d {
             return Err(GarudaError::Cache(format!(
                 "kv append expects a {d}-dim key and value, got {} and {}",
@@ -283,8 +324,8 @@ impl KVCacheState {
             )));
         }
 
-        let idx = self.len / self.dims.block_size;
-        let (bs, dm) = (self.dims.block_size, d);
+        let idx = self.len / self.block_size;
+        let (bs, dm) = (self.block_size, d);
         let block = self.resident.entry(idx).or_insert_with(|| KvBlock {
             keys: Vec::with_capacity(bs * dm),
             values: Vec::with_capacity(bs * dm),
@@ -355,9 +396,9 @@ impl KVCacheState {
             )));
         }
         let filled = u64::from_le_bytes(bytes[..8].try_into().expect("checked length")) as usize;
-        let d = self.dims.d_model;
+        let d = self.kv_dim;
         let expected = 8 + filled * d * 2 * 4;
-        if bytes.len() != expected || filled > self.dims.block_size {
+        if bytes.len() != expected || filled > self.block_size {
             return Err(GarudaError::Cache(format!(
                 "spill file for block {block} is malformed: {} bytes, filled={filled}",
                 bytes.len()
@@ -388,7 +429,7 @@ impl KVCacheState {
         if start >= end {
             return Ok(());
         }
-        let bs = self.dims.block_size;
+        let bs = self.block_size;
         let needed: Vec<usize> = (start / bs..=(end - 1) / bs)
             .filter(|b| self.spilled.contains_key(b))
             .collect();
@@ -412,8 +453,8 @@ impl KVCacheState {
         if pos >= self.len {
             return None;
         }
-        let bs = self.dims.block_size;
-        let d = self.dims.d_model;
+        let bs = self.block_size;
+        let d = self.kv_dim;
         let block = self.resident.get(&(pos / bs))?;
         let off = (pos % bs) * d;
         let src = if key { &block.keys } else { &block.values };
@@ -455,12 +496,16 @@ impl KVCacheState {
 // Sequence state
 // ---------------------------------------------------------------------------
 
-/// Everything one in-flight sequence carries between decode steps: its attention
-/// cache, plus the routing history the prefetcher learns from.
+/// Everything one in-flight sequence carries between decode steps: one attention
+/// cache per transformer layer, plus the routing history the prefetcher learns from.
+///
+/// A single-block engine (the MoE) has one layer; a real model has one per block.
+/// All layers advance together — each token appends exactly one position to every
+/// layer — so `len()` reads the first layer and speaks for all of them.
 #[derive(Debug, Clone)]
 pub struct SeqState {
-    pub kv: KVCacheState,
-    /// Experts that fired on the previous step.
+    kvs: Vec<KVCacheState>,
+    /// Experts that fired on the previous step (MoE prefetch bookkeeping).
     pub last_experts: Vec<ExpertId>,
     /// What the predictor guessed the current step would need.
     pub last_predicted: Vec<ExpertId>,
@@ -468,19 +513,58 @@ pub struct SeqState {
 
 impl SeqState {
     pub fn new(cfg: KvConfig, seq_id: u64) -> Self {
+        let n = cfg.n_layers.max(1);
         Self {
-            kv: KVCacheState::new(cfg, seq_id),
+            kvs: (0..n)
+                .map(|l| KVCacheState::for_layer(&cfg, seq_id, l))
+                .collect(),
             last_experts: Vec::new(),
             last_predicted: Vec::new(),
         }
     }
 
+    pub fn n_layers(&self) -> usize {
+        self.kvs.len()
+    }
+
+    /// The cache for layer `l`.
+    ///
+    /// # Panics
+    /// If `l` is out of range. The backend owns both the layer count and the cache,
+    /// so an out-of-range layer is a backend bug, not runtime input.
+    pub fn layer(&mut self, l: usize) -> &mut KVCacheState {
+        &mut self.kvs[l]
+    }
+
+    /// The first (and, for the MoE engine, only) layer's cache.
+    pub fn kv(&mut self) -> &mut KVCacheState {
+        &mut self.kvs[0]
+    }
+
     pub fn len(&self) -> usize {
-        self.kv.len()
+        self.kvs[0].len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.kv.is_empty()
+        self.kvs[0].is_empty()
+    }
+
+    pub fn has_spill(&self) -> bool {
+        self.kvs.iter().any(KVCacheState::has_spill)
+    }
+
+    /// Give every layer a fresh sequence identity. Fails if anything is spilled.
+    pub fn rekey(&mut self, seq_id: u64) -> Result<(), GarudaError> {
+        for kv in &mut self.kvs {
+            kv.rekey(seq_id)?;
+        }
+        Ok(())
+    }
+
+    pub fn purge_spill_files(&mut self) {
+        for kv in &mut self.kvs {
+            kv.purge_spill_files();
+        }
     }
 }
 
@@ -488,7 +572,7 @@ impl Drop for SeqState {
     fn drop(&mut self) {
         // A sequence that ends — completed, cancelled, timed out, or dropped because
         // the client hung up — takes its spill files with it.
-        self.kv.purge_spill_files();
+        self.purge_spill_files();
     }
 }
 
@@ -559,7 +643,6 @@ impl PromptCache {
         drop(inner);
 
         state
-            .kv
             .rekey(fresh_seq_id)
             .expect("cached states never hold spilled blocks");
         Some(state)
@@ -571,7 +654,7 @@ impl PromptCache {
     /// clone, and a clone that shared spill-file paths with a live sequence would
     /// delete that sequence's attention state when it was evicted.
     pub fn insert(&self, tokens: &[Token], state: SeqState) {
-        if state.kv.has_spill() {
+        if state.has_spill() {
             return;
         }
         let key = prompt_key(tokens);
@@ -615,13 +698,7 @@ mod tests {
     }
 
     fn kv_cfg(storage: Option<Arc<dyn StorageBackend>>, max_resident: usize) -> KvConfig {
-        KvConfig {
-            dims: dims(),
-            max_positions: 64,
-            max_resident_blocks: max_resident,
-            sliding_window: None,
-            storage,
-        }
+        KvConfig::mha(dims(), 64, max_resident, None, storage)
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
@@ -765,15 +842,16 @@ mod tests {
         let v = vec![0.25; d.d_model];
         // Force both to spill, then confirm they wrote to different files.
         for _ in 0..12 {
-            a.kv.append(&v, &v).unwrap();
-            b.kv.append(&v, &v).unwrap();
+            a.kv().append(&v, &v).unwrap();
+            b.kv().append(&v, &v).unwrap();
         }
-        assert!(a.kv.has_spill() && b.kv.has_spill());
+        assert!(a.has_spill() && b.has_spill());
 
         // Dropping `a` purges only `a`'s files; `b` must still read back.
         drop(a);
-        b.kv.ensure_resident(0, b.kv.len()).unwrap();
-        assert_eq!(b.kv.key_at(0).unwrap(), &v[..]);
+        let n = b.len();
+        b.kv().ensure_resident(0, n).unwrap();
+        assert_eq!(b.kv().key_at(0).unwrap(), &v[..]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -795,9 +873,9 @@ mod tests {
         );
         let v = vec![0.5; d.d_model];
         for _ in 0..12 {
-            state.kv.append(&v, &v).unwrap();
+            state.kv().append(&v, &v).unwrap();
         }
-        assert!(state.kv.has_spill());
+        assert!(state.has_spill());
 
         let cache = PromptCache::new(4);
         cache.insert(&[1], state);

@@ -6,7 +6,7 @@
 
 use crate::cache::{KvConfig, PromptCache, SeqState};
 use crate::core::{GarudaError, InferenceBackend, ModelDims, Tensor, Token};
-use crate::tokenizer::Tokenizer;
+use crate::tokenizer::Tokenize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -210,7 +210,7 @@ impl StopReason {
 }
 
 pub struct InferenceRuntime {
-    pub tokenizer: Tokenizer,
+    pub tokenizer: Arc<dyn Tokenize>,
     backend: Arc<dyn InferenceBackend>,
     prompt_cache: PromptCache,
     kv_template: KvConfig,
@@ -220,7 +220,7 @@ pub struct InferenceRuntime {
 
 impl InferenceRuntime {
     pub fn new(
-        tokenizer: Tokenizer,
+        tokenizer: Arc<dyn Tokenize>,
         backend: Arc<dyn InferenceBackend>,
         kv_template: KvConfig,
         prompt_cache_capacity: usize,
@@ -281,7 +281,7 @@ impl InferenceRuntime {
             let mut fresh = SeqState::new(self.kv_template.clone(), seq_id);
             // Prefill. The logits from the prefix are not needed; the KV state is.
             self.backend.logits(prefix, &mut fresh)?;
-            if !fresh.kv.has_spill() {
+            if !fresh.has_spill() {
                 self.prompt_cache.insert(prefix, fresh.clone());
             }
             fresh
@@ -398,14 +398,9 @@ mod tests {
         let router = Router::new(RouterType::Mixtral, dims).unwrap();
         let engine = Arc::new(MoeEngine::new(dims, weights, router, mm, None).unwrap());
 
-        let kv = KvConfig {
-            dims,
-            max_positions: 128,
-            max_resident_blocks: 64,
-            sliding_window: None,
-            storage: None,
-        };
-        (InferenceRuntime::new(Tokenizer::new(), engine, kv, 8), dir)
+        let kv = KvConfig::mha(dims, 128, 64, None, None);
+        let tk = Arc::new(crate::tokenizer::Tokenizer::new());
+        (InferenceRuntime::new(tk, engine, kv, 8), dir)
     }
 
     fn greedy(max_tokens: usize) -> SamplingParams {

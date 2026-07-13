@@ -4,7 +4,7 @@ use garuda::api::{create_router, ApiState};
 use garuda::cli::{Cli, Commands};
 use garuda::config::AppConfig;
 use garuda::scheduler::Scheduler;
-use garuda::server::{configure_thread_pool, Engine};
+use garuda::server::{configure_thread_pool, Backend, Engine};
 use garuda::websocket::create_ws_router;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -74,18 +74,33 @@ fn inspect(path: &std::path::Path) -> anyhow::Result<()> {
 
 async fn serve(config: AppConfig) -> anyhow::Result<()> {
     let engine = Engine::build(&config)?;
-    info!(
-        experts = config.model.experts,
-        top_k = config.model.top_k,
-        context = config.model.context,
-        router = %config.model.router,
-        prefetch = engine.prefetch.is_some(),
-        "engine ready"
-    );
-    warn!(
-        "this runtime has no trained weights: generated text is meaningless. \
-         it also has no authentication."
-    );
+    match &engine.backend {
+        Backend::SyntheticMoe => {
+            info!(
+                experts = config.model.experts,
+                top_k = config.model.top_k,
+                context = config.model.context,
+                router = %config.model.router,
+                prefetch = engine.prefetch.is_some(),
+                "synthetic MoE engine ready"
+            );
+            warn!(
+                "this runtime has no trained weights: generated text is meaningless. \
+                 it also has no authentication."
+            );
+        }
+        Backend::Gguf { path, layers } => {
+            info!(
+                model = %path,
+                layers,
+                d_model = engine.dims.d_model,
+                vocab = engine.dims.vocab_size,
+                context = engine.runtime.max_context(),
+                "loaded GGUF model"
+            );
+            warn!("this server has no authentication; do not expose it to an untrusted network");
+        }
+    }
 
     let scheduler = Scheduler::new(engine.runtime.clone(), config.scheduler());
 

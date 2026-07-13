@@ -108,13 +108,7 @@ mod tests {
     use crate::cache::{KVCacheState, KvConfig};
 
     fn cfg(dims: ModelDims, sliding_window: Option<usize>) -> KvConfig {
-        KvConfig {
-            dims,
-            max_positions: 256,
-            max_resident_blocks: 64,
-            sliding_window,
-            storage: None,
-        }
+        KvConfig::mha(dims, 256, 64, sliding_window, None)
     }
 
     fn setup() -> (Attention, ModelWeights, KVCacheState) {

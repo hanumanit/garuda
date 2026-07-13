@@ -6,7 +6,6 @@
 
 use crate::api::SharedState;
 use crate::scheduler::{Priority, RequestSpec, StreamEvent};
-use crate::tokenizer::StreamDecoder;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -178,7 +177,7 @@ async fn run_one(socket: &mut WebSocket, state: &SharedState, req: WsRequest) ->
         Err(e) => return send(socket, &WsResponse::error(e.to_string())).await,
     };
 
-    let mut decoder = StreamDecoder::new();
+    let mut decoder = state.runtime.tokenizer.stream_decoder();
 
     loop {
         tokio::select! {

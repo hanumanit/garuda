@@ -6,7 +6,14 @@
 [model]
 # Root for the L2 expert cache and the KV spill directory.
 path = "./models"
-# Gating strategy: mixtral | deepseek | qwen
+# Path to a GGUF checkpoint. Leave empty to run the synthetic MoE (meaningless
+# output). Set it to load a real model instead — the router/experts/top_k knobs are
+# then ignored. Only F32/F16 checkpoints load; quantised weights are not yet
+# supported. A tiny real model to try:
+#   curl -L https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf -o stories260K.gguf
+# gguf = "stories260K.gguf"
+gguf = ""
+# Gating strategy (synthetic MoE only): mixtral | deepseek | qwen
 router = "mixtral"
 # Context window, in tokens. A byte-level tokenizer means roughly one token per byte.
 context = 4096

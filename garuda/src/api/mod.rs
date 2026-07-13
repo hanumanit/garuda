@@ -12,7 +12,6 @@
 use crate::core::GarudaError;
 use crate::runtime::{InferenceRuntime, SamplingParams};
 use crate::scheduler::{Priority, RequestSpec, Scheduler, StreamEvent};
-use crate::tokenizer::StreamDecoder;
 use axum::{
     extract::State,
     http::StatusCode,
@@ -452,7 +451,7 @@ fn stream_chat(
         // this stream, the handle drops with it — which cancels the request. That is
         // the whole disconnect path: no bookkeeping, nothing to leak.
         let _keep = &state;
-        let mut decoder = StreamDecoder::new();
+        let mut decoder = state.runtime.tokenizer.stream_decoder();
         let mut first = true;
 
         let chunk = |delta: Delta, finish: Option<String>| {

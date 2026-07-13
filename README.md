@@ -8,32 +8,49 @@ Rust.
 
 ## Read this first
 
-**Garuda has no trained model.** It cannot load one yet. The transformer
-arithmetic is real — causal multi-head attention with RoPE, top-k MoE routing,
-SwiGLU experts, a KV cache that spills to disk, temperature/top-k/top-p sampling
-— but it runs over weights that are pseudo-random and deterministic. **The text it
-generates is meaningless.** That is by construction, not a bug.
+Garuda runs in one of two modes.
 
-What is real is everything *around* the weights: the scheduling, the memory
-tiering, the caching, the streaming, the cancellation, the load shedding. That is
-what this codebase is for. It is an honest skeleton with a real skeleton's
-mechanics — and a clearly marked hole where the model goes.
+**With a real GGUF checkpoint** (`model.gguf` in the config), it loads the weights
+and generates real text. Point it at the 1&nbsp;MB TinyStories model and ask for a
+story and you get one:
+
+```
+$ curl -L https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf -o stories260K.gguf
+$ curl -s localhost:8080/v1/completions -d '{"prompt":"Once upon a time","max_tokens":60,"temperature":0}'
+```
+> Once upon a time, there was a little girl named Lily. She loved to play outside
+> in the park. One day, she saw a big, red ball. She wanted to play with it, but it
+> was too high…
+
+That runs a real Llama-architecture transformer — grouped-query attention with
+RoPE, SwiGLU feed-forward, a SentencePiece tokenizer loaded from the file — through
+the same runtime, scheduler and API as everything else. Only **F32/F16**
+checkpoints load; quantised weights (`Q4_K`, `Q8_0`, …) are rejected, because no
+dequantiser exists yet. That is the one real limit on which models work.
+
+**Without a checkpoint**, it runs a synthetic MoE whose weights are pseudo-random
+but deterministic. The transformer arithmetic is real; the weights are not, so the
+output is meaningless — by construction. This mode exists to exercise the parts
+that are the point of the project: the scheduling, the memory tiering, the caching,
+the streaming, the cancellation, the load shedding.
 
 | | Status |
 |---|---|
-| Transformer forward pass (attention, RoPE, MoE, SwiGLU, sampling) | Real, tested |
+| Load & run a real model from GGUF (Llama, F32/F16) | Real, tested |
+| SentencePiece tokenizer from GGUF | Real, tested |
+| Transformer forward pass (GQA + RoPE + SwiGLU; MoE routing) | Real, tested |
 | Tiered expert storage (L1 RAM → L2 disk → L3 archive) | Real, tested |
-| Paged KV cache with disk spill | Real, tested |
+| Paged KV cache with disk spill (multi-layer, GQA-aware) | Real, tested |
 | Scheduler (priority, concurrency limits, cancellation, timeouts, backpressure) | Real, tested |
 | OpenAI-compatible API + SSE + WebSocket | Real, tested |
-| GGUF metadata + tensor descriptors | Parsed correctly |
-| **Loading GGUF weights (dequantisation)** | **Not implemented** |
-| **Trained model / meaningful output** | **Not implemented** |
+| **Quantised weights (`Q4_K`, `Q8_0`, …)** | **Not implemented** — F32/F16 only |
 | **GPU backend** | **Not implemented** (`gpu = true` is a startup error) |
 | **Authentication** | **Not implemented** — do not expose this to a network |
 
-The gap between this and a usable runtime is one thing: turning GGUF's quantised
-tensor blocks into `weights::Expert`. Everything else is waiting for it.
+The real model runs as a **plugin**: `llama::LlamaBackend` implements the same
+`core::InferenceBackend` trait as the synthetic MoE, and `SpmTokenizer` implements
+the same `Tokenize` trait as the byte-level one. Selecting a checkpoint swaps both
+behind those traits; the scheduler and API never learn which is running.
 
 ---
 
@@ -79,14 +96,18 @@ computing. A wrong guess costs one wasted load and can never change the output.
 ```bash
 cd garuda
 
-# Run the API server (config.toml is read if present)
+# Run the API server on the synthetic MoE (config.toml is read if present)
 cargo run --release -- serve
+
+# Run a real model: set model.gguf in config.toml, or drop the file in and go
+curl -L https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf -o stories260K.gguf
+cargo run --release -- serve   # with model.gguf = "stories260K.gguf"
+
+# Inspect a GGUF file's architecture and tokenizer
+cargo run --release -- inspect stories260K.gguf
 
 # Measure startup, expert-load latency, cache behaviour and decode throughput
 cargo run --release -- benchmark --iterations 40 --tokens 32
-
-# Read a GGUF file's metadata (weights cannot be loaded yet)
-cargo run --release -- inspect model.gguf
 
 cargo test
 ```
@@ -127,30 +148,38 @@ Two extensions beyond the OpenAI shape:
   name. It is a fairness knob, not a security control.
 - `"priority": "low" | "normal" | "high"` on any request.
 
-**About `/v1/embeddings`:** the vectors are genuine — a real forward pass, mean
-of the final hidden state, L2-normalised. They are also *useless*, because the
-weights are untrained: two similar sentences have no reason to land near each
-other. The endpoint returns the right shape, computed the right way, from a model
-that knows nothing. It exists so the plumbing is exercised, not so you can search
-with it.
+**About `/v1/embeddings`:** the vectors are the model's real pooled hidden state,
+L2-normalised. With a trained checkpoint loaded they mean something; on the
+synthetic MoE they are genuine forward passes over untrained weights, so they carry
+no semantic structure. Either way the shape and cost are real.
 
 ---
 
-## Where the model would go
+## Adding a plugin
 
-1. **Dequantise GGUF tensors.** [`gguf`](garuda/src/gguf/mod.rs) already reads the
-   header, metadata and tensor descriptors correctly, with every length bounds-checked.
-   What is missing is the block-format decoders (`Q4_K`, `Q6_K`, …) that turn tensor
-   data into `f32`.
-2. **Replace weight synthesis.** [`weights::ModelWeights::synthesize`](garuda/src/weights/mod.rs)
-   and `synthesize_expert` are the only two functions that invent values. Point them
-   at the dequantised tensors and the rest of the pipeline does not move.
-3. **Load the real tokenizer.** [`tokenizer`](garuda/src/tokenizer/mod.rs) is byte-level:
-   lossless and bounded, but not the BPE the checkpoint was trained with. The merge table
-   is in the GGUF metadata.
-4. **Support more than one block.** [`moe`](garuda/src/moe/mod.rs) runs a single
-   transformer block. Real models stack dozens; the loop is the easy part, the weight
-   layout is the work.
+The two extension points are traits in [`core`](garuda/src/core/mod.rs):
+
+- **`InferenceBackend`** — turns a context into logits. Implemented by
+  [`moe::MoeEngine`](garuda/src/moe/mod.rs) (synthetic) and
+  [`llama::LlamaBackend`](garuda/src/llama/mod.rs) (real GGUF model). A GPU backend
+  or a different architecture goes here.
+- **`Tokenize`** — text ↔ tokens. Implemented by the byte-level
+  [`Tokenizer`](garuda/src/tokenizer/mod.rs) and the GGUF-loaded
+  [`SpmTokenizer`](garuda/src/tokenizer/spm.rs).
+
+`server::Engine::build` is the only place that picks which pair to construct. The
+runtime, scheduler and API depend on the traits, not the implementations, so a new
+backend needs no changes to any of them — the Llama backend was added exactly this
+way.
+
+### What is still missing
+
+- **Quantised weights.** [`gguf`](garuda/src/gguf/mod.rs) reads F32/F16 tensors and
+  the full container; the block-format decoders (`Q4_K`, `Q6_K`, …) that most
+  downloadable models use are not written yet. Until they are, only F32/F16
+  checkpoints (small models) load.
+- **Architectures beyond Llama.** `LlamaBackend` covers the Llama family (dense,
+  GQA). Other architectures each need their own `InferenceBackend`.
 
 ---
 

@@ -430,14 +430,8 @@ mod tests {
         let router = Router::new(RouterType::Mixtral, dims).unwrap();
         let engine = Arc::new(MoeEngine::new(dims, weights, router, mm, None).unwrap());
 
-        let kv = KvConfig {
-            dims,
-            max_positions: 256,
-            max_resident_blocks: 64,
-            sliding_window: None,
-            storage: None,
-        };
-        let rt = InferenceRuntime::new(Tokenizer::new(), engine, kv, 16);
+        let kv = KvConfig::mha(dims, 256, 64, None, None);
+        let rt = InferenceRuntime::new(Arc::new(Tokenizer::new()), engine, kv, 16);
         (Arc::new(rt), dir)
     }
 

@@ -1,10 +1,14 @@
 //! Assembling the engine from configuration.
 //!
-//! `serve` and `benchmark` both go through here, so they cannot drift apart.
+//! `serve` and `benchmark` both go through here, so they cannot drift apart. Two
+//! engines can be built: the synthetic MoE (no checkpoint) and a real model loaded
+//! from GGUF. Both expose the same runtime, so nothing downstream knows which it is.
 
 use crate::cache::KvConfig;
 use crate::config::AppConfig;
-use crate::core::{ExpertLoader, ModelDims, StorageBackend};
+use crate::core::{ExpertLoader, InferenceBackend, ModelDims, StorageBackend};
+use crate::gguf::Gguf;
+use crate::llama::LlamaBackend;
 use crate::memory::MemoryManager;
 use crate::moe::MoeEngine;
 use crate::predictor::ExpertPredictor;
@@ -12,14 +16,25 @@ use crate::prefetch::PrefetchEngine;
 use crate::router::Router;
 use crate::runtime::InferenceRuntime;
 use crate::storage::LocalStorageBackend;
-use crate::tokenizer::Tokenizer;
+use crate::tokenizer::{spm::SpmTokenizer, Tokenize, Tokenizer};
 use crate::weights::ModelWeights;
 use anyhow::Context;
 use std::sync::Arc;
 
+/// Which backend the engine is running.
+#[derive(Debug, Clone)]
+pub enum Backend {
+    /// The synthetic MoE with pseudo-random weights.
+    SyntheticMoe,
+    /// A real checkpoint loaded from GGUF.
+    Gguf { path: String, layers: usize },
+}
+
 pub struct Engine {
     pub dims: ModelDims,
-    pub memory: Arc<MemoryManager>,
+    pub backend: Backend,
+    /// The tiered expert store — only the synthetic MoE uses one.
+    pub memory: Option<Arc<MemoryManager>>,
     pub runtime: Arc<InferenceRuntime>,
     pub prefetch: Option<Arc<PrefetchEngine>>,
 }
@@ -27,7 +42,67 @@ pub struct Engine {
 impl Engine {
     pub fn build(config: &AppConfig) -> anyhow::Result<Self> {
         config.validate()?;
+        match config.gguf_path() {
+            Some(path) => Self::build_gguf(config, &path),
+            None => Self::build_synthetic(config),
+        }
+    }
 
+    /// Somewhere for the KV cache to spill. Without it a sequence is still bounded by
+    /// the context window; it just holds all of it in RAM.
+    fn kv_storage(config: &AppConfig) -> anyhow::Result<Option<Arc<dyn StorageBackend>>> {
+        if !config.memory.kv_spill {
+            return Ok(None);
+        }
+        let dir = config.model.path.join("kv_spill");
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("creating KV spill directory at {}", dir.display()))?;
+        Ok(Some(Arc::new(LocalStorageBackend::new(dir))))
+    }
+
+    fn build_gguf(config: &AppConfig, path: &std::path::Path) -> anyhow::Result<Self> {
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("reading checkpoint {}", path.display()))?;
+        let gguf = Gguf::parse(&bytes)?;
+
+        let backend = LlamaBackend::load(&bytes)?;
+        let tokenizer: Arc<dyn Tokenize> = Arc::new(SpmTokenizer::from_gguf(&gguf)?);
+        let lc = backend.config();
+        let dims = backend.dims();
+
+        // Never promise a longer context than the model was trained for.
+        let max_positions = config.model.context.min(lc.context).max(1);
+
+        let kv = KvConfig {
+            dims,
+            kv_dim: lc.kv_dim(),
+            n_layers: lc.n_layers,
+            max_positions,
+            max_resident_blocks: config.memory.kv_resident_blocks,
+            sliding_window: config.sliding_window(),
+            storage: Self::kv_storage(config)?,
+        };
+
+        let runtime = Arc::new(InferenceRuntime::new(
+            tokenizer,
+            Arc::new(backend),
+            kv,
+            config.memory.prompt_cache_entries,
+        ));
+
+        Ok(Self {
+            dims,
+            backend: Backend::Gguf {
+                path: path.display().to_string(),
+                layers: lc.n_layers,
+            },
+            memory: None,
+            runtime,
+            prefetch: None,
+        })
+    }
+
+    fn build_synthetic(config: &AppConfig) -> anyhow::Result<Self> {
         let dims = config.dims()?;
         let router = Router::new(config.router()?, dims)?;
 
@@ -71,27 +146,16 @@ impl Engine {
             prefetch.clone(),
         )?);
 
-        // Spilling needs somewhere to spill to. Without it, a sequence is still
-        // bounded by the context window; it just holds all of it in RAM.
-        let kv_storage: Option<Arc<dyn StorageBackend>> = if config.memory.kv_spill {
-            let dir = config.model.path.join("kv_spill");
-            std::fs::create_dir_all(&dir)
-                .with_context(|| format!("creating KV spill directory at {}", dir.display()))?;
-            Some(Arc::new(LocalStorageBackend::new(dir)))
-        } else {
-            None
-        };
-
-        let kv = KvConfig {
+        let kv = KvConfig::mha(
             dims,
-            max_positions: config.model.context,
-            max_resident_blocks: config.memory.kv_resident_blocks,
-            sliding_window: config.sliding_window(),
-            storage: kv_storage,
-        };
+            config.model.context,
+            config.memory.kv_resident_blocks,
+            config.sliding_window(),
+            Self::kv_storage(config)?,
+        );
 
         let runtime = Arc::new(InferenceRuntime::new(
-            Tokenizer::new(),
+            Arc::new(Tokenizer::new()),
             backend,
             kv,
             config.memory.prompt_cache_entries,
@@ -99,7 +163,8 @@ impl Engine {
 
         Ok(Self {
             dims,
-            memory,
+            backend: Backend::SyntheticMoe,
+            memory: Some(memory),
             runtime,
             prefetch,
         })

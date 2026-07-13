@@ -27,6 +27,7 @@ pub mod cli;
 pub mod config;
 pub mod core;
 pub mod gguf;
+pub mod llama;
 pub mod memory;
 pub mod moe;
 pub mod predictor;

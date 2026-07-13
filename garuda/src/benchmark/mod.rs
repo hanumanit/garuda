@@ -11,7 +11,7 @@
 use crate::config::AppConfig;
 use crate::core::ExpertLoader;
 use crate::runtime::{SamplingParams, StopReason};
-use crate::server::Engine;
+use crate::server::{Backend, Engine};
 use std::time::{Duration, Instant};
 
 pub fn run(config: &AppConfig, iterations: usize, tokens_per_iter: usize) -> anyhow::Result<()> {
@@ -19,39 +19,45 @@ pub fn run(config: &AppConfig, iterations: usize, tokens_per_iter: usize) -> any
     let tokens_per_iter = tokens_per_iter.max(1);
 
     println!("=== Garuda benchmark ===");
-    println!(
-        "model: {} experts, top-{}, d_model {}, vocab {} (untrained weights)",
-        config.model.experts,
-        config.model.top_k,
-        crate::core::ModelDims::default().d_model,
-        crate::tokenizer::VOCAB_SIZE,
-    );
-    println!();
 
     let t0 = Instant::now();
     let engine = Engine::build(config)?;
     let startup = t0.elapsed();
+
+    match &engine.backend {
+        Backend::SyntheticMoe => println!(
+            "model: synthetic MoE, {} experts, top-{}, d_model {} (untrained weights)",
+            config.model.experts, config.model.top_k, engine.dims.d_model,
+        ),
+        Backend::Gguf { path, layers } => println!(
+            "model: {path} ({layers} layers, d_model {}, vocab {})",
+            engine.dims.d_model, engine.dims.vocab_size,
+        ),
+    }
+    println!();
     println!("startup                {startup:>12.2?}");
 
-    // Cold: nothing is in L1 and no expert file exists yet, so this is synthesis
-    // plus a write to L2. Warm: straight out of L1.
-    let t = Instant::now();
-    engine.memory.load(0)?;
-    let cold = t.elapsed();
+    // The tiered expert cache only exists for the synthetic MoE.
+    if let Some(memory) = &engine.memory {
+        // Cold: nothing in L1 and no expert file yet — synthesis plus a write to L2.
+        let t = Instant::now();
+        memory.load(0)?;
+        let cold = t.elapsed();
 
-    let t = Instant::now();
-    engine.memory.load(0)?;
-    let warm = t.elapsed();
+        let t = Instant::now();
+        memory.load(0)?;
+        let warm = t.elapsed();
 
-    // Evict it, then measure the real L2 read path.
-    engine.memory.unload(0);
-    let t = Instant::now();
-    engine.memory.load(0)?;
-    let from_l2 = t.elapsed();
+        // Evict it, then measure the real L2 read path.
+        memory.unload(0);
+        let t = Instant::now();
+        memory.load(0)?;
+        let from_l2 = t.elapsed();
 
-    println!("expert load (cold)     {cold:>12.2?}");
-    println!("expert load (L2 read)  {from_l2:>12.2?}");
-    println!("expert load (L1 hit)   {warm:>12.2?}");
+        println!("expert load (cold)     {cold:>12.2?}");
+        println!("expert load (L2 read)  {from_l2:>12.2?}");
+        println!("expert load (L1 hit)   {warm:>12.2?}");
+    }
     println!();
 
     let params = SamplingParams {
@@ -126,26 +132,28 @@ pub fn run(config: &AppConfig, iterations: usize, tokens_per_iter: usize) -> any
     );
     println!();
 
-    let l1 = engine.memory.l1_stats();
-    let tiers = engine.memory.tier_counts();
-    println!("--- expert cache (measured) ---");
-    println!("l1 hit ratio           {:>12.1}%", l1.hit_ratio() * 100.0);
-    println!(
-        "l1 hits / misses       {:>12}",
-        format!("{} / {}", l1.hits, l1.misses)
-    );
-    println!("l1 evictions           {:>12}", l1.evictions);
-    println!(
-        "l1 resident            {:>12}",
-        format!("{} experts, {} KiB", l1.entries, l1.bytes / 1024)
-    );
-    println!(
-        "loads by tier          {:>12}",
-        format!(
-            "l1 {} / l2 {} / l3 {} / synth {}",
-            tiers.l1, tiers.l2, tiers.l3, tiers.synthesised
-        )
-    );
+    if let Some(memory) = &engine.memory {
+        let l1 = memory.l1_stats();
+        let tiers = memory.tier_counts();
+        println!("--- expert cache (measured) ---");
+        println!("l1 hit ratio           {:>12.1}%", l1.hit_ratio() * 100.0);
+        println!(
+            "l1 hits / misses       {:>12}",
+            format!("{} / {}", l1.hits, l1.misses)
+        );
+        println!("l1 evictions           {:>12}", l1.evictions);
+        println!(
+            "l1 resident            {:>12}",
+            format!("{} experts, {} KiB", l1.entries, l1.bytes / 1024)
+        );
+        println!(
+            "loads by tier          {:>12}",
+            format!(
+                "l1 {} / l2 {} / l3 {} / synth {}",
+                tiers.l1, tiers.l2, tiers.l3, tiers.synthesised
+            )
+        );
+    }
 
     let prompt_cache = engine.runtime.prompt_cache_stats();
     println!(

@@ -18,9 +18,13 @@ use std::time::Duration;
 pub struct ModelConfig {
     /// Root for the L2 expert cache (and the L3 archive, if enabled).
     pub path: PathBuf,
-    /// `mixtral`, `deepseek` or `qwen`.
+    /// Path to a GGUF checkpoint. When set, Garuda loads that model instead of the
+    /// synthetic MoE, and the `router`/`experts`/`top_k` knobs below are ignored.
+    /// Only F32/F16 checkpoints load; quantised weights are not yet supported.
+    pub gguf: String,
+    /// `mixtral`, `deepseek` or `qwen`. Ignored when `gguf` is set.
     pub router: String,
-    /// Context window, in tokens.
+    /// Context window, in tokens. A loaded model caps this at its own trained length.
     pub context: usize,
     pub experts: usize,
     pub top_k: usize,
@@ -34,6 +38,7 @@ impl Default for ModelConfig {
     fn default() -> Self {
         Self {
             path: PathBuf::from("./models"),
+            gguf: String::new(),
             router: "mixtral".into(),
             context: 4096,
             experts: 8,
@@ -213,8 +218,12 @@ impl AppConfig {
                     .into(),
             ));
         }
-        self.router()?;
-        self.dims()?.validate()?;
+        // The router and MoE dimensions only matter for the synthetic engine; a
+        // loaded checkpoint brings its own architecture.
+        if self.gguf_path().is_none() {
+            self.router()?;
+            self.dims()?.validate()?;
+        }
         self.sampling()?.validate()?;
         parse_size(&self.memory.expert_cache)?;
 
@@ -250,6 +259,12 @@ impl AppConfig {
             ));
         }
         Ok(())
+    }
+
+    /// The GGUF checkpoint to load, if one is configured.
+    pub fn gguf_path(&self) -> Option<PathBuf> {
+        let p = self.model.gguf.trim();
+        (!p.is_empty()).then(|| PathBuf::from(p))
     }
 
     pub fn router(&self) -> Result<RouterType, GarudaError> {

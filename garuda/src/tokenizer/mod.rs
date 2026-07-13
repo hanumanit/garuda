@@ -10,6 +10,27 @@
 
 use crate::core::{GarudaError, Token};
 
+pub mod spm;
+
+/// A tokenizer the runtime can drive. Implemented by the byte-level [`Tokenizer`]
+/// here and by [`spm::SpmTokenizer`], which loads a real model's vocabulary. The
+/// runtime holds one of these behind a trait object, so swapping the model swaps
+/// the tokenizer without the API or scheduler noticing.
+pub trait Tokenize: Send + Sync {
+    fn encode(&self, text: &str) -> Vec<Token>;
+    fn decode(&self, tokens: &[Token]) -> Result<String, GarudaError>;
+    fn eos(&self) -> Token;
+    fn vocab_size(&self) -> usize;
+    /// A decoder for streaming, since a token may be a partial UTF-8 character.
+    fn stream_decoder(&self) -> Box<dyn StreamDecode>;
+}
+
+/// Incremental decoding: feed tokens as they are generated, receive complete text.
+pub trait StreamDecode: Send {
+    fn push(&mut self, token: Token) -> String;
+    fn finish(&mut self) -> String;
+}
+
 pub const PAD: Token = 0;
 pub const BOS: Token = 1;
 pub const EOS: Token = 2;
@@ -66,6 +87,33 @@ impl Tokenizer {
             bytes.push((t - BYTE_OFFSET) as u8);
         }
         Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
+
+impl Tokenize for Tokenizer {
+    fn encode(&self, text: &str) -> Vec<Token> {
+        Tokenizer::encode(self, text)
+    }
+    fn decode(&self, tokens: &[Token]) -> Result<String, GarudaError> {
+        Tokenizer::decode(self, tokens)
+    }
+    fn eos(&self) -> Token {
+        EOS
+    }
+    fn vocab_size(&self) -> usize {
+        VOCAB_SIZE
+    }
+    fn stream_decoder(&self) -> Box<dyn StreamDecode> {
+        Box::new(StreamDecoder::new())
+    }
+}
+
+impl StreamDecode for StreamDecoder {
+    fn push(&mut self, token: Token) -> String {
+        StreamDecoder::push(self, token)
+    }
+    fn finish(&mut self) -> String {
+        StreamDecoder::finish(self)
     }
 }
 
