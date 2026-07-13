@@ -28,4 +28,5 @@ All notable changes to this project will be documented in this file.
 - **Documentation (`README.md`)**: Wrote a comprehensive setup guide, system overview, and mermaid architecture diagram.
 - **Compilation optimization (`Cargo.toml`)**: Added dev and test profiles that disable debug symbols to minimize disk space consumption during builds.
 - **Visual Assets**: Added a high-tech robotic Garuda cover banner to the project and linked it in `README.md`.
+- **Documentation Revision**: Simplified target platform definitions inside `README.md`.
 
