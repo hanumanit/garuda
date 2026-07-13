@@ -25,3 +25,5 @@ All notable changes to this project will be documented in this file.
 - **CLI Subcommands (`cli`)**: Programmed Clap-based command configurations (`Serve`, `Benchmark`).
 - **Microbenchmarks (`benchmark`)**: Verifies targets (Startup, Expert Load, Hit Rate, Token Latency, Throughput).
 - **Integration Tests**: Added verification suites for the tokenizer, MoE, and scheduler pipelines.
+- **Documentation (`README.md`)**: Wrote a comprehensive setup guide, system overview, and mermaid architecture diagram.
+- **Compilation optimization (`Cargo.toml`)**: Added dev and test profiles that disable debug symbols to minimize disk space consumption during builds.

@@ -30,4 +30,11 @@ headers = "0.4"
 toml = "0.8"
 async-stream = "0.3"
 
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0
+
+
 
