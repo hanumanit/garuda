@@ -190,38 +190,15 @@ does not re-check:
 5. **Determinism** — same context and weights ⇒ same logits. Randomness belongs to
    the sampler; the prompt cache depends on this.
 
-### A minimal backend
+A backend is registered in one place — [`server::Engine::build`](garuda/src/server/mod.rs) —
+and the runtime, scheduler and API depend on the traits, not the implementations, so
+nothing else changes. The Llama backend was added exactly this way.
 
-```rust
-use garuda::core::{InferenceBackend, ModelDims, Tensor, Token, GarudaError};
-use garuda::cache::SeqState;
-
-struct MyBackend { dims: ModelDims }
-
-impl InferenceBackend for MyBackend {
-    fn dims(&self) -> ModelDims { self.dims }
-
-    fn hidden(&self, ctx: &[Token], seq: &mut SeqState) -> Result<Tensor, GarudaError> {
-        if ctx.is_empty() { return Err(GarudaError::Inference("empty context".into())); }
-        for &tok in &ctx[seq.len()..] {          // invariant 1: only unseen tokens
-            let (k, v) = /* your attention key/value for this token */;
-            seq.kv().append(&k, &v)?;            // invariant 2: one position appended
-            // … your forward pass …
-        }
-        Tensor::new(vec![self.dims.d_model], /* final hidden state */)
-    }
-
-    fn logits(&self, ctx: &[Token], seq: &mut SeqState) -> Result<Tensor, GarudaError> {
-        let h = self.hidden(ctx, seq)?;
-        Tensor::new(vec![self.dims.vocab_size], /* project h to vocab */) // invariant 3
-    }
-}
-```
-
-Then construct it in [`server::Engine::build`](garuda/src/server/mod.rs) — the one
-place that picks which backend and tokenizer to build. The runtime, scheduler and
-API depend on the traits, not the implementations, so nothing else changes. The
-Llama backend was added exactly this way.
+For a step-by-step walkthrough with a **complete, runnable example** — a custom
+backend built from scratch, satisfying each invariant, wired into the runtime and
+registered in `Engine::build` — see **[PLUGIN.md](PLUGIN.md)** and
+[`garuda/examples/custom_backend.rs`](garuda/examples/custom_backend.rs)
+(`cargo run --example custom_backend`).
 
 ### What is still missing
 
