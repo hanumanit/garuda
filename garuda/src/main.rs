@@ -66,9 +66,22 @@ fn inspect(path: &std::path::Path) -> anyhow::Result<()> {
     println!("tensors       {}", gguf.tensors.len());
     println!("metadata keys {}", gguf.metadata.len());
     println!("data offset   {}", gguf.data_offset);
+
+    // Report loadability honestly: F32 (type 0) and F16 (type 1) load; anything
+    // quantised does not, and only the llama architecture is wired up.
+    let arch = gguf.architecture().unwrap_or("(unknown)");
+    let quantised = gguf
+        .tensors
+        .iter()
+        .any(|t| t.ggml_type != 0 && t.ggml_type != 1);
     println!();
-    println!("Garuda can read this file's metadata but cannot load its weights:");
-    println!("nothing dequantises GGUF tensors into experts yet.");
+    if arch == "llama" && !quantised {
+        println!("loadable      yes — F32/F16 llama. Run it with `model.gguf = \"{}\"`.", path.display());
+    } else if arch != "llama" {
+        println!("loadable      no — only the llama architecture is supported (this is '{arch}').");
+    } else {
+        println!("loadable      no — this checkpoint is quantised; only F32/F16 weights load today.");
+    }
     Ok(())
 }
 
