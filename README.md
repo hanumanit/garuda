@@ -46,16 +46,16 @@ the streaming, the cancellation, the load shedding.
 
 | | Status |
 |---|---|
-| Load & run a real model from GGUF (Llama; F32/F16/Q4_0/Q8_0) | Real, tested |
+| Load & run a real model from GGUF (Llama; F32/F16/Q4_0/Q8_0/Q2_K–Q6_K) | Real, tested |
 | SentencePiece tokenizer from GGUF | Real, tested |
-| Transformer forward pass (GQA + RoPE + SwiGLU; MoE routing) | Real, tested |
+| Transformer forward pass — dense **and** mixture-of-experts (top-k routing) | Real, tested |
 | Tiered expert storage (L1 RAM → L2 disk → L3 archive) | Real, tested |
 | Paged KV cache with disk spill (multi-layer, GQA-aware) | Real, tested |
 | Scheduler (priority, concurrency limits, cancellation, timeouts, backpressure) | Real, tested |
 | OpenAI-compatible API + SSE + WebSocket | Real, tested |
 | Dequantisation: F32 / F16 / Q4_0 / Q8_0 / Q2_K–Q6_K | Real, tested (runs Q2_K…Q5_K_M models) |
-| Memory-mapped packed weights (`mmap = true`) | Real, tested (~6× less RAM, same output) |
-| **Efficient streaming of a model larger than RAM** | **Not implemented** — a dense model pages all its weights per token |
+| Memory-mapped packed weights (`mmap = true`), incl. per-expert streaming | Real, tested (~6× less RAM, same output) |
+| **A real MoE checkpoint at scale (e.g. Mixtral)** | **Not run** — the MoE path is verified on a synthetic model; no large MoE was downloadable here |
 | **GPU backend** | **Not implemented** (`gpu = true` is a startup error) |
 | **Authentication** | **Not implemented** — do not expose this to a network |
 
@@ -214,16 +214,16 @@ registered in `Engine::build` — see **[PLUGIN.md](PLUGIN.md)** and
 
 ### What is still missing
 
-- **Efficient large-model streaming.** [`quant`](garuda/src/quant/mod.rs) dequantises
-  F32, F16, Q4_0, Q8_0 and every k-quant `Q2_K`–`Q6_K`, and `mmap = true` keeps the
-  weights packed so the model uses ~its on-disk size. But the backend is a *dense*
-  Llama: every token reads every weight, so a checkpoint larger than RAM would page
-  its whole self from disk each token. The efficient path — loading only the top-k
-  experts a token routes to — needs a real MoE backend, which is the next phase. A
-  faster integer matmul kernel (instead of dequantising to f32 per row) would help too.
-  (The `*_1` linear quants and the IQ imatrix quants also still need decoders.)
-- **Architectures beyond Llama.** `LlamaBackend` covers the Llama family (dense,
-  GQA). Other architectures each need their own `InferenceBackend`.
+- **A large MoE at scale.** The Llama backend runs both dense and mixture-of-experts
+  FFNs: a router scores the experts, and only the top-k a token selects are executed,
+  reading just their slice of the stacked expert tensors — so under `mmap` a token
+  pages in only those experts. This is verified on a synthetic MoE model (routing,
+  blending, and packed-vs-expanded equivalence all tested), but **not** yet on a real
+  large MoE like Mixtral — none was downloadable in this environment (16 GB checkpoint,
+  5 GB of disk). A faster integer matmul kernel (instead of dequantising to f32 per row)
+  would also help. (The `*_1` linear quants and IQ imatrix quants still need decoders.)
+- **Architectures beyond Llama.** `LlamaBackend` covers the Llama family (dense and
+  MoE, GQA). Other architectures each need their own `InferenceBackend`.
 
 ---
 

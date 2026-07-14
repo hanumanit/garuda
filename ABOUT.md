@@ -33,9 +33,10 @@ streaming.
 Garuda is honest about its edges. It decodes **F32, F16, Q4_0, Q8_0 and every k-quant
 from `Q2_K` to `Q6_K`** — the formats nearly every GGUF download uses — and with
 `mmap = true` keeps the weights packed so the model uses roughly its on-disk size.
-What it does *not* yet do is stream a model larger than RAM efficiently: the backend
-is a dense Llama, so every token reads every weight. There is **no GPU backend**
-(`gpu = true` is a
+The backend runs both dense and mixture-of-experts FFNs, executing only the top-k
+experts a token routes to (and, under `mmap`, paging in only those). That MoE path is
+verified on a synthetic model but has not been run on a real large MoE like Mixtral —
+none fit the disk here. There is **no GPU backend** (`gpu = true` is a
 startup error, not a silent fallback), and **no authentication** — do not expose it
 to a network you do not control.
 

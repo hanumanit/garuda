@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.0] - 2026-07-14
+
+A mixture-of-experts feed-forward path — the streaming payoff of the packed-weight
+work. A token now runs only the experts it routes to.
+
+### Added
+
+- **MoE in the Llama backend.** When a checkpoint declares experts (`llama.expert_count`)
+  and a block has the stacked expert tensors, its feed-forward becomes a mixture of
+  experts: a router (`ffn_gate_inp`) scores the experts, softmax + top-k + renormalise
+  (standard Mixtral gating), and only the selected experts run — each read as a row-slice
+  of the stacked `ffn_{gate,up,down}_exps` tensors via the new `Weight::matvec_rows`.
+  Under `mmap`, a token therefore pages in only its top-k experts, not the whole layer —
+  the expert-streaming property.
+- A minimal in-memory GGUF writer in the tests, used to build a synthetic 4-expert
+  (top-2) model and verify the MoE path end to end.
+
+Verified: the synthetic MoE model loads, routes and produces finite logits; different
+contexts give different outputs; and the packed (`mmap`) run matches the f32-expanded
+run — which proves the per-expert byte offsets into the stacked tensors are right. The
+dense path (TinyLlama Q4_K_M) is unchanged, still "Paris" in both modes.
+
+### Not done
+
+- No real large MoE (e.g. Mixtral) was run: the smallest Mixtral quant is ~16 GB and
+  this environment had ~5 GB of disk and a slow link. The MoE path is verified
+  structurally and against a synthetic model, not against a famous checkpoint's output.
+
 ## [0.5.1] - 2026-07-14
 
 Made the packed (`mmap`) path faster.

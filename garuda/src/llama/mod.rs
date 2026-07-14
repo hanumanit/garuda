@@ -1,14 +1,15 @@
-//! A Llama-family dense transformer backend, loaded from a GGUF checkpoint.
+//! A Llama-family transformer backend, loaded from a GGUF checkpoint.
 //!
-//! This is the real thing running on real trained weights: `token_embd`, per-block
-//! RMSNorm + grouped-query attention with RoPE + SwiGLU feed-forward, a final norm,
-//! and an output projection. It implements the same [`InferenceBackend`] as the
-//! synthetic MoE engine, so it drops into the existing runtime, scheduler and API
-//! with nothing else changed — which is the whole point of the trait.
+//! Real weights, real math: `token_embd`, per-block RMSNorm + grouped-query attention
+//! with RoPE, and a feed-forward network that is either a dense SwiGLU or a mixture of
+//! experts (a router picks the top-k experts to run per token). A final norm and an
+//! output head produce the logits. It implements the same [`InferenceBackend`] as the
+//! synthetic MoE engine, so it drops into the existing runtime, scheduler and API.
 //!
-//! Only F32/F16 checkpoints load; quantised tensors are rejected by the GGUF reader
-//! because no dequantiser exists yet. In practice that means small models (the
-//! TinyStories checkpoints are F32).
+//! Weights load in any format [`crate::quant`] decodes (F32/F16/Q4_0/Q8_0/Q2_K–Q6_K).
+//! With `mmap`, each projection — including per-expert matrices — stays packed in the
+//! mapped file and is dequantised a row at a time; for MoE that means a token only
+//! pages in the top-k experts it routes to.
 
 use crate::cache::{KVCacheState, SeqState};
 use crate::core::{GarudaError, InferenceBackend, ModelDims, Tensor, Token};
@@ -26,48 +27,55 @@ use std::sync::Arc;
 enum Weight {
     Full {
         data: Vec<f32>,
-        rows: usize,
         cols: usize,
     },
     Packed {
         qtype: u32,
-        rows: usize,
         cols: usize,
         src: Arc<Mmap>,
         start: usize,
-        len: usize,
     },
 }
 
 impl Weight {
-    /// `out[r] = dot(row r, x)`.
+    /// `out[r] = dot(row r, x)` over the whole matrix.
     fn matvec(&self, x: &[f32], out: &mut [f32]) -> Result<(), GarudaError> {
+        self.matvec_rows(0, x, out)
+    }
+
+    /// `out[i] = dot(row (row_start + i), x)`, i.e. a matvec over the `out.len()` rows
+    /// starting at `row_start`. Used to view one expert's slice of a stacked 3D expert
+    /// tensor without copying it out.
+    fn matvec_rows(&self, row_start: usize, x: &[f32], out: &mut [f32]) -> Result<(), GarudaError> {
+        let n = out.len();
         match self {
-            Weight::Full { data, rows, cols } => {
-                simd::matvec(data, *rows, *cols, x, out);
+            Weight::Full { data, cols } => {
+                let off = row_start * cols;
+                simd::matvec(&data[off..off + n * cols], n, *cols, x, out);
                 Ok(())
             }
             Weight::Packed {
                 qtype,
-                rows,
                 cols,
                 src,
                 start,
-                len,
-            } => quant::matvec(*qtype, &src[*start..*start + *len], *rows, *cols, x, out),
+            } => {
+                let row_bytes = quant::byte_size(*qtype, *cols)?;
+                let off = start + row_start * row_bytes;
+                quant::matvec(*qtype, &src[off..off + n * row_bytes], n, *cols, x, out)
+            }
         }
     }
 
     /// Dequantise a single row (e.g. one embedding).
     fn row(&self, r: usize) -> Result<Vec<f32>, GarudaError> {
         match self {
-            Weight::Full { data, cols, .. } => Ok(data[r * cols..(r + 1) * cols].to_vec()),
+            Weight::Full { data, cols } => Ok(data[r * cols..(r + 1) * cols].to_vec()),
             Weight::Packed {
                 qtype,
                 cols,
                 src,
                 start,
-                ..
             } => {
                 let row_bytes = quant::byte_size(*qtype, *cols)?;
                 let off = start + r * row_bytes;
@@ -90,6 +98,10 @@ pub struct LlamaConfig {
     pub context: usize,
     pub rms_eps: f32,
     pub rope_theta: f32,
+    /// Number of experts in a mixture-of-experts FFN. `0` means a dense FFN.
+    pub n_experts: usize,
+    /// Experts activated per token (top-k). Unused when `n_experts == 0`.
+    pub n_experts_used: usize,
 }
 
 impl LlamaConfig {
@@ -141,6 +153,8 @@ impl LlamaConfig {
                 .arch_f32("attention.layer_norm_rms_epsilon")
                 .unwrap_or(1e-5),
             rope_theta: g.arch_f32("rope.freq_base").unwrap_or(10_000.0),
+            n_experts: g.arch_u64("expert_count").unwrap_or(0) as usize,
+            n_experts_used: g.arch_u64("expert_used_count").unwrap_or(0) as usize,
         })
     }
 
@@ -166,8 +180,28 @@ impl LlamaConfig {
     }
 }
 
-/// One transformer block's weights. Norms are small and always `f32`; the four
-/// projection matrices may be packed.
+/// A block's feed-forward network: either a single dense SwiGLU, or a mixture of
+/// experts where a router picks the top-k experts to run for each token.
+///
+/// For MoE, `gate`/`up`/`down` are the *stacked* expert tensors: expert `e`'s matrix
+/// is the row-slice `[e·d_ff, (e+1)·d_ff)` (or `d_model` for `down`), read on demand.
+/// Under `mmap`, only the selected experts' rows are ever paged in — the streaming win.
+enum Ffn {
+    Dense {
+        gate: Weight,
+        up: Weight,
+        down: Weight,
+    },
+    Moe {
+        router: Weight,
+        gate: Weight,
+        up: Weight,
+        down: Weight,
+    },
+}
+
+/// One transformer block's weights. Norms are small and always `f32`; the projection
+/// matrices may be packed.
 struct Layer {
     attn_norm: Vec<f32>,
     wq: Weight,
@@ -175,9 +209,7 @@ struct Layer {
     wv: Weight,
     wo: Weight,
     ffn_norm: Vec<f32>,
-    gate: Weight,
-    up: Weight,
-    down: Weight,
+    ffn: Ffn,
 }
 
 pub struct LlamaBackend {
@@ -240,16 +272,13 @@ impl LlamaBackend {
                     }
                     Ok(Weight::Packed {
                         qtype: t.ggml_type,
-                        rows,
                         cols,
                         src: src.clone(),
                         start,
-                        len,
                     })
                 }
                 None => Ok(Weight::Full {
                     data: g.tensor_f32(bytes, name)?,
-                    rows,
                     cols,
                 }),
             }
@@ -264,9 +293,28 @@ impl LlamaBackend {
             weight("token_embd.weight", v, d)?
         };
 
+        let ne = cfg.n_experts;
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for l in 0..cfg.n_layers {
             let p = |name: &str| format!("blk.{l}.{name}.weight");
+
+            // A layer is MoE if the model declares experts and the block has the
+            // stacked expert tensors; otherwise it is a plain dense FFN.
+            let ffn = if ne > 0 && g.tensor(&p("ffn_gate_exps")).is_some() {
+                Ffn::Moe {
+                    router: weight(&p("ffn_gate_inp"), ne, d)?,
+                    gate: weight(&p("ffn_gate_exps"), ne * f, d)?,
+                    up: weight(&p("ffn_up_exps"), ne * f, d)?,
+                    down: weight(&p("ffn_down_exps"), ne * d, f)?,
+                }
+            } else {
+                Ffn::Dense {
+                    gate: weight(&p("ffn_gate"), f, d)?,
+                    up: weight(&p("ffn_up"), f, d)?,
+                    down: weight(&p("ffn_down"), d, f)?,
+                }
+            };
+
             layers.push(Layer {
                 attn_norm: norm(&p("attn_norm"), d)?,
                 wq: weight(&p("attn_q"), d, d)?,
@@ -274,9 +322,7 @@ impl LlamaBackend {
                 wv: weight(&p("attn_v"), hk, d)?,
                 wo: weight(&p("attn_output"), d, d)?,
                 ffn_norm: norm(&p("ffn_norm"), d)?,
-                gate: weight(&p("ffn_gate"), f, d)?,
-                up: weight(&p("ffn_up"), f, d)?,
-                down: weight(&p("ffn_down"), d, f)?,
+                ffn,
             });
         }
 
@@ -390,18 +436,63 @@ impl LlamaBackend {
         Ok(out)
     }
 
-    /// SwiGLU: `down(silu(gate·h) ⊙ (up·h))`.
-    fn feed_forward(&self, layer: &Layer, h: &[f32]) -> Result<Vec<f32>, GarudaError> {
+    /// One SwiGLU expert `e`: `down_e(silu(gate_e·h) ⊙ (up_e·h))`. `e = 0` for a dense
+    /// FFN (a single expert spanning the whole tensor).
+    fn expert(
+        &self,
+        gate: &Weight,
+        up: &Weight,
+        down: &Weight,
+        e: usize,
+        h: &[f32],
+    ) -> Result<Vec<f32>, GarudaError> {
         let (d, f) = (self.cfg.d_model, self.cfg.d_ff);
-        let mut gate = vec![0.0; f];
-        let mut up = vec![0.0; f];
-        layer.gate.matvec(h, &mut gate)?;
-        layer.up.matvec(h, &mut up)?;
-        simd::silu(&mut gate);
-        simd::mul_assign(&mut gate, &up);
+        let mut g = vec![0.0; f];
+        let mut u = vec![0.0; f];
+        gate.matvec_rows(e * f, h, &mut g)?;
+        up.matvec_rows(e * f, h, &mut u)?;
+        simd::silu(&mut g);
+        simd::mul_assign(&mut g, &u);
         let mut out = vec![0.0; d];
-        layer.down.matvec(&gate, &mut out)?;
+        down.matvec_rows(e * d, &g, &mut out)?;
         Ok(out)
+    }
+
+    /// The block's feed-forward, dense or mixture-of-experts.
+    fn feed_forward(&self, layer: &Layer, h: &[f32]) -> Result<Vec<f32>, GarudaError> {
+        match &layer.ffn {
+            Ffn::Dense { gate, up, down } => self.expert(gate, up, down, 0, h),
+            Ffn::Moe {
+                router,
+                gate,
+                up,
+                down,
+            } => {
+                let d = self.cfg.d_model;
+                let (ne, k) = (self.cfg.n_experts, self.cfg.n_experts_used.max(1));
+
+                // Route: score every expert, softmax, take the top-k, renormalise their
+                // weights — the standard Mixtral gating.
+                let mut scores = vec![0.0; ne];
+                router.matvec(h, &mut scores)?;
+                simd::softmax(&mut scores);
+
+                let mut ranked: Vec<(usize, f32)> = scores.iter().copied().enumerate().collect();
+                ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+                ranked.truncate(k);
+                let sum: f32 = ranked.iter().map(|(_, w)| w).sum();
+                let norm = if sum > 0.0 { 1.0 / sum } else { 1.0 / k as f32 };
+
+                // Run only the chosen experts and blend by weight. Under mmap, this is
+                // the only place a token touches expert weights — top-k of ne per layer.
+                let mut out = vec![0.0; d];
+                for (e, w) in ranked {
+                    let y = self.expert(gate, up, down, e, h)?;
+                    simd::add_scaled(&mut out, &y, w * norm);
+                }
+                Ok(out)
+            }
+        }
     }
 }
 
@@ -457,5 +548,285 @@ impl InferenceBackend for LlamaBackend {
         let mut logits = vec![0.0; self.cfg.vocab];
         self.output.matvec(x.data(), &mut logits)?;
         Tensor::new(vec![self.cfg.vocab], logits)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::{KvConfig, SeqState};
+    use std::io::Write;
+
+    // ---- a minimal GGUF writer, to build a synthetic MoE model with real data ----
+
+    fn put_str(out: &mut Vec<u8>, s: &str) {
+        out.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        out.extend_from_slice(s.as_bytes());
+    }
+    fn kv_u32(out: &mut Vec<u8>, key: &str, v: u32) {
+        put_str(out, key);
+        out.extend_from_slice(&4u32.to_le_bytes());
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    fn kv_f32(out: &mut Vec<u8>, key: &str, v: f32) {
+        put_str(out, key);
+        out.extend_from_slice(&6u32.to_le_bytes());
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    fn kv_str(out: &mut Vec<u8>, key: &str, v: &str) {
+        put_str(out, key);
+        out.extend_from_slice(&8u32.to_le_bytes());
+        put_str(out, v);
+    }
+    fn kv_str_array(out: &mut Vec<u8>, key: &str, vals: &[String]) {
+        put_str(out, key);
+        out.extend_from_slice(&9u32.to_le_bytes()); // ARRAY
+        out.extend_from_slice(&8u32.to_le_bytes()); // of STRING
+        out.extend_from_slice(&(vals.len() as u64).to_le_bytes());
+        for v in vals {
+            put_str(out, v);
+        }
+    }
+
+    /// Deterministic small weights, distinct per tensor `seed`.
+    fn gen(seed: usize, n: usize) -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let h = seed
+                    .wrapping_mul(2_654_435_761)
+                    .wrapping_add(i.wrapping_mul(40_503));
+                (h % 2000) as f32 / 2000.0 - 0.5
+            })
+            .collect()
+    }
+
+    /// Build a tiny MoE llama GGUF (F32 weights) entirely in memory.
+    fn build_moe_gguf() -> Vec<u8> {
+        let (d, kv_dim, ff, nl, vocab, ne) = (32usize, 16usize, 32usize, 2usize, 64usize, 4usize);
+
+        // (name, ne-order dims, data)
+        let mut tensors: Vec<(String, Vec<u64>, Vec<f32>)> = Vec::new();
+        let add = |name: String,
+                   ne: Vec<u64>,
+                   seed: usize,
+                   tv: &mut Vec<(String, Vec<u64>, Vec<f32>)>| {
+            let n: usize = ne.iter().product::<u64>() as usize;
+            let data = if name.contains("norm") {
+                vec![1.0; n] // norms near 1 so rmsnorm output is sane
+            } else {
+                gen(seed, n)
+            };
+            tv.push((name, ne, data));
+        };
+        let mut s = 1;
+        add(
+            "token_embd.weight".into(),
+            vec![d as u64, vocab as u64],
+            s,
+            &mut tensors,
+        );
+        s += 1;
+        add("output_norm.weight".into(), vec![d as u64], s, &mut tensors);
+        s += 1;
+        add(
+            "output.weight".into(),
+            vec![d as u64, vocab as u64],
+            s,
+            &mut tensors,
+        );
+        s += 1;
+        for l in 0..nl {
+            let p = |n: &str| format!("blk.{l}.{n}.weight");
+            for (name, ne) in [
+                (p("attn_norm"), vec![d as u64]),
+                (p("attn_q"), vec![d as u64, d as u64]),
+                (p("attn_k"), vec![d as u64, kv_dim as u64]),
+                (p("attn_v"), vec![d as u64, kv_dim as u64]),
+                (p("attn_output"), vec![d as u64, d as u64]),
+                (p("ffn_norm"), vec![d as u64]),
+                (p("ffn_gate_inp"), vec![d as u64, ne as u64]),
+                (p("ffn_gate_exps"), vec![d as u64, ff as u64, ne as u64]),
+                (p("ffn_up_exps"), vec![d as u64, ff as u64, ne as u64]),
+                (p("ffn_down_exps"), vec![ff as u64, d as u64, ne as u64]),
+            ] {
+                add(name, ne, s, &mut tensors);
+                s += 1;
+            }
+        }
+
+        // metadata
+        let mut meta = Vec::new();
+        let mut kv_count = 0u64;
+        macro_rules! m {
+            ($f:expr) => {{
+                $f;
+                kv_count += 1;
+            }};
+        }
+        m!(kv_str(&mut meta, "general.architecture", "llama"));
+        m!(kv_u32(&mut meta, "llama.embedding_length", d as u32));
+        m!(kv_u32(&mut meta, "llama.block_count", nl as u32));
+        m!(kv_u32(&mut meta, "llama.attention.head_count", 4));
+        m!(kv_u32(&mut meta, "llama.attention.head_count_kv", 2));
+        m!(kv_u32(&mut meta, "llama.feed_forward_length", ff as u32));
+        m!(kv_u32(&mut meta, "llama.context_length", 64));
+        m!(kv_f32(
+            &mut meta,
+            "llama.attention.layer_norm_rms_epsilon",
+            1e-5
+        ));
+        m!(kv_u32(&mut meta, "llama.expert_count", ne as u32));
+        m!(kv_u32(&mut meta, "llama.expert_used_count", 2));
+        let toks: Vec<String> = (0..vocab).map(|i| format!("t{i}")).collect();
+        m!(kv_str_array(&mut meta, "tokenizer.ggml.tokens", &toks));
+
+        // tensor data offsets (each aligned to 32, relative to the data section)
+        let align = |x: usize| x.next_multiple_of(32);
+        let mut offsets = Vec::new();
+        let mut cursor = 0usize;
+        for (_, _, data) in &tensors {
+            let off = align(cursor);
+            offsets.push(off as u64);
+            cursor = off + data.len() * 4;
+        }
+        let data_size = align(cursor);
+
+        // tensor infos
+        let mut infos = Vec::new();
+        for ((name, ne, _), &off) in tensors.iter().zip(&offsets) {
+            put_str(&mut infos, name);
+            infos.extend_from_slice(&(ne.len() as u32).to_le_bytes());
+            for &dim in ne {
+                infos.extend_from_slice(&dim.to_le_bytes());
+            }
+            infos.extend_from_slice(&0u32.to_le_bytes()); // type F32
+            infos.extend_from_slice(&off.to_le_bytes());
+        }
+
+        // assemble
+        let mut out = Vec::new();
+        out.extend_from_slice(b"GGUF");
+        out.extend_from_slice(&3u32.to_le_bytes());
+        out.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+        out.extend_from_slice(&kv_count.to_le_bytes());
+        out.extend_from_slice(&meta);
+        out.extend_from_slice(&infos);
+        let data_start = out.len().next_multiple_of(32);
+        out.resize(data_start, 0);
+        let base = out.len();
+        out.resize(base + data_size, 0);
+        for ((_, _, data), &off) in tensors.iter().zip(&offsets) {
+            let at = base + off as usize;
+            for (i, &v) in data.iter().enumerate() {
+                out[at + i * 4..at + i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    fn seq_for(b: &LlamaBackend) -> SeqState {
+        let lc = b.config();
+        SeqState::new(
+            KvConfig {
+                dims: b.dims(),
+                kv_dim: lc.kv_dim(),
+                n_layers: lc.n_layers,
+                max_positions: 64,
+                max_resident_blocks: 64,
+                sliding_window: None,
+                storage: None,
+            },
+            1,
+        )
+    }
+
+    #[test]
+    fn matvec_rows_agrees_between_full_and_packed() {
+        let (rows, cols) = (6usize, 4usize);
+        let mat: Vec<f32> = (0..rows * cols).map(|i| i as f32 * 0.1 - 1.0).collect();
+        let x = vec![0.5, -1.0, 2.0, 0.25];
+
+        let full = Weight::Full {
+            data: mat.clone(),
+            cols,
+        };
+
+        // Packed(F32) over a memory-mapped copy of the same bytes.
+        let dir = std::env::temp_dir().join("garuda_matvec_rows");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("m.bin");
+        let mut bytes = Vec::new();
+        for &v in &mat {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        let mmap = Arc::new(unsafe { Mmap::map(&std::fs::File::open(&path).unwrap()).unwrap() });
+        let packed = Weight::Packed {
+            qtype: crate::quant::F32,
+            cols,
+            src: mmap,
+            start: 0,
+        };
+
+        // A sub-range of rows [2, 5).
+        let mut of = vec![0.0; 3];
+        let mut op = vec![0.0; 3];
+        full.matvec_rows(2, &x, &mut of).unwrap();
+        packed.matvec_rows(2, &x, &mut op).unwrap();
+
+        for r in 0..3 {
+            let naive: f32 = (0..cols).map(|c| mat[(2 + r) * cols + c] * x[c]).sum();
+            assert!((of[r] - naive).abs() < 1e-5, "full row {r}");
+            assert!((op[r] - naive).abs() < 1e-5, "packed row {r}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn synthetic_moe_model_loads_routes_and_runs() {
+        let bytes = build_moe_gguf();
+
+        // f32-expand path
+        let f32b = LlamaBackend::load(&bytes).unwrap();
+        assert_eq!(f32b.config().n_experts, 4);
+        assert_eq!(f32b.config().n_experts_used, 2);
+        assert!(!f32b.is_mmapped());
+
+        let mut s1 = seq_for(&f32b);
+        let a = f32b.logits(&[3, 7, 1], &mut s1).unwrap();
+        assert_eq!(a.shape(), &[64]);
+        assert!(
+            a.data().iter().all(|v| v.is_finite()),
+            "MoE produced non-finite logits"
+        );
+
+        // Different context must give different logits (the model is actually routing
+        // and computing, not degenerate).
+        let mut s2 = seq_for(&f32b);
+        let b = f32b.logits(&[9, 2, 5], &mut s2).unwrap();
+        assert_ne!(a.data(), b.data());
+
+        // mmap path: same model, weights kept packed and dequantised per row.
+        let dir = std::env::temp_dir().join("garuda_moe_gguf");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("moe.gguf");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+        let mmap = Arc::new(unsafe { Mmap::map(&std::fs::File::open(&path).unwrap()).unwrap() });
+        let g = Gguf::parse(&mmap).unwrap();
+        let mmb = LlamaBackend::from_gguf(&g, &mmap, Some(mmap.clone())).unwrap();
+        assert!(mmb.is_mmapped());
+
+        let mut s3 = seq_for(&mmb);
+        let c = mmb.logits(&[3, 7, 1], &mut s3).unwrap();
+
+        // The packed path must match f32 exactly-ish — proving the per-expert slice
+        // offsets (e·d_ff, e·d_model) into the stacked expert tensors are correct.
+        for (x, y) in a.data().iter().zip(c.data()) {
+            assert!((x - y).abs() < 1e-3, "f32 {x} vs mmap {y}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
