@@ -9,7 +9,8 @@
 use crate::api::{SharedState, MODEL_ID};
 use crate::core::GarudaError;
 use crate::runtime::SamplingParams;
-use crate::scheduler::{Priority, RequestSpec, StreamEvent};
+use crate::scheduler::Priority;
+use crate::session::{self, Piece};
 use axum::{
     body::Body,
     extract::State,
@@ -18,6 +19,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
 use std::convert::Infallible;
@@ -192,13 +194,7 @@ async fn run(
     params: SamplingParams,
     stream: bool,
 ) -> Response {
-    let handle = match state.scheduler.submit(RequestSpec {
-        user_id: "ollama".to_owned(),
-        prompt: tokens,
-        params,
-        priority: Priority::Normal,
-        timeout: state.request_timeout,
-    }) {
+    let handle = match session::submit(&state, "ollama", tokens, params, Priority::Normal) {
         Ok(h) => h,
         Err(e) => return map_error(&e),
     };
@@ -206,29 +202,20 @@ async fn run(
     if stream {
         let started = Instant::now();
         let body = async_stream::stream! {
-            let mut handle = handle; // moved in; dropping it cancels on disconnect
-            let mut decoder = state.runtime.tokenizer.stream_decoder();
+            let pieces = session::pieces(state, handle);
+            futures_util::pin_mut!(pieces);
             let mut count = 0usize;
-            while let Some(ev) = handle.events.recv().await {
-                match ev {
-                    StreamEvent::Token(t) => {
-                        let text = decoder.push(t);
-                        if !text.is_empty() {
-                            count += 1;
-                            yield Ok::<_, Infallible>(chunk(kind, &model, &text));
-                        }
+            while let Some(p) = pieces.next().await {
+                match p {
+                    Piece::Text(text) => {
+                        count += 1;
+                        yield Ok::<_, Infallible>(chunk(kind, &model, &text));
                     }
-                    StreamEvent::Done(reason) => {
-                        let tail = decoder.finish();
-                        if !tail.is_empty() {
-                            yield Ok(chunk(kind, &model, &tail));
-                        }
+                    Piece::Done(reason) => {
                         yield Ok(done_line(kind, &model, count, started.elapsed(), stop_reason(reason)));
-                        break;
                     }
-                    StreamEvent::Error(e) => {
+                    Piece::Error(e) => {
                         yield Ok(format!("{}\n", json!({ "error": e.to_string() })));
-                        break;
                     }
                 }
             }
@@ -241,39 +228,20 @@ async fn run(
     }
 
     // Non-streaming: collect everything into a single object.
-    let mut handle = handle;
-    let mut tokens = Vec::new();
-    let mut reason = None;
-    while let Some(ev) = handle.events.recv().await {
-        match ev {
-            StreamEvent::Token(t) => tokens.push(t),
-            StreamEvent::Done(r) => {
-                reason = Some(r);
-                break;
-            }
-            StreamEvent::Error(e) => return map_error(&e),
-        }
-    }
-    let Some(reason) = reason else {
-        return error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "stream ended without a result",
-        );
-    };
-    let text = match state.runtime.tokenizer.decode(&tokens) {
-        Ok(t) => t,
+    let reply = match session::collect(&state, handle).await {
+        Ok(r) => r,
         Err(e) => return map_error(&e),
     };
     let mut v = json!({
         "model": model,
         "created_at": rfc3339(now_secs()),
         "done": true,
-        "done_reason": stop_reason(reason),
-        "eval_count": tokens.len(),
+        "done_reason": stop_reason(reply.reason),
+        "eval_count": reply.tokens,
     });
     match kind {
-        Kind::Generate => v["response"] = json!(text),
-        Kind::Chat => v["message"] = json!({ "role": "assistant", "content": text }),
+        Kind::Generate => v["response"] = json!(reply.text),
+        Kind::Chat => v["message"] = json!({ "role": "assistant", "content": reply.text }),
     }
     Json(v).into_response()
 }
@@ -305,14 +273,11 @@ async fn chat(State(state): State<SharedState>, Json(req): Json<ChatRequest>) ->
         Ok(p) => p,
         Err(e) => return map_error(&e),
     };
-    let mut prompt = String::new();
-    for m in &req.messages {
-        prompt.push_str(&m.role);
-        prompt.push_str(": ");
-        prompt.push_str(&m.content);
-        prompt.push('\n');
-    }
-    prompt.push_str("assistant: ");
+    let prompt = session::render_chat(
+        req.messages
+            .iter()
+            .map(|m| (m.role.as_str(), m.content.as_str())),
+    );
     let tokens = state.runtime.tokenizer.encode(&prompt);
     let model = req.model.unwrap_or_else(|| MODEL_ID.to_owned());
     run(state, Kind::Chat, model, tokens, params, req.stream).await

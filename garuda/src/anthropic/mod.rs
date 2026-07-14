@@ -9,7 +9,8 @@
 use crate::api::{SharedState, MODEL_ID};
 use crate::core::GarudaError;
 use crate::runtime::{SamplingParams, StopReason};
-use crate::scheduler::{Priority, RequestSpec, StreamEvent};
+use crate::scheduler::Priority;
+use crate::session::{self, Piece};
 use axum::{
     extract::State,
     http::StatusCode,
@@ -20,6 +21,7 @@ use axum::{
     routing::post,
     Json, Router,
 };
+use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
@@ -143,13 +145,7 @@ async fn messages(State(state): State<SharedState>, Json(req): Json<MessagesRequ
     let model = req.model.unwrap_or_else(|| MODEL_ID.to_owned());
     let id = format!("msg_{}", Uuid::new_v4().simple());
 
-    let handle = match state.scheduler.submit(RequestSpec {
-        user_id: "anthropic".to_owned(),
-        prompt: tokens,
-        params,
-        priority: Priority::Normal,
-        timeout: state.request_timeout,
-    }) {
+    let handle = match session::submit(&state, "anthropic", tokens, params, Priority::Normal) {
         Ok(h) => h,
         Err(e) => return map_error(&e),
     };
@@ -163,32 +159,13 @@ async fn messages(State(state): State<SharedState>, Json(req): Json<MessagesRequ
 
 async fn collect_message(
     state: SharedState,
-    mut handle: crate::scheduler::Handle,
+    handle: crate::scheduler::Handle,
     id: String,
     model: String,
     input_tokens: usize,
 ) -> Response {
-    let mut tokens = Vec::new();
-    let mut reason = None;
-    while let Some(ev) = handle.events.recv().await {
-        match ev {
-            StreamEvent::Token(t) => tokens.push(t),
-            StreamEvent::Done(r) => {
-                reason = Some(r);
-                break;
-            }
-            StreamEvent::Error(e) => return map_error(&e),
-        }
-    }
-    let Some(reason) = reason else {
-        return error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "api_error",
-            "stream ended without a result",
-        );
-    };
-    let text = match state.runtime.tokenizer.decode(&tokens) {
-        Ok(t) => t,
+    let reply = match session::collect(&state, handle).await {
+        Ok(r) => r,
         Err(e) => return map_error(&e),
     };
 
@@ -197,24 +174,22 @@ async fn collect_message(
         "type": "message",
         "role": "assistant",
         "model": model,
-        "content": [{ "type": "text", "text": text }],
-        "stop_reason": stop_reason(reason),
+        "content": [{ "type": "text", "text": reply.text }],
+        "stop_reason": stop_reason(reply.reason),
         "stop_sequence": null,
-        "usage": { "input_tokens": input_tokens, "output_tokens": tokens.len() },
+        "usage": { "input_tokens": input_tokens, "output_tokens": reply.tokens },
     }))
     .into_response()
 }
 
 fn stream_messages(
     state: SharedState,
-    mut handle: crate::scheduler::Handle,
+    handle: crate::scheduler::Handle,
     id: String,
     model: String,
     input_tokens: usize,
 ) -> Sse<impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>>> {
     let stream = async_stream::stream! {
-        let _keep = &state;
-        let mut decoder = state.runtime.tokenizer.stream_decoder();
         let mut output_tokens = 0usize;
 
         // message_start
@@ -234,29 +209,19 @@ fn stream_messages(
         }).to_string()));
 
         let mut reason = StopReason::Length;
-        while let Some(ev) = handle.events.recv().await {
-            match ev {
-                StreamEvent::Token(t) => {
-                    let piece = decoder.push(t);
-                    if piece.is_empty() { continue; }
+        let pieces = session::pieces(state, handle);
+        futures_util::pin_mut!(pieces);
+        while let Some(p) = pieces.next().await {
+            match p {
+                Piece::Text(text) => {
                     output_tokens += 1;
                     yield Ok(Event::default().event("content_block_delta").data(json!({
                         "type": "content_block_delta", "index": 0,
-                        "delta": { "type": "text_delta", "text": piece }
+                        "delta": { "type": "text_delta", "text": text }
                     }).to_string()));
                 }
-                StreamEvent::Done(r) => {
-                    let tail = decoder.finish();
-                    if !tail.is_empty() {
-                        yield Ok(Event::default().event("content_block_delta").data(json!({
-                            "type": "content_block_delta", "index": 0,
-                            "delta": { "type": "text_delta", "text": tail }
-                        }).to_string()));
-                    }
-                    reason = r;
-                    break;
-                }
-                StreamEvent::Error(e) => {
+                Piece::Done(r) => { reason = r; }
+                Piece::Error(e) => {
                     yield Ok(Event::default().event("error").data(json!({
                         "type": "error",
                         "error": { "type": "api_error", "message": e.to_string() }

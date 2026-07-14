@@ -52,7 +52,7 @@ the streaming, the cancellation, the load shedding.
 | Tiered expert storage (L1 RAM → L2 disk → L3 archive) | Real, tested |
 | Paged KV cache with disk spill (multi-layer, GQA-aware) | Real, tested |
 | Scheduler (priority, concurrency limits, cancellation, timeouts, backpressure) | Real, tested |
-| OpenAI + Ollama + Anthropic APIs, SSE / NDJSON / WebSocket | Real, tested |
+| OpenAI + Ollama + Anthropic + llama.cpp + TGI APIs, SSE / NDJSON / WebSocket | Real, tested |
 | Dequantisation: F32 / F16 / Q4_0 / Q8_0 / Q2_K–Q6_K | Real, tested (runs Q2_K…Q5_K_M models) |
 | Memory-mapped packed weights (`mmap = true`), incl. per-expert streaming | Real, tested (~6× less RAM, same output) |
 | Integer (NEON `i8`) matmul kernel for Q8_0 | Real, tested (2.6× faster on Apple M2, same output) |
@@ -136,10 +136,13 @@ ignored.
 
 ## API
 
-Garuda speaks three wire formats over the same engine, so most existing clients work
-unchanged: **OpenAI**, **Ollama**, and **Anthropic**. The scheduler and runtime don't
-know which protocol asked — each is a thin translation layer (`api`, `ollama`,
-`anthropic`), which is the same seam a new one would slot into.
+Garuda speaks five wire formats over the same engine, so most existing clients work
+unchanged: **OpenAI**, **Ollama**, **Anthropic**, **llama.cpp**, and **TGI**. The
+scheduler and runtime don't know which protocol asked — each adapter (`api`, `ollama`,
+`anthropic`, `llamacpp`, `tgi`) is a thin translation layer over one shared engine core
+(`session`: render the prompt, submit it, drive the result to a full reply or a stream
+of decoded pieces). Adding a protocol means parsing its request and formatting its
+reply; the engine-facing middle is written once.
 
 **OpenAI** — `created` is a real timestamp, streams end with the `data: [DONE]`
 sentinel SDKs wait for, `usage` is reported, `finish_reason` is honest, and errors use
@@ -167,6 +170,23 @@ OpenAI's envelope with the status code clients act on (`429` rate limit, `503` b
 | Endpoint | Notes |
 |---|---|
 | `POST /v1/messages` | `stream: true` for the Anthropic event stream |
+
+**llama.cpp** — the `llama-server` shape: `n_predict`, a single `{"content": …}` object,
+and SSE `{"content": …, "stop": false}` frames ending in a `"stop": true` frame with
+`tokens_predicted` / `tokens_evaluated`.
+
+| Endpoint | Notes |
+|---|---|
+| `POST /completion` | `{"prompt": …, "n_predict": …}`, `stream: true` for SSE |
+
+**TGI** — Hugging Face Text Generation Inference: `{"inputs": …, "parameters": {…}}`,
+with `generated_text` on `/generate` and per-token SSE events on `/generate_stream`
+(the terminal event carries `generated_text` and `details.finish_reason`).
+
+| Endpoint | Notes |
+|---|---|
+| `POST /generate` | `parameters.details: true` adds `finish_reason` / `generated_tokens` |
+| `POST /generate_stream` | Per-token SSE `token` events |
 
 ```bash
 curl -s localhost:8080/v1/chat/completions \

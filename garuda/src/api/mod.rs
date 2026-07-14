@@ -11,7 +11,8 @@
 
 use crate::core::GarudaError;
 use crate::runtime::{InferenceRuntime, SamplingParams};
-use crate::scheduler::{Priority, RequestSpec, Scheduler, StreamEvent};
+use crate::scheduler::{Priority, Scheduler};
+use crate::session::{self, Piece};
 use axum::{
     extract::State,
     http::StatusCode,
@@ -22,6 +23,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -319,19 +321,6 @@ async fn stats(State(state): State<SharedState>) -> impl IntoResponse {
     }))
 }
 
-/// Flatten chat messages into a prompt.
-fn render_chat(messages: &[ChatMessage]) -> String {
-    let mut out = String::new();
-    for m in messages {
-        out.push_str(&m.role);
-        out.push_str(": ");
-        out.push_str(&m.content);
-        out.push('\n');
-    }
-    out.push_str("assistant: ");
-    out
-}
-
 /// Caller identity. There is no auth, so everyone shares one bucket unless they
 /// name themselves — which is a scaffold's honest answer, not a security control.
 fn user_id(headers: &axum::http::HeaderMap) -> String {
@@ -361,19 +350,16 @@ async fn chat_completions(
         Err(e) => return error_response(&e),
     };
 
-    let prompt = state.runtime.tokenizer.encode(&render_chat(&req.messages));
+    let rendered = session::render_chat(
+        req.messages
+            .iter()
+            .map(|m| (m.role.as_str(), m.content.as_str())),
+    );
+    let prompt = state.runtime.tokenizer.encode(&rendered);
     let prompt_tokens = prompt.len();
     let model = req.model.unwrap_or_else(|| MODEL_ID.to_owned());
 
-    let spec = RequestSpec {
-        user_id: user_id(&headers),
-        prompt,
-        params,
-        priority,
-        timeout: state.request_timeout,
-    };
-
-    let handle = match state.scheduler.submit(spec) {
+    let handle = match session::submit(&state, &user_id(&headers), prompt, params, priority) {
         Ok(h) => h,
         Err(e) => return error_response(&e),
     };
@@ -388,33 +374,13 @@ async fn chat_completions(
 
 async fn collect_chat(
     state: SharedState,
-    mut handle: crate::scheduler::Handle,
+    handle: crate::scheduler::Handle,
     id: String,
     model: String,
     prompt_tokens: usize,
 ) -> Response {
-    let mut tokens = Vec::new();
-    let mut finish = None;
-
-    while let Some(ev) = handle.events.recv().await {
-        match ev {
-            StreamEvent::Token(t) => tokens.push(t),
-            StreamEvent::Done(reason) => {
-                finish = Some(reason);
-                break;
-            }
-            StreamEvent::Error(e) => return error_response(&e),
-        }
-    }
-
-    let Some(finish) = finish else {
-        return error_response(&GarudaError::Scheduler(
-            "stream ended without a result".into(),
-        ));
-    };
-
-    let content = match state.runtime.tokenizer.decode(&tokens) {
-        Ok(c) => c,
+    let reply = match session::collect(&state, handle).await {
+        Ok(r) => r,
         Err(e) => return error_response(&e),
     };
 
@@ -427,14 +393,14 @@ async fn collect_chat(
             index: 0,
             message: ChatMessage {
                 role: "assistant".to_owned(),
-                content,
+                content: reply.text,
             },
-            finish_reason: finish.as_openai().to_owned(),
+            finish_reason: reply.reason.as_openai().to_owned(),
         }],
         usage: Usage {
             prompt_tokens,
-            completion_tokens: tokens.len(),
-            total_tokens: prompt_tokens + tokens.len(),
+            completion_tokens: reply.tokens,
+            total_tokens: prompt_tokens + reply.tokens,
         },
     })
     .into_response()
@@ -442,16 +408,11 @@ async fn collect_chat(
 
 fn stream_chat(
     state: SharedState,
-    mut handle: crate::scheduler::Handle,
+    handle: crate::scheduler::Handle,
     id: String,
     model: String,
 ) -> Sse<impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>>> {
     let stream = async_stream::stream! {
-        // `handle` is moved in here, so when the client disconnects and axum drops
-        // this stream, the handle drops with it — which cancels the request. That is
-        // the whole disconnect path: no bookkeeping, nothing to leak.
-        let _keep = &state;
-        let mut decoder = state.runtime.tokenizer.stream_decoder();
         let mut first = true;
 
         let chunk = |delta: Delta, finish: Option<String>| {
@@ -464,15 +425,13 @@ fn stream_chat(
             })
         };
 
-        while let Some(ev) = handle.events.recv().await {
-            match ev {
-                StreamEvent::Token(t) => {
-                    let text = decoder.push(t);
-                    // A byte that does not yet complete a character emits nothing;
-                    // sending an empty delta would just be noise on the wire.
-                    if text.is_empty() && !first {
-                        continue;
-                    }
+        // `handle` moves into `session::pieces`; when the client disconnects and axum
+        // drops this stream, the handle drops with it — which cancels the request.
+        let pieces = session::pieces(state, handle);
+        futures_util::pin_mut!(pieces);
+        while let Some(p) = pieces.next().await {
+            match p {
+                Piece::Text(text) => {
                     let delta = Delta {
                         role: first.then(|| "assistant".to_owned()),
                         content: Some(text),
@@ -482,19 +441,12 @@ fn stream_chat(
                         yield Ok(e);
                     }
                 }
-                StreamEvent::Done(reason) => {
-                    let tail = decoder.finish();
-                    if !tail.is_empty() {
-                        if let Ok(e) = chunk(Delta { role: None, content: Some(tail) }, None) {
-                            yield Ok(e);
-                        }
-                    }
+                Piece::Done(reason) => {
                     if let Ok(e) = chunk(Delta::default(), Some(reason.as_openai().to_owned())) {
                         yield Ok(e);
                     }
-                    break;
                 }
-                StreamEvent::Error(e) => {
+                Piece::Error(e) => {
                     // The stream has already begun; the status line is long gone, so
                     // the error has to travel as an SSE event.
                     if let Ok(ev) = Event::default().json_data(ErrorEnvelope {
@@ -506,13 +458,12 @@ fn stream_chat(
                     }) {
                         yield Ok(ev);
                     }
-                    break;
+                    return;
                 }
             }
         }
 
-        // The sentinel every OpenAI client waits for. The old implementation never
-        // sent it, so well-behaved SDKs hung until their own timeout.
+        // The sentinel every OpenAI client waits for.
         yield Ok(Event::default().data("[DONE]"));
     };
 
@@ -541,13 +492,7 @@ async fn completions(
     let prompt_tokens = prompt.len();
     let model = req.model.unwrap_or_else(|| MODEL_ID.to_owned());
 
-    let handle = match state.scheduler.submit(RequestSpec {
-        user_id: user_id(&headers),
-        prompt,
-        params,
-        priority,
-        timeout: state.request_timeout,
-    }) {
+    let handle = match session::submit(&state, &user_id(&headers), prompt, params, priority) {
         Ok(h) => h,
         Err(e) => return error_response(&e),
     };
@@ -557,27 +502,8 @@ async fn completions(
         return stream_chat(state, handle, id, model).into_response();
     }
 
-    let mut handle = handle;
-    let mut tokens = Vec::new();
-    let mut finish = None;
-    while let Some(ev) = handle.events.recv().await {
-        match ev {
-            StreamEvent::Token(t) => tokens.push(t),
-            StreamEvent::Done(r) => {
-                finish = Some(r);
-                break;
-            }
-            StreamEvent::Error(e) => return error_response(&e),
-        }
-    }
-
-    let Some(finish) = finish else {
-        return error_response(&GarudaError::Scheduler(
-            "stream ended without a result".into(),
-        ));
-    };
-    let text = match state.runtime.tokenizer.decode(&tokens) {
-        Ok(t) => t,
+    let reply = match session::collect(&state, handle).await {
+        Ok(r) => r,
         Err(e) => return error_response(&e),
     };
 
@@ -587,14 +513,14 @@ async fn completions(
         created: now(),
         model,
         choices: vec![CompletionChoice {
-            text,
+            text: reply.text,
             index: 0,
-            finish_reason: finish.as_openai().to_owned(),
+            finish_reason: reply.reason.as_openai().to_owned(),
         }],
         usage: Usage {
             prompt_tokens,
-            completion_tokens: tokens.len(),
-            total_tokens: prompt_tokens + tokens.len(),
+            completion_tokens: reply.tokens,
+            total_tokens: prompt_tokens + reply.tokens,
         },
     })
     .into_response()

@@ -4,9 +4,11 @@ use garuda::anthropic::create_anthropic_router;
 use garuda::api::{create_router, ApiState};
 use garuda::cli::{Cli, Commands};
 use garuda::config::AppConfig;
+use garuda::llamacpp::create_llamacpp_router;
 use garuda::ollama::create_ollama_router;
 use garuda::scheduler::Scheduler;
 use garuda::server::{configure_thread_pool, Backend, Engine};
+use garuda::tgi::create_tgi_router;
 use garuda::websocket::create_ws_router;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -140,7 +142,9 @@ async fn serve(config: AppConfig) -> anyhow::Result<()> {
     let mut app = create_router(state.clone())
         .merge(create_ws_router(state.clone()))
         .merge(create_ollama_router(state.clone()))
-        .merge(create_anthropic_router(state));
+        .merge(create_anthropic_router(state.clone()))
+        .merge(create_llamacpp_router(state.clone()))
+        .merge(create_tgi_router(state));
 
     if config.server.cors {
         warn!("permissive CORS is enabled and this server has no auth");

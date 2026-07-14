@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.0] - 2026-07-14
+
+Two more API front ends — llama.cpp and TGI — and a shared engine core so the
+adapters stop reimplementing the same thing.
+
+### Added
+
+- **llama.cpp-compatible API** (`llamacpp` module): `POST /completion`, speaking
+  `llama-server`'s shape — `n_predict`, a single `{"content": …}` object, and SSE
+  `{"content": …, "stop": false}` frames ending in a `"stop": true` frame with
+  `tokens_predicted` / `tokens_evaluated` / `stopped_eos`.
+- **TGI-compatible API** (`tgi` module): `POST /generate` (`{"generated_text": …}`,
+  optional `details`) and `POST /generate_stream` (per-token SSE `token` events; the
+  terminal event carries `generated_text` and `details.finish_reason`).
+
+### Changed
+
+- **New `session` module — one engine-facing core shared by every front end.** The
+  five adapters (`api`, `ollama`, `anthropic`, `llamacpp`, `tgi`) previously each
+  reimplemented submit → collect-tokens → decode and the streaming decoder loop. That
+  logic now lives once in `session` (`render_chat`, `submit`, `collect`, and a
+  format-agnostic `pieces` stream of decoded text); each adapter is pure translation —
+  parse the request, format the reply. No behaviour change: the 12 OpenAI integration
+  tests and all endpoint shapes are unchanged, verified end to end.
+
+All four HTTP front ends and the WebSocket path were re-verified live (streaming and
+non-streaming) after the refactor.
+
 ## [0.7.0] - 2026-07-14
 
 Two more API front ends — Garuda now speaks OpenAI, Ollama and Anthropic, so most
