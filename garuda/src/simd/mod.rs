@@ -1,9 +1,9 @@
 //! Dense math kernels.
 //!
-//! These are plain Rust written so LLVM auto-vectorises them (chunked, no early
-//! exits). There are no intrinsics and no hand-written assembly here — the name
-//! refers to the codegen, not to hand-rolled SIMD. `matvec` fans rows out across
-//! rayon when the matrix is big enough to pay for the split.
+//! The f32 kernels are plain Rust written so LLVM auto-vectorises them (chunked, no
+//! early exits); `matvec` fans rows out across rayon when the matrix is big enough to
+//! pay for the split. The one place with explicit intrinsics is [`dot_i8`], which uses
+//! aarch64 NEON for the integer quantised matmul path.
 
 use rayon::prelude::*;
 
