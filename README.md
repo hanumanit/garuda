@@ -77,10 +77,10 @@ graph TD
 
     subgraph Forward pass
         RT --> Embed[Embedding]
-        Embed --> Attn[Causal MHA + RoPE]
+        Embed --> Attn[Causal GQA + RoPE]
         Attn --> Router[Router: mixtral / deepseek / qwen]
         Router --> Experts[Top-k SwiGLU experts]
-        Experts --> Logits[Tied output head]
+        Experts --> Logits[Output head: tied or separate]
     end
 
     Attn <-->|read / append| KV[Paged KV cache]
