@@ -30,10 +30,10 @@ streaming.
 
 ## What it is not
 
-Garuda is honest about its edges. It decodes **F32, F16, Q4_0, Q8_0, Q4_K and Q6_K**
-— enough to run a `*_K_M` GGUF — but the remaining k-quants (`Q2_K`, `Q3_K`, `Q5_K`)
-are rejected with a clear error, and weights expand to `f32` at load, so a model must
-fit in RAM at full precision. There is **no GPU backend** (`gpu = true` is a
+Garuda is honest about its edges. It decodes **F32, F16, Q4_0, Q8_0 and every k-quant
+from `Q2_K` to `Q6_K`** — the formats nearly every GGUF download uses — but weights
+expand to `f32` at load, so a model must fit in RAM at full precision. There is **no
+GPU backend** (`gpu = true` is a
 startup error, not a silent fallback), and **no authentication** — do not expose it
 to a network you do not control.
 

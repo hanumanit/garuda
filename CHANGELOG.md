@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.2] - 2026-07-14
+
+The rest of the k-quants — Garuda now decodes every `Q2_K … Q6_K` format, so nearly
+any GGUF download loads.
+
+### Added
+
+- **`Q2_K`, `Q3_K` and `Q5_K` dequantisation**, completing the k-quant set:
+  - Q5_K: Q4_K plus a 5th bit per quant selected from `qh` by a per-group mask.
+  - Q2_K: 2-bit quants with 4-bit packed scale/min pairs.
+  - Q3_K: 3-bit quants with an inverted high-bit mask, and the 16 signed 6-bit scales
+    unpacked from 12 bytes via ggml's 32-bit word juggling — the fiddliest of the set.
+
+Verified end to end: TinyLlama-1.1B in **Q2_K, Q3_K_M and Q5_K_M** all load and answer
+"the capital of France is" with "Paris" (Q3_K_M's reply, "Paris, and the official
+language is French", exercises Q3_K, Q4_K, Q5_K and Q6_K in one forward pass).
+
+### Changed
+
+- Load support is now F32, F16, Q4_0, Q8_0 and the whole k-quant family Q2_K–Q6_K.
+  The one real limit left: weights expand to `f32` at load, so a model must fit in RAM
+  at full precision — the memory-mapped, integer-kernel phase is still ahead. (The
+  `*_1` linear quants and IQ imatrix quants also remain undecoded.)
+
 ## [0.4.1] - 2026-07-14
 
 The k-quants — so Garuda now loads the `*_K_M` checkpoints that make up most GGUF
