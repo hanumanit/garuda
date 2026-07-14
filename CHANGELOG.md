@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.1] - 2026-07-14
+
+An integer matmul kernel for Q8_0 — 2.6× faster on Apple Silicon.
+
+### Added
+
+- **`simd::dot_i8`** — an `i8` dot product that uses baseline NEON on aarch64 (widening
+  `i8×i8→i16` multiply + pairwise accumulate into `i32`) and a scalar fallback elsewhere.
+  Tested to equal the exact integer result on this machine.
+- **A Q8_0 integer matmul.** For packed Q8_0 weights, `quant::matvec` now quantises the
+  activation to int8 once (per 32-block, ggml-style) and dots it against the already-int8
+  weight rows with `dot_i8`, never expanding weights to f32.
+
+Measured on the Q8_0 build of TinyStories 15M under `mmap`: 116 → **306 tok/s** (2.6×),
+with identical generated text — the small activation-quantisation error, the same tradeoff
+llama.cpp makes, doesn't change the output.
+
+### Not done
+
+- The k-quants keep the dequantise-to-f32 path: they are bottlenecked on unpacking their
+  sub-byte quants, not on the dot, so an integer kernel helps far less and is much fiddlier.
+
 ## [0.6.0] - 2026-07-14
 
 A mixture-of-experts feed-forward path — the streaming payoff of the packed-weight

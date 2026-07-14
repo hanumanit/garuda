@@ -15,6 +15,51 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
+/// Integer dot product of two equal-length `i8` slices, returning the exact `i32` sum.
+///
+/// On aarch64 (every Apple Silicon core) it uses baseline NEON — a widening `i8×i8→i16`
+/// multiply and a pairwise accumulate into `i32`, 16 lanes at a time. Everywhere else it
+/// is a scalar loop. This is the primitive an integer quantised matmul is built on.
+pub fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
+    debug_assert_eq!(a.len(), b.len());
+    // NEON is baseline on aarch64, so no runtime detection is needed.
+    #[cfg(target_arch = "aarch64")]
+    let r = unsafe { dot_i8_neon(a, b) };
+    #[cfg(not(target_arch = "aarch64"))]
+    let r = dot_i8_scalar(a, b);
+    r
+}
+
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+fn dot_i8_scalar(a: &[i8], b: &[i8]) -> i32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| x as i32 * y as i32)
+        .sum()
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn dot_i8_neon(a: &[i8], b: &[i8]) -> i32 {
+    use std::arch::aarch64::*;
+    let n = a.len();
+    let chunks = n / 16;
+    let mut acc = vdupq_n_s32(0);
+    for i in 0..chunks {
+        let va = vld1q_s8(a.as_ptr().add(i * 16));
+        let vb = vld1q_s8(b.as_ptr().add(i * 16));
+        // i8×i8 → i16 for the low and high 8 lanes, then pairwise-accumulate into i32.
+        let lo = vmull_s8(vget_low_s8(va), vget_low_s8(vb));
+        let hi = vmull_s8(vget_high_s8(va), vget_high_s8(vb));
+        acc = vpadalq_s16(acc, lo);
+        acc = vpadalq_s16(acc, hi);
+    }
+    let mut sum = vaddvq_s32(acc);
+    for j in chunks * 16..n {
+        sum += a[j] as i32 * b[j] as i32;
+    }
+    sum
+}
+
 /// `out[r] = dot(m[r], x)` for a row-major `[rows, cols]` matrix.
 ///
 /// # Panics
@@ -110,6 +155,28 @@ pub fn rope(v: &mut [f32], pos: usize, theta: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dot_i8_matches_naive_and_scalar_matches_hardware() {
+        // Lengths that exercise the 16-wide body and a ragged tail.
+        for n in [0usize, 1, 15, 16, 31, 32, 64, 100] {
+            let a: Vec<i8> = (0..n).map(|i| (i as i32 % 200 - 100) as i8).collect();
+            let b: Vec<i8> = (0..n).map(|i| (i as i32 * 7 % 200 - 100) as i8).collect();
+            let naive: i32 = a.iter().zip(&b).map(|(&x, &y)| x as i32 * y as i32).sum();
+            assert_eq!(dot_i8_scalar(&a, &b), naive, "scalar n={n}");
+            // dot_i8 uses the hardware path on this machine when available; it must
+            // still equal the exact integer result.
+            assert_eq!(dot_i8(&a, &b), naive, "dispatched n={n}");
+        }
+    }
+
+    #[test]
+    fn dot_i8_handles_extremes_without_overflow() {
+        // 128 × (-128 × -128) fits comfortably in i32.
+        let a = vec![-128i8; 128];
+        let b = vec![-128i8; 128];
+        assert_eq!(dot_i8(&a, &b), 128 * 128 * 128);
+    }
 
     #[test]
     fn matvec_matches_naive_above_and_below_par_threshold() {

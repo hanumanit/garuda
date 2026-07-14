@@ -55,6 +55,7 @@ the streaming, the cancellation, the load shedding.
 | OpenAI-compatible API + SSE + WebSocket | Real, tested |
 | Dequantisation: F32 / F16 / Q4_0 / Q8_0 / Q2_K–Q6_K | Real, tested (runs Q2_K…Q5_K_M models) |
 | Memory-mapped packed weights (`mmap = true`), incl. per-expert streaming | Real, tested (~6× less RAM, same output) |
+| Integer (NEON `i8`) matmul kernel for Q8_0 | Real, tested (2.6× faster on Apple M2, same output) |
 | **A real MoE checkpoint at scale (e.g. Mixtral)** | **Not run** — the MoE path is verified on a synthetic model; no large MoE was downloadable here |
 | **GPU backend** | **Not implemented** (`gpu = true` is a startup error) |
 | **Authentication** | **Not implemented** — do not expose this to a network |
@@ -220,8 +221,12 @@ registered in `Engine::build` — see **[PLUGIN.md](PLUGIN.md)** and
   pages in only those experts. This is verified on a synthetic MoE model (routing,
   blending, and packed-vs-expanded equivalence all tested), but **not** yet on a real
   large MoE like Mixtral — none was downloadable in this environment (16 GB checkpoint,
-  5 GB of disk). A faster integer matmul kernel (instead of dequantising to f32 per row)
-  would also help. (The `*_1` linear quants and IQ imatrix quants still need decoders.)
+  5 GB of disk). (The `*_1` linear quants and IQ imatrix quants still need decoders.)
+- **Integer kernels for the k-quants.** Q8_0 already uses a NEON `i8` dot
+  ([`simd::dot_i8`](garuda/src/simd/mod.rs)) that runs 2.6× faster than dequantising to
+  f32. The k-quants (`Q4_K`…) could too, but they are bottlenecked on unpacking their
+  sub-byte quants rather than on the dot, so the win there is smaller and the code much
+  fiddlier.
 - **Architectures beyond Llama.** `LlamaBackend` covers the Llama family (dense and
   MoE, GQA). Other architectures each need their own `InferenceBackend`.
 

@@ -180,6 +180,13 @@ pub fn matvec(
         )));
     }
 
+    // Q8_0 weights are already int8, so we can dot them with an int8-quantised input
+    // directly — no f32 dequantisation of the weights at all.
+    if qtype == Q8_0 {
+        matvec_q8_0(weight, cols, x, out);
+        return Ok(());
+    }
+
     out.par_iter_mut()
         .zip(weight.par_chunks_exact(row_bytes))
         .try_for_each_init(
@@ -190,6 +197,45 @@ pub fn matvec(
                 Ok(())
             },
         )
+}
+
+/// Q8_0 integer-kernel matvec: quantise `x` to int8 once (per 32-element block, with a
+/// per-block scale, the way ggml quantises activations), then dot each already-int8
+/// weight row with it using `simd::dot_i8`. The weights never touch `f32`.
+///
+/// This introduces a small activation-quantisation error — the same tradeoff llama.cpp
+/// makes for its quantised matmuls — so the result is very close to, but not bit-identical
+/// with, the exact `f32` dequantisation path.
+fn matvec_q8_0(weight: &[u8], cols: usize, x: &[f32], out: &mut [f32]) {
+    use rayon::prelude::*;
+    let nblocks = cols / 32;
+
+    let mut xq = vec![0i8; cols];
+    let mut xs = vec![0.0f32; nblocks];
+    for (b, blk) in x.chunks_exact(32).enumerate() {
+        let amax = blk.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let scale = amax / 127.0;
+        xs[b] = scale;
+        let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+        for (j, &v) in blk.iter().enumerate() {
+            xq[b * 32 + j] = (v * inv).round().clamp(-127.0, 127.0) as i8;
+        }
+    }
+
+    let row_bytes = 34 * nblocks; // Q8_0 block: 2-byte f16 scale + 32 int8
+    out.par_iter_mut()
+        .zip(weight.par_chunks_exact(row_bytes))
+        .for_each(|(o, row)| {
+            let mut sum = 0.0f32;
+            for (b, blk) in row.chunks_exact(34).enumerate() {
+                let ws = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+                // The 32 quant bytes reinterpreted as i8 — same size and alignment.
+                let wq: &[i8] =
+                    unsafe { std::slice::from_raw_parts(blk[2..].as_ptr() as *const i8, 32) };
+                sum += ws * xs[b] * crate::simd::dot_i8(wq, &xq[b * 32..b * 32 + 32]) as f32;
+            }
+            *o = sum;
+        });
 }
 
 /// `block_q8_0`: `[ f16 scale | int8 q[0..32] ]`, dequant `y = scale * q`.
