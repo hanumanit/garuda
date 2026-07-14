@@ -30,6 +30,14 @@ adapters stop reimplementing the same thing.
 All four HTTP front ends and the WebSocket path were re-verified live (streaming and
 non-streaming) after the refactor.
 
+- **Moved to the Rust 2024 edition; MSRV is now 1.85** (was edition 2021 / 1.82). The
+  automated migration touched only test code (`gen` is a reserved word in 2024; an
+  `expr` macro matcher pinned to `expr_2021`). The 2024 tail-expression drop-order
+  change was reviewed at each streaming site and is behaviour-neutral here — the only
+  side-effectful `Drop` is the request `Handle` (cancellation), which is a named local,
+  not a reordered temporary. Verified: full suite and every endpoint pass on both 1.85
+  and 1.97.
+
 ## [0.7.0] - 2026-07-14
 
 Two more API front ends — Garuda now speaks OpenAI, Ollama and Anthropic, so most

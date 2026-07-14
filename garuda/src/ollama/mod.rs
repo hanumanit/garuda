@@ -6,18 +6,18 @@
 //! WebUI and friends — can point at Garuda unchanged. The engine doesn't know or care
 //! which protocol asked; only the request/response shapes differ.
 
-use crate::api::{SharedState, MODEL_ID};
+use crate::api::{MODEL_ID, SharedState};
 use crate::core::GarudaError;
 use crate::runtime::SamplingParams;
 use crate::scheduler::Priority;
 use crate::session::{self, Piece};
 use axum::{
+    Json, Router,
     body::Body,
     extract::State,
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
 };
 use futures_util::StreamExt;
 use serde::Deserialize;

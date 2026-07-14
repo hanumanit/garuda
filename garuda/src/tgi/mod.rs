@@ -13,14 +13,14 @@ use crate::runtime::{SamplingParams, StopReason};
 use crate::scheduler::Priority;
 use crate::session::{self, Piece};
 use axum::{
+    Json, Router,
     extract::State,
     http::StatusCode,
     response::{
-        sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
     },
     routing::post,
-    Json, Router,
 };
 use futures_util::StreamExt;
 use serde::Deserialize;

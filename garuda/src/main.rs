@@ -1,13 +1,13 @@
 use anyhow::Context;
 use clap::Parser;
 use garuda::anthropic::create_anthropic_router;
-use garuda::api::{create_router, ApiState};
+use garuda::api::{ApiState, create_router};
 use garuda::cli::{Cli, Commands};
 use garuda::config::AppConfig;
 use garuda::llamacpp::create_llamacpp_router;
 use garuda::ollama::create_ollama_router;
 use garuda::scheduler::Scheduler;
-use garuda::server::{configure_thread_pool, Backend, Engine};
+use garuda::server::{Backend, Engine, configure_thread_pool};
 use garuda::tgi::create_tgi_router;
 use garuda::websocket::create_ws_router;
 use std::net::SocketAddr;

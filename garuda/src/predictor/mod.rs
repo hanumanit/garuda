@@ -104,7 +104,7 @@ impl ExpertPredictor {
         let mut ranked: Vec<(ExpertId, u64)> = score
             .iter()
             .enumerate()
-            .filter(|(_, &s)| s > 0)
+            .filter(|&(_, &s)| s > 0)
             .map(|(i, &s)| (i as ExpertId, s))
             .collect();
         ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));

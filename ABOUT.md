@@ -46,7 +46,7 @@ the runtime already depended on. See [PLUGIN.md](PLUGIN.md).
 
 ## Facts
 
-- **Language:** Rust (edition 2021, 1.82+)
+- **Language:** Rust (edition 2024, 1.85+)
 - **Tests:** 121 (109 unit + 12 end-to-end HTTP)
 - **Verified:** loads and runs the TinyStories 260K checkpoint end to end
 - **API:** OpenAI-compatible REST + SSE + WebSocket

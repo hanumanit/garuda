@@ -7,20 +7,20 @@
 //! and the many wrappers that target it — can point at Garuda unchanged. Like the
 //! other front ends this is pure translation over the shared [`session`] core.
 
-use crate::api::{SharedState, MODEL_ID};
+use crate::api::{MODEL_ID, SharedState};
 use crate::core::GarudaError;
 use crate::runtime::{SamplingParams, StopReason};
 use crate::scheduler::Priority;
 use crate::session::{self, Piece};
 use axum::{
+    Json, Router,
     extract::State,
     http::StatusCode,
     response::{
-        sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
     },
     routing::post,
-    Json, Router,
 };
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -145,7 +145,9 @@ async fn completion(
                 }
             }
         };
-        return Sse::new(stream).keep_alive(KeepAlive::default()).into_response();
+        return Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response();
     }
 
     let reply = match session::collect(&state, handle).await {

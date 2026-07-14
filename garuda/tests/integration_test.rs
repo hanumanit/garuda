@@ -5,10 +5,10 @@
 //! missing `[DONE]` sentinel, the hardcoded `created` timestamp, and generation
 //! that echoed the prompt back instead of decoding.
 
+use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use axum::Router;
-use garuda::api::{create_router, ApiState};
+use garuda::api::{ApiState, create_router};
 use garuda::config::AppConfig;
 use garuda::scheduler::Scheduler;
 use garuda::server::Engine;

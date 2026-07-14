@@ -589,7 +589,7 @@ mod tests {
     }
 
     /// Deterministic small weights, distinct per tensor `seed`.
-    fn gen(seed: usize, n: usize) -> Vec<f32> {
+    fn r#gen(seed: usize, n: usize) -> Vec<f32> {
         (0..n)
             .map(|i| {
                 let h = seed
@@ -614,7 +614,7 @@ mod tests {
             let data = if name.contains("norm") {
                 vec![1.0; n] // norms near 1 so rmsnorm output is sane
             } else {
-                gen(seed, n)
+                r#gen(seed, n)
             };
             tv.push((name, ne, data));
         };
@@ -658,7 +658,7 @@ mod tests {
         let mut meta = Vec::new();
         let mut kv_count = 0u64;
         macro_rules! m {
-            ($f:expr) => {{
+            ($f:expr_2021) => {{
                 $f;
                 kv_count += 1;
             }};

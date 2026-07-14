@@ -40,24 +40,28 @@ fn dot_i8_scalar(a: &[i8], b: &[i8]) -> i32 {
 
 #[cfg(target_arch = "aarch64")]
 unsafe fn dot_i8_neon(a: &[i8], b: &[i8]) -> i32 {
-    use std::arch::aarch64::*;
-    let n = a.len();
-    let chunks = n / 16;
-    let mut acc = vdupq_n_s32(0);
-    for i in 0..chunks {
-        let va = vld1q_s8(a.as_ptr().add(i * 16));
-        let vb = vld1q_s8(b.as_ptr().add(i * 16));
-        // i8×i8 → i16 for the low and high 8 lanes, then pairwise-accumulate into i32.
-        let lo = vmull_s8(vget_low_s8(va), vget_low_s8(vb));
-        let hi = vmull_s8(vget_high_s8(va), vget_high_s8(vb));
-        acc = vpadalq_s16(acc, lo);
-        acc = vpadalq_s16(acc, hi);
+    // Every intrinsic below is unsafe; the caller upholds the contract (equal
+    // lengths, valid slices), so one block covers the whole body.
+    unsafe {
+        use std::arch::aarch64::*;
+        let n = a.len();
+        let chunks = n / 16;
+        let mut acc = vdupq_n_s32(0);
+        for i in 0..chunks {
+            let va = vld1q_s8(a.as_ptr().add(i * 16));
+            let vb = vld1q_s8(b.as_ptr().add(i * 16));
+            // i8×i8 → i16 for the low and high 8 lanes, then pairwise-accumulate into i32.
+            let lo = vmull_s8(vget_low_s8(va), vget_low_s8(vb));
+            let hi = vmull_s8(vget_high_s8(va), vget_high_s8(vb));
+            acc = vpadalq_s16(acc, lo);
+            acc = vpadalq_s16(acc, hi);
+        }
+        let mut sum = vaddvq_s32(acc);
+        for j in chunks * 16..n {
+            sum += a[j] as i32 * b[j] as i32;
+        }
+        sum
     }
-    let mut sum = vaddvq_s32(acc);
-    for j in chunks * 16..n {
-        sum += a[j] as i32 * b[j] as i32;
-    }
-    sum
 }
 
 /// `out[r] = dot(m[r], x)` for a row-major `[rows, cols]` matrix.

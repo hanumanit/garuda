@@ -7,13 +7,13 @@
 use crate::api::SharedState;
 use crate::scheduler::{Priority, RequestSpec, StreamEvent};
 use axum::{
+    Router,
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
         State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
     },
     response::IntoResponse,
     routing::get,
-    Router,
 };
 use serde::{Deserialize, Serialize};
 

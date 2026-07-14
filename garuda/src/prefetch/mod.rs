@@ -13,8 +13,8 @@ use crate::core::{ExpertId, ExpertLoader};
 use crate::predictor::{ExpertPredictor, PredictStats};
 use parking_lot::Mutex;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub struct PrefetchEngine {
     loader: Arc<dyn ExpertLoader>,

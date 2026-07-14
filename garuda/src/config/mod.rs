@@ -189,7 +189,7 @@ pub fn parse_size(s: &str) -> Result<usize, GarudaError> {
         other => {
             return Err(GarudaError::Config(format!(
                 "unknown size unit '{other}' in '{s}'"
-            )))
+            )));
         }
     };
 

@@ -7,8 +7,8 @@
 use crate::cache::{KvConfig, PromptCache, SeqState};
 use crate::core::{GarudaError, InferenceBackend, ModelDims, Tensor, Token};
 use crate::tokenizer::Tokenize;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// How to turn logits into a token.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -101,11 +101,7 @@ pub fn sample(
             data.iter()
                 .enumerate()
                 .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
-                    if v > bv {
-                        (i, v)
-                    } else {
-                        (bi, bv)
-                    }
+                    if v > bv { (i, v) } else { (bi, bv) }
                 });
         return Ok(idx as Token);
     }
@@ -275,16 +271,22 @@ impl InferenceRuntime {
 
         let seq = if prefix.is_empty() {
             SeqState::new(self.kv_template.clone(), seq_id)
-        } else if let Some(cached) = self.prompt_cache.get(prefix, seq_id) {
-            cached
         } else {
-            let mut fresh = SeqState::new(self.kv_template.clone(), seq_id);
-            // Prefill. The logits from the prefix are not needed; the KV state is.
-            self.backend.logits(prefix, &mut fresh)?;
-            if !fresh.has_spill() {
-                self.prompt_cache.insert(prefix, fresh.clone());
+            // A `match` rather than an `else if let` chain: under the 2024 edition the
+            // latter would drop the `get` temporary at a different point, and the
+            // explicit form keeps the prompt-cache lookup scope unambiguous.
+            match self.prompt_cache.get(prefix, seq_id) {
+                Some(cached) => cached,
+                None => {
+                    let mut fresh = SeqState::new(self.kv_template.clone(), seq_id);
+                    // Prefill. The logits from the prefix are not needed; the KV state is.
+                    self.backend.logits(prefix, &mut fresh)?;
+                    if !fresh.has_spill() {
+                        self.prompt_cache.insert(prefix, fresh.clone());
+                    }
+                    fresh
+                }
             }
-            fresh
         };
 
         let seed = params.seed.unwrap_or(seq_id);

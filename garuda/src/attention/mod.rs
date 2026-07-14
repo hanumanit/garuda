@@ -207,16 +207,18 @@ mod tests {
         let mut full = KVCacheState::new(cfg(dims, None), 2);
 
         for _ in 0..6 {
-            assert!(attn
-                .forward(&x, &w, &mut windowed)
-                .unwrap()
-                .iter()
-                .all(|v| v.is_finite()));
-            assert!(attn
-                .forward(&x, &w, &mut full)
-                .unwrap()
-                .iter()
-                .all(|v| v.is_finite()));
+            assert!(
+                attn.forward(&x, &w, &mut windowed)
+                    .unwrap()
+                    .iter()
+                    .all(|v| v.is_finite())
+            );
+            assert!(
+                attn.forward(&x, &w, &mut full)
+                    .unwrap()
+                    .iter()
+                    .all(|v| v.is_finite())
+            );
         }
         assert_eq!(
             windowed.attention_start(),

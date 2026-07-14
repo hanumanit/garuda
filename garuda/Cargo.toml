@@ -1,8 +1,8 @@
 [package]
 name = "garuda"
 version = "0.8.0"
-edition = "2021"
-rust-version = "1.82"
+edition = "2024"
+rust-version = "1.85"
 description = "Rust MoE inference runtime with tiered expert storage (no trained weights)"
 authors = ["HANUMANIT Co., Ltd."]
 license = "MIT OR Apache-2.0"

@@ -501,11 +501,7 @@ pub fn f16_to_f32(h: u16) -> f32 {
         0x1f => f32::NAN,
         _ => (1.0 + mant as f32 / 1024.0) * 2f32.powi(exp as i32 - 15),
     };
-    if sign == 1 {
-        -val
-    } else {
-        val
-    }
+    if sign == 1 { -val } else { val }
 }
 
 fn unsupported(ggml_type: u32) -> GarudaError {
@@ -617,7 +613,7 @@ mod tests {
         raw[2..4].copy_from_slice(&f16(0.0)); // dmin
         raw[4] = 1; // scales[0]: get_scale_min_k4(0) -> sc = 1
         raw[5] = 1; // scales[1]: sc = 1 for the second sub-block too
-                    // qs[0] = 0x30: low nibble 0 (element 0), high nibble 3 (element 32)
+        // qs[0] = 0x30: low nibble 0 (element 0), high nibble 3 (element 32)
         raw[16] = 0x30;
 
         let y = dequantize(Q4_K, &raw, 256).unwrap();

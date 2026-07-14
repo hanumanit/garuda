@@ -16,7 +16,7 @@ use crate::prefetch::PrefetchEngine;
 use crate::router::Router;
 use crate::runtime::InferenceRuntime;
 use crate::storage::LocalStorageBackend;
-use crate::tokenizer::{spm::SpmTokenizer, Tokenize, Tokenizer};
+use crate::tokenizer::{Tokenize, Tokenizer, spm::SpmTokenizer};
 use crate::weights::ModelWeights;
 use anyhow::Context;
 use std::sync::Arc;

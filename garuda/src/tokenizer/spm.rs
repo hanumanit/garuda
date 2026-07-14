@@ -150,11 +150,7 @@ impl SpmTokenizer {
 
     fn byte_to_token(&self, b: u8) -> Token {
         let t = self.byte_token[b as usize];
-        if t == 0 {
-            self.unk
-        } else {
-            t
-        }
+        if t == 0 { self.unk } else { t }
     }
 
     /// SPM encode: prepend a space marker, then merge greedily by score.
