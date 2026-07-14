@@ -1,8 +1,10 @@
 use anyhow::Context;
 use clap::Parser;
+use garuda::anthropic::create_anthropic_router;
 use garuda::api::{create_router, ApiState};
 use garuda::cli::{Cli, Commands};
 use garuda::config::AppConfig;
+use garuda::ollama::create_ollama_router;
 use garuda::scheduler::Scheduler;
 use garuda::server::{configure_thread_pool, Backend, Engine};
 use garuda::websocket::create_ws_router;
@@ -135,7 +137,10 @@ async fn serve(config: AppConfig) -> anyhow::Result<()> {
         started: std::time::Instant::now(),
     });
 
-    let mut app = create_router(state.clone()).merge(create_ws_router(state));
+    let mut app = create_router(state.clone())
+        .merge(create_ws_router(state.clone()))
+        .merge(create_ollama_router(state.clone()))
+        .merge(create_anthropic_router(state));
 
     if config.server.cors {
         warn!("permissive CORS is enabled and this server has no auth");

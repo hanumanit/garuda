@@ -19,6 +19,7 @@
 //!   `gpu = true` in the config is a startup error, not a silent fallback.
 //! - There is no authentication. Do not expose it to a network you do not control.
 
+pub mod anthropic;
 pub mod api;
 pub mod attention;
 pub mod benchmark;
@@ -30,6 +31,7 @@ pub mod gguf;
 pub mod llama;
 pub mod memory;
 pub mod moe;
+pub mod ollama;
 pub mod predictor;
 pub mod prefetch;
 pub mod quant;

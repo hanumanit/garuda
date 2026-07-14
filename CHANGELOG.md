@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.0] - 2026-07-14
+
+Two more API front ends — Garuda now speaks OpenAI, Ollama and Anthropic, so most
+existing clients work against it unchanged.
+
+### Added
+
+- **Ollama-compatible API** (`ollama` module): `POST /api/generate`, `POST /api/chat`
+  (newline-delimited-JSON streaming, params under `options`), plus `GET /api/tags` and
+  `GET /api/version`. Includes an RFC 3339 `created_at` computed without a date crate.
+- **Anthropic Messages API** (`anthropic` module): `POST /v1/messages`, with content
+  blocks, a system prompt, and the full typed SSE stream (`message_start`,
+  `content_block_start`, `content_block_delta`, `content_block_stop`, `message_delta`,
+  `message_stop`).
+
+Both are thin translation layers over the existing scheduler — the engine is untouched,
+exactly like the OpenAI and WebSocket front ends. Verified end to end: streaming and
+non-streaming replies, the correct wire shapes and event sequences, and content-block /
+`options` parsing.
+
 ## [0.6.1] - 2026-07-14
 
 An integer matmul kernel for Q8_0 — 2.6× faster on Apple Silicon.

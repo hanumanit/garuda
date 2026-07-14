@@ -52,7 +52,7 @@ the streaming, the cancellation, the load shedding.
 | Tiered expert storage (L1 RAM → L2 disk → L3 archive) | Real, tested |
 | Paged KV cache with disk spill (multi-layer, GQA-aware) | Real, tested |
 | Scheduler (priority, concurrency limits, cancellation, timeouts, backpressure) | Real, tested |
-| OpenAI-compatible API + SSE + WebSocket | Real, tested |
+| OpenAI + Ollama + Anthropic APIs, SSE / NDJSON / WebSocket | Real, tested |
 | Dequantisation: F32 / F16 / Q4_0 / Q8_0 / Q2_K–Q6_K | Real, tested (runs Q2_K…Q5_K_M models) |
 | Memory-mapped packed weights (`mmap = true`), incl. per-expert streaming | Real, tested (~6× less RAM, same output) |
 | Integer (NEON `i8`) matmul kernel for Q8_0 | Real, tested (2.6× faster on Apple M2, same output) |
@@ -136,20 +136,37 @@ ignored.
 
 ## API
 
-OpenAI-compatible where it counts: `created` is a real timestamp, streams end with
-the `data: [DONE]` sentinel SDKs wait for, `usage` is reported, `finish_reason`
-says what actually happened, and errors arrive in OpenAI's error envelope with the
-status code clients act on — `429` for rate limits, `503` when the queue is full.
+Garuda speaks three wire formats over the same engine, so most existing clients work
+unchanged: **OpenAI**, **Ollama**, and **Anthropic**. The scheduler and runtime don't
+know which protocol asked — each is a thin translation layer (`api`, `ollama`,
+`anthropic`), which is the same seam a new one would slot into.
+
+**OpenAI** — `created` is a real timestamp, streams end with the `data: [DONE]`
+sentinel SDKs wait for, `usage` is reported, `finish_reason` is honest, and errors use
+OpenAI's envelope with the status code clients act on (`429` rate limit, `503` busy).
 
 | Endpoint | Notes |
 |---|---|
 | `POST /v1/chat/completions` | `stream: true` for SSE |
 | `POST /v1/completions` | |
 | `POST /v1/embeddings` | Real pooled hidden states. Untrained, so they carry no meaning — see below |
-| `GET /v1/models` | |
-| `GET /v1/stats` | Measured scheduler and cache counters |
-| `GET /health` | |
+| `GET /v1/models` · `GET /v1/stats` · `GET /health` | Models list, measured counters, health |
 | `WS /v1/ws` | Bidirectional streaming with `{"cancel": true}` |
+
+**Ollama** — NDJSON streaming (not SSE), params under `options`.
+
+| Endpoint | Notes |
+|---|---|
+| `POST /api/generate` | `{"prompt": …, "options": {"num_predict": …}}` |
+| `POST /api/chat` | `{"messages": […]}` |
+| `GET /api/tags` · `GET /api/version` | Model list, version |
+
+**Anthropic** — content blocks and the typed SSE stream (`message_start` →
+`content_block_delta` → `message_stop`).
+
+| Endpoint | Notes |
+|---|---|
+| `POST /v1/messages` | `stream: true` for the Anthropic event stream |
 
 ```bash
 curl -s localhost:8080/v1/chat/completions \
