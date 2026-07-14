@@ -20,8 +20,11 @@ pub struct ModelConfig {
     pub path: PathBuf,
     /// Path to a GGUF checkpoint. When set, Garuda loads that model instead of the
     /// synthetic MoE, and the `router`/`experts`/`top_k` knobs below are ignored.
-    /// Only F32/F16 checkpoints load; quantised weights are not yet supported.
     pub gguf: String,
+    /// Keep the checkpoint's weights packed in a memory-mapped file and dequantise
+    /// them per row at inference time, instead of expanding everything to `f32` in RAM.
+    /// Far less memory (the model uses roughly its on-disk size), but slower per token.
+    pub mmap: bool,
     /// `mixtral`, `deepseek` or `qwen`. Ignored when `gguf` is set.
     pub router: String,
     /// Context window, in tokens. A loaded model caps this at its own trained length.
@@ -39,6 +42,7 @@ impl Default for ModelConfig {
         Self {
             path: PathBuf::from("./models"),
             gguf: String::new(),
+            mmap: false,
             router: "mixtral".into(),
             context: 4096,
             experts: 8,

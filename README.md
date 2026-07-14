@@ -34,8 +34,9 @@ RoPE, SwiGLU feed-forward, a SentencePiece tokenizer loaded from the file — th
 the same runtime, scheduler and API as everything else. The common quant formats all
 load — **F32, F16, Q4_0, Q8_0, and every k-quant from `Q2_K` to `Q6_K`** (TinyLlama-1.1B
 in Q2_K, Q3_K_M, Q4_K_M and Q5_K_M all answer "the capital of France is" with "Paris").
-The one real limit left: weights expand to `f32` at load, so a model still has to fit in
-RAM at full precision.
+With `mmap = true` the weights stay packed in a memory-mapped file and are dequantised a
+row at a time, so the model uses roughly its on-disk size — about **0.6 GB instead of
+4 GB** for that 1.1B Q4_K_M checkpoint — at the cost of slower generation.
 
 **Without a checkpoint**, it runs a synthetic MoE whose weights are pseudo-random
 but deterministic. The transformer arithmetic is real; the weights are not, so the
@@ -53,7 +54,8 @@ the streaming, the cancellation, the load shedding.
 | Scheduler (priority, concurrency limits, cancellation, timeouts, backpressure) | Real, tested |
 | OpenAI-compatible API + SSE + WebSocket | Real, tested |
 | Dequantisation: F32 / F16 / Q4_0 / Q8_0 / Q2_K–Q6_K | Real, tested (runs Q2_K…Q5_K_M models) |
-| **Run a model larger than RAM** | **Not implemented** — weights expand to f32 at load |
+| Memory-mapped packed weights (`mmap = true`) | Real, tested (~6× less RAM, same output) |
+| **Efficient streaming of a model larger than RAM** | **Not implemented** — a dense model pages all its weights per token |
 | **GPU backend** | **Not implemented** (`gpu = true` is a startup error) |
 | **Authentication** | **Not implemented** — do not expose this to a network |
 
@@ -212,12 +214,14 @@ registered in `Engine::build` — see **[PLUGIN.md](PLUGIN.md)** and
 
 ### What is still missing
 
-- **Models larger than RAM.** [`quant`](garuda/src/quant/mod.rs) dequantises F32, F16,
-  Q4_0, Q8_0 and every k-quant `Q2_K`–`Q6_K`, but the weights are expanded to `f32` at
-  load, so a checkpoint must fit in RAM at full precision. Keeping them packed
-  (memory-mapped) and multiplying with an integer kernel — the trick that streams
-  experts from disk — is the next phase. (The `*_1` linear quants and the IQ imatrix
-  quants also still need decoders.)
+- **Efficient large-model streaming.** [`quant`](garuda/src/quant/mod.rs) dequantises
+  F32, F16, Q4_0, Q8_0 and every k-quant `Q2_K`–`Q6_K`, and `mmap = true` keeps the
+  weights packed so the model uses ~its on-disk size. But the backend is a *dense*
+  Llama: every token reads every weight, so a checkpoint larger than RAM would page
+  its whole self from disk each token. The efficient path — loading only the top-k
+  experts a token routes to — needs a real MoE backend, which is the next phase. A
+  faster integer matmul kernel (instead of dequantising to f32 per row) would help too.
+  (The `*_1` linear quants and the IQ imatrix quants also still need decoders.)
 - **Architectures beyond Llama.** `LlamaBackend` covers the Llama family (dense,
   GQA). Other architectures each need their own `InferenceBackend`.
 

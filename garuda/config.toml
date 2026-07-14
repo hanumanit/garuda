@@ -13,6 +13,11 @@ path = "./models"
 #   curl -L https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf -o stories260K.gguf
 # gguf = "stories260K.gguf"
 gguf = ""
+# Keep the checkpoint packed in a memory-mapped file and dequantise per row at
+# inference, instead of expanding every weight to f32 in RAM. Uses roughly the file's
+# on-disk size instead of several times more (e.g. ~0.6 GB vs ~4 GB for a 1.1B Q4_K_M
+# model), at the cost of slower generation. Only affects gguf models.
+mmap = false
 # Gating strategy (synthetic MoE only): mixtral | deepseek | qwen
 router = "mixtral"
 # Context window, in tokens. A byte-level tokenizer means roughly one token per byte.

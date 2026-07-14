@@ -137,6 +137,48 @@ pub fn dequantize(ggml_type: u32, raw: &[u8], n: usize) -> Result<Vec<f32>, Garu
     Ok(out)
 }
 
+/// `out[r] = dot(dequantised row r of a row-major quantised matrix, x)`.
+///
+/// The weight stays packed; each row is dequantised into a small temporary just long
+/// enough to take the dot product, so the full `f32` matrix is never materialised.
+/// This is what lets a memory-mapped, quantised model run without expanding to `f32`
+/// — at the cost of re-dequantising every row on every call. Rows fan out over rayon.
+pub fn matvec(
+    qtype: u32,
+    weight: &[u8],
+    rows: usize,
+    cols: usize,
+    x: &[f32],
+    out: &mut [f32],
+) -> Result<(), GarudaError> {
+    use rayon::prelude::*;
+
+    let row_bytes = byte_size(qtype, cols)?;
+    if weight.len() != rows * row_bytes {
+        return Err(GarudaError::Model(format!(
+            "{} matvec: weight is {} bytes, expected {} ({rows} rows × {row_bytes})",
+            type_name(qtype),
+            weight.len(),
+            rows * row_bytes
+        )));
+    }
+    if x.len() != cols || out.len() != rows {
+        return Err(GarudaError::Inference(format!(
+            "matvec dimension mismatch: x={}, out={}, expected cols={cols}, rows={rows}",
+            x.len(),
+            out.len()
+        )));
+    }
+
+    out.par_iter_mut()
+        .zip(weight.par_chunks_exact(row_bytes))
+        .try_for_each(|(o, row)| -> Result<(), GarudaError> {
+            let w = dequantize(qtype, row, cols)?;
+            *o = crate::simd::dot(&w, x);
+            Ok(())
+        })
+}
+
 /// `block_q8_0`: `[ f16 scale | int8 q[0..32] ]`, dequant `y = scale * q`.
 fn dequant_q8_0(raw: &[u8], n: usize) -> Vec<f32> {
     let mut out = Vec::with_capacity(n);

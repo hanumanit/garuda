@@ -61,12 +61,33 @@ impl Engine {
     }
 
     fn build_gguf(config: &AppConfig, path: &std::path::Path) -> anyhow::Result<Self> {
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("reading checkpoint {}", path.display()))?;
-        let gguf = Gguf::parse(&bytes)?;
+        // Either memory-map the file (weights stay packed, low RAM) or read it into a
+        // buffer and expand every weight to f32 (more RAM, faster).
+        let mmap: Option<Arc<memmap2::Mmap>> = if config.model.mmap {
+            let file = std::fs::File::open(path)
+                .with_context(|| format!("opening checkpoint {}", path.display()))?;
+            // Safety: the file is opened read-only and the mapping is held for the
+            // process lifetime inside the backend; we never mutate it.
+            let map = unsafe { memmap2::Mmap::map(&file) }
+                .with_context(|| format!("mmapping checkpoint {}", path.display()))?;
+            Some(Arc::new(map))
+        } else {
+            None
+        };
 
-        let backend = LlamaBackend::load(&bytes)?;
+        let owned;
+        let bytes: &[u8] = match &mmap {
+            Some(m) => &m[..],
+            None => {
+                owned = std::fs::read(path)
+                    .with_context(|| format!("reading checkpoint {}", path.display()))?;
+                &owned
+            }
+        };
+
+        let gguf = Gguf::parse(bytes)?;
         let tokenizer: Arc<dyn Tokenize> = Arc::new(SpmTokenizer::from_gguf(&gguf)?);
+        let backend = LlamaBackend::from_gguf(&gguf, bytes, mmap.clone())?;
         let lc = backend.config();
         let dims = backend.dims();
 

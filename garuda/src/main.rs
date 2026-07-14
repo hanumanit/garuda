@@ -118,6 +118,7 @@ async fn serve(config: AppConfig) -> anyhow::Result<()> {
                 d_model = engine.dims.d_model,
                 vocab = engine.dims.vocab_size,
                 context = engine.runtime.max_context(),
+                mmap = config.model.mmap,
                 "loaded GGUF model"
             );
             warn!("this server has no authentication; do not expose it to an untrusted network");

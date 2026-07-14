@@ -13,7 +13,69 @@
 use crate::cache::{KVCacheState, SeqState};
 use crate::core::{GarudaError, InferenceBackend, ModelDims, Tensor, Token};
 use crate::gguf::Gguf;
-use crate::simd;
+use crate::{quant, simd};
+use memmap2::Mmap;
+use std::sync::Arc;
+
+/// One weight matrix, either expanded to `f32` in RAM or kept packed (quantised) in a
+/// memory-mapped file and dequantised a row at a time during matmul.
+///
+/// `Full` is fast (dequantised once at load) but holds the whole `f32` matrix; `Packed`
+/// trades speed for memory — the model occupies its on-disk (quantised) size, so a
+/// checkpoint far larger than RAM can run via demand paging.
+enum Weight {
+    Full {
+        data: Vec<f32>,
+        rows: usize,
+        cols: usize,
+    },
+    Packed {
+        qtype: u32,
+        rows: usize,
+        cols: usize,
+        src: Arc<Mmap>,
+        start: usize,
+        len: usize,
+    },
+}
+
+impl Weight {
+    /// `out[r] = dot(row r, x)`.
+    fn matvec(&self, x: &[f32], out: &mut [f32]) -> Result<(), GarudaError> {
+        match self {
+            Weight::Full { data, rows, cols } => {
+                simd::matvec(data, *rows, *cols, x, out);
+                Ok(())
+            }
+            Weight::Packed {
+                qtype,
+                rows,
+                cols,
+                src,
+                start,
+                len,
+            } => quant::matvec(*qtype, &src[*start..*start + *len], *rows, *cols, x, out),
+        }
+    }
+
+    /// Dequantise a single row (e.g. one embedding).
+    fn row(&self, r: usize) -> Result<Vec<f32>, GarudaError> {
+        match self {
+            Weight::Full { data, cols, .. } => Ok(data[r * cols..(r + 1) * cols].to_vec()),
+            Weight::Packed {
+                qtype,
+                cols,
+                src,
+                start,
+                ..
+            } => {
+                let row_bytes = quant::byte_size(*qtype, *cols)?;
+                let off = start + r * row_bytes;
+                quant::dequantize(*qtype, &src[off..off + row_bytes], *cols)
+            }
+        }
+    }
+}
 
 /// The architecture parameters read from GGUF metadata.
 #[derive(Debug, Clone, Copy)]
@@ -104,42 +166,48 @@ impl LlamaConfig {
     }
 }
 
-/// One transformer block's weights.
+/// One transformer block's weights. Norms are small and always `f32`; the four
+/// projection matrices may be packed.
 struct Layer {
     attn_norm: Vec<f32>,
-    wq: Vec<f32>,
-    wk: Vec<f32>,
-    wv: Vec<f32>,
-    wo: Vec<f32>,
+    wq: Weight,
+    wk: Weight,
+    wv: Weight,
+    wo: Weight,
     ffn_norm: Vec<f32>,
-    gate: Vec<f32>,
-    up: Vec<f32>,
-    down: Vec<f32>,
+    gate: Weight,
+    up: Weight,
+    down: Weight,
 }
 
 pub struct LlamaBackend {
     cfg: LlamaConfig,
-    token_embd: Vec<f32>,
+    token_embd: Weight,
     output_norm: Vec<f32>,
-    output: Vec<f32>,
+    output: Weight,
     layers: Vec<Layer>,
 }
 
 impl LlamaBackend {
-    /// Load a checkpoint from a GGUF file's bytes.
+    /// Load a checkpoint from a GGUF file's bytes, expanding weights to `f32` in RAM.
     pub fn load(bytes: &[u8]) -> Result<Self, GarudaError> {
         let g = Gguf::parse(bytes)?;
-        Self::from_gguf(&g, bytes)
+        Self::from_gguf(&g, bytes, None)
     }
 
-    /// Load from an already-parsed GGUF header plus the file bytes, so the caller can
-    /// also build the tokenizer from the same parse without parsing twice.
-    pub fn from_gguf(g: &Gguf, bytes: &[u8]) -> Result<Self, GarudaError> {
+    /// Load from an already-parsed GGUF header plus the file bytes.
+    ///
+    /// When `mmap` is `Some`, the projection matrices are kept packed in the mapped
+    /// file and dequantised per row at inference time (low RAM, slower). When `None`,
+    /// every weight is expanded to `f32` in RAM (more RAM, faster). `bytes` must be the
+    /// same data the mmap covers.
+    pub fn from_gguf(g: &Gguf, bytes: &[u8], mmap: Option<Arc<Mmap>>) -> Result<Self, GarudaError> {
         let cfg = LlamaConfig::from_gguf(g)?;
+        let (d, f, v, hk) = (cfg.d_model, cfg.d_ff, cfg.vocab, cfg.kv_dim());
 
-        // Every tensor is validated for length and finiteness as it is read.
-        let get = |name: &str| g.tensor_f32(bytes, name);
-        let expect = |data: Vec<f32>, name: &str, n: usize| -> Result<Vec<f32>, GarudaError> {
+        // A small f32 tensor (norm), always expanded.
+        let norm = |name: &str, n: usize| -> Result<Vec<f32>, GarudaError> {
+            let data = g.tensor_f32(bytes, name)?;
             if data.len() != n {
                 return Err(GarudaError::Model(format!(
                     "tensor '{name}' has {} values, expected {n}",
@@ -149,29 +217,66 @@ impl LlamaBackend {
             Ok(data)
         };
 
-        let (d, f, v, hk) = (cfg.d_model, cfg.d_ff, cfg.vocab, cfg.kv_dim());
+        // A weight matrix: packed if mmapping, otherwise expanded to f32.
+        let weight = |name: &str, rows: usize, cols: usize| -> Result<Weight, GarudaError> {
+            let t = g
+                .tensor(name)
+                .ok_or_else(|| GarudaError::Model(format!("tensor '{name}' not found")))?;
+            if t.n_elements() as usize != rows * cols {
+                return Err(GarudaError::Model(format!(
+                    "tensor '{name}' has {} elements, expected {}",
+                    t.n_elements(),
+                    rows * cols
+                )));
+            }
+            match &mmap {
+                Some(src) => {
+                    let len = quant::byte_size(t.ggml_type, rows * cols)?;
+                    let start = g.data_offset + t.offset as usize;
+                    if start + len > src.len() {
+                        return Err(GarudaError::Model(format!(
+                            "tensor '{name}' runs past the end of the file"
+                        )));
+                    }
+                    Ok(Weight::Packed {
+                        qtype: t.ggml_type,
+                        rows,
+                        cols,
+                        src: src.clone(),
+                        start,
+                        len,
+                    })
+                }
+                None => Ok(Weight::Full {
+                    data: g.tensor_f32(bytes, name)?,
+                    rows,
+                    cols,
+                }),
+            }
+        };
 
-        let token_embd = expect(get("token_embd.weight")?, "token_embd.weight", v * d)?;
-        let output_norm = expect(get("output_norm.weight")?, "output_norm.weight", d)?;
+        let token_embd = weight("token_embd.weight", v, d)?;
+        let output_norm = norm("output_norm.weight", d)?;
         // Some checkpoints tie the output head to the embeddings and omit `output`.
-        let output = match g.tensor("output.weight") {
-            Some(_) => expect(get("output.weight")?, "output.weight", v * d)?,
-            None => token_embd.clone(),
+        let output = if g.tensor("output.weight").is_some() {
+            weight("output.weight", v, d)?
+        } else {
+            weight("token_embd.weight", v, d)?
         };
 
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for l in 0..cfg.n_layers {
             let p = |name: &str| format!("blk.{l}.{name}.weight");
             layers.push(Layer {
-                attn_norm: expect(get(&p("attn_norm"))?, "attn_norm", d)?,
-                wq: expect(get(&p("attn_q"))?, "attn_q", d * d)?,
-                wk: expect(get(&p("attn_k"))?, "attn_k", hk * d)?,
-                wv: expect(get(&p("attn_v"))?, "attn_v", hk * d)?,
-                wo: expect(get(&p("attn_output"))?, "attn_output", d * d)?,
-                ffn_norm: expect(get(&p("ffn_norm"))?, "ffn_norm", d)?,
-                gate: expect(get(&p("ffn_gate"))?, "ffn_gate", f * d)?,
-                up: expect(get(&p("ffn_up"))?, "ffn_up", f * d)?,
-                down: expect(get(&p("ffn_down"))?, "ffn_down", d * f)?,
+                attn_norm: norm(&p("attn_norm"), d)?,
+                wq: weight(&p("attn_q"), d, d)?,
+                wk: weight(&p("attn_k"), hk, d)?,
+                wv: weight(&p("attn_v"), hk, d)?,
+                wo: weight(&p("attn_output"), d, d)?,
+                ffn_norm: norm(&p("ffn_norm"), d)?,
+                gate: weight(&p("ffn_gate"), f, d)?,
+                up: weight(&p("ffn_up"), f, d)?,
+                down: weight(&p("ffn_down"), d, f)?,
             });
         }
 
@@ -182,6 +287,11 @@ impl LlamaBackend {
             output,
             layers,
         })
+    }
+
+    /// True when weights are kept packed in a memory-mapped file.
+    pub fn is_mmapped(&self) -> bool {
+        matches!(self.token_embd, Weight::Packed { .. })
     }
 
     pub fn config(&self) -> LlamaConfig {
@@ -205,7 +315,7 @@ impl LlamaBackend {
         simd::add_assign(x, &attn);
 
         let h = self.norm(x, &layer.ffn_norm);
-        let ffn = self.feed_forward(layer, &h);
+        let ffn = self.feed_forward(layer, &h)?;
         simd::add_assign(x, &ffn);
         Ok(())
     }
@@ -231,9 +341,9 @@ impl LlamaBackend {
         let mut q = vec![0.0; d];
         let mut k = vec![0.0; kv_dim];
         let mut v = vec![0.0; kv_dim];
-        simd::matvec(&layer.wq, d, d, h, &mut q);
-        simd::matvec(&layer.wk, kv_dim, d, h, &mut k);
-        simd::matvec(&layer.wv, kv_dim, d, h, &mut v);
+        layer.wq.matvec(h, &mut q)?;
+        layer.wk.matvec(h, &mut k)?;
+        layer.wv.matvec(h, &mut v)?;
 
         let pos = kv.len();
         for hh in 0..n_heads {
@@ -276,22 +386,22 @@ impl LlamaBackend {
         }
 
         let mut out = vec![0.0; d];
-        simd::matvec(&layer.wo, d, d, &context, &mut out);
+        layer.wo.matvec(&context, &mut out)?;
         Ok(out)
     }
 
     /// SwiGLU: `down(silu(gate·h) ⊙ (up·h))`.
-    fn feed_forward(&self, layer: &Layer, h: &[f32]) -> Vec<f32> {
+    fn feed_forward(&self, layer: &Layer, h: &[f32]) -> Result<Vec<f32>, GarudaError> {
         let (d, f) = (self.cfg.d_model, self.cfg.d_ff);
         let mut gate = vec![0.0; f];
         let mut up = vec![0.0; f];
-        simd::matvec(&layer.gate, f, d, h, &mut gate);
-        simd::matvec(&layer.up, f, d, h, &mut up);
+        layer.gate.matvec(h, &mut gate)?;
+        layer.up.matvec(h, &mut up)?;
         simd::silu(&mut gate);
         simd::mul_assign(&mut gate, &up);
         let mut out = vec![0.0; d];
-        simd::matvec(&layer.down, d, f, &gate, &mut out);
-        out
+        layer.down.matvec(&gate, &mut out)?;
+        Ok(out)
     }
 }
 
@@ -325,7 +435,7 @@ impl InferenceBackend for LlamaBackend {
             if idx >= self.cfg.vocab {
                 return Err(GarudaError::InvalidToken(token));
             }
-            let mut x = self.token_embd[idx * d..(idx + 1) * d].to_vec();
+            let mut x = self.token_embd.row(idx)?;
             for l in 0..self.cfg.n_layers {
                 // Split the layer borrow from the per-layer cache borrow.
                 let kv = seq.layer(l);
@@ -344,9 +454,8 @@ impl InferenceBackend for LlamaBackend {
 
     fn logits(&self, context: &[Token], seq: &mut SeqState) -> Result<Tensor, GarudaError> {
         let x = self.hidden(context, seq)?;
-        let (d, v) = (self.cfg.d_model, self.cfg.vocab);
-        let mut logits = vec![0.0; v];
-        simd::matvec(&self.output, v, d, x.data(), &mut logits);
-        Tensor::new(vec![v], logits)
+        let mut logits = vec![0.0; self.cfg.vocab];
+        self.output.matvec(x.data(), &mut logits)?;
+        Tensor::new(vec![self.cfg.vocab], logits)
     }
 }

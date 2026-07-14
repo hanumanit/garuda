@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0] - 2026-07-14
+
+Memory-mapped, packed weights — the second phase of the disk-streaming rebuild. A
+quantised model can now run without expanding to `f32` in RAM.
+
+### Added
+
+- **`mmap = true`** (config): the Llama backend keeps each projection matrix packed in
+  the memory-mapped GGUF file and dequantises it a row at a time during matmul, via the
+  new `quant::matvec`. Weights never expand to `f32`, so the process uses roughly the
+  file's on-disk size.
+- A `Weight` abstraction in the backend with two forms — `Full` (expanded `f32`, the
+  fast default) and `Packed` (mmap + per-row dequant) — behind one `matvec`/`row` API,
+  so the forward pass doesn't know which it's using.
+
+Measured on TinyLlama-1.1B Q4_K_M: resident memory dropped from **3953 MB to 622 MB**
+(~6.4×, near the 638 MB file), with identical output ("Paris") and about 1.8× slower
+generation — the packed-weights tradeoff.
+
+### Changed
+
+- `memmap2` is a dependency again, and now actually used.
+- The remaining limit is reframed honestly: this is the packed-weight foundation, but
+  the backend is a *dense* Llama, so a model larger than RAM would page all its weights
+  every token. Efficient streaming needs a real MoE backend (load only the routed
+  experts) — the next phase — and an integer matmul kernel would cut the per-row
+  dequant cost.
+
 ## [0.4.2] - 2026-07-14
 
 The rest of the k-quants — Garuda now decodes every `Q2_K … Q6_K` format, so nearly
