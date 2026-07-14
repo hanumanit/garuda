@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.1] - 2026-07-14
+
+Made the packed (`mmap`) path faster.
+
+### Changed
+
+- The quantised decoders now write into a caller-supplied buffer (`quant::dequant_into`)
+  instead of returning a fresh `Vec`. `quant::matvec` gives each rayon worker one reusable
+  buffer, so a packed matmul no longer allocates per row, and it skips the per-row
+  finiteness check that the batch `dequantize` still does. Same math, same output — every
+  Q2_K…Q6_K model still answers "Paris" in both modes.
+- Measured on TinyLlama-1.1B Q4_K_M: the `mmap` path's slowdown versus f32-expand went from
+  ~1.8× to ~1.34×, at the same ~6× memory saving.
+
 ## [0.5.0] - 2026-07-14
 
 Memory-mapped, packed weights — the second phase of the disk-streaming rebuild. A

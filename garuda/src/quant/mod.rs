@@ -95,39 +95,13 @@ pub fn byte_size(ggml_type: u32, n: usize) -> Result<usize, GarudaError> {
     Ok((n / elems) * bytes)
 }
 
-/// Decode exactly `n` elements of `ggml_type` from `raw` into `f32`.
+/// Decode exactly `n` elements of `ggml_type` from `raw` into a fresh `Vec<f32>`.
 ///
 /// `raw` must be exactly [`byte_size`] long. Non-finite results are rejected, so a
 /// corrupt block is an error rather than a `NaN` that silently poisons inference.
 pub fn dequantize(ggml_type: u32, raw: &[u8], n: usize) -> Result<Vec<f32>, GarudaError> {
-    let expected = byte_size(ggml_type, n)?;
-    if raw.len() != expected {
-        return Err(GarudaError::Model(format!(
-            "{} tensor: expected {expected} bytes for {n} elements, got {}",
-            type_name(ggml_type),
-            raw.len()
-        )));
-    }
-
-    let out = match ggml_type {
-        F32 => raw
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect(),
-        F16 => raw
-            .chunks_exact(2)
-            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect(),
-        Q8_0 => dequant_q8_0(raw, n),
-        Q4_0 => dequant_q4_0(raw, n),
-        Q2_K => dequant_q2_k(raw, n),
-        Q3_K => dequant_q3_k(raw, n),
-        Q4_K => dequant_q4_k(raw, n),
-        Q5_K => dequant_q5_k(raw, n),
-        Q6_K => dequant_q6_k(raw, n),
-        _ => return Err(unsupported(ggml_type)),
-    };
-
+    let mut out = vec![0.0f32; n];
+    dequant_into(ggml_type, raw, &mut out)?;
     if let Some(bad) = out.iter().position(|v| !v.is_finite()) {
         return Err(GarudaError::Model(format!(
             "{} tensor produced a non-finite value at index {bad}",
@@ -137,12 +111,48 @@ pub fn dequantize(ggml_type: u32, raw: &[u8], n: usize) -> Result<Vec<f32>, Garu
     Ok(out)
 }
 
+/// Decode into a caller-provided buffer (`out.len()` elements). No finiteness check —
+/// this is the hot path for [`matvec`], where the same buffer is reused per row so
+/// nothing is allocated. Validates `raw`/`out` lengths against the format.
+pub fn dequant_into(ggml_type: u32, raw: &[u8], out: &mut [f32]) -> Result<(), GarudaError> {
+    let n = out.len();
+    let expected = byte_size(ggml_type, n)?;
+    if raw.len() != expected {
+        return Err(GarudaError::Model(format!(
+            "{} tensor: expected {expected} bytes for {n} elements, got {}",
+            type_name(ggml_type),
+            raw.len()
+        )));
+    }
+    match ggml_type {
+        F32 => {
+            for (o, c) in out.iter_mut().zip(raw.chunks_exact(4)) {
+                *o = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            }
+        }
+        F16 => {
+            for (o, c) in out.iter_mut().zip(raw.chunks_exact(2)) {
+                *o = f16_to_f32(u16::from_le_bytes([c[0], c[1]]));
+            }
+        }
+        Q8_0 => dequant_q8_0(raw, out),
+        Q4_0 => dequant_q4_0(raw, out),
+        Q2_K => dequant_q2_k(raw, out),
+        Q3_K => dequant_q3_k(raw, out),
+        Q4_K => dequant_q4_k(raw, out),
+        Q5_K => dequant_q5_k(raw, out),
+        Q6_K => dequant_q6_k(raw, out),
+        _ => return Err(unsupported(ggml_type)),
+    }
+    Ok(())
+}
+
 /// `out[r] = dot(dequantised row r of a row-major quantised matrix, x)`.
 ///
-/// The weight stays packed; each row is dequantised into a small temporary just long
-/// enough to take the dot product, so the full `f32` matrix is never materialised.
-/// This is what lets a memory-mapped, quantised model run without expanding to `f32`
-/// — at the cost of re-dequantising every row on every call. Rows fan out over rayon.
+/// The weight stays packed; each rayon worker dequantises one row at a time into a
+/// reused scratch buffer, so the full `f32` matrix is never materialised and nothing
+/// is allocated per row. This is what lets a memory-mapped, quantised model run
+/// without expanding to `f32` — at the cost of re-dequantising every row on each call.
 pub fn matvec(
     qtype: u32,
     weight: &[u8],
@@ -172,30 +182,31 @@ pub fn matvec(
 
     out.par_iter_mut()
         .zip(weight.par_chunks_exact(row_bytes))
-        .try_for_each(|(o, row)| -> Result<(), GarudaError> {
-            let w = dequantize(qtype, row, cols)?;
-            *o = crate::simd::dot(&w, x);
-            Ok(())
-        })
+        .try_for_each_init(
+            || vec![0.0f32; cols],
+            |buf, (o, row)| -> Result<(), GarudaError> {
+                dequant_into(qtype, row, buf)?;
+                *o = crate::simd::dot(buf, x);
+                Ok(())
+            },
+        )
 }
 
 /// `block_q8_0`: `[ f16 scale | int8 q[0..32] ]`, dequant `y = scale * q`.
-fn dequant_q8_0(raw: &[u8], n: usize) -> Vec<f32> {
-    let mut out = Vec::with_capacity(n);
-    for block in raw.chunks_exact(2 + QK) {
+fn dequant_q8_0(raw: &[u8], out: &mut [f32]) {
+    for (bi, block) in raw.chunks_exact(2 + QK).enumerate() {
         let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
-        for &q in &block[2..] {
-            out.push(scale * (q as i8) as f32);
+        let base = bi * QK;
+        for (i, &q) in block[2..].iter().enumerate() {
+            out[base + i] = scale * (q as i8) as f32;
         }
     }
-    out
 }
 
 /// `block_q4_0`: `[ f16 scale | u8 q[0..16] ]`. Each byte holds two 4-bit weights;
 /// the low nibble is element `i`, the high nibble element `i + 16`, and each is
 /// centred by subtracting 8. `y = scale * (nibble - 8)`.
-fn dequant_q4_0(raw: &[u8], n: usize) -> Vec<f32> {
-    let mut out = vec![0.0f32; n];
+fn dequant_q4_0(raw: &[u8], out: &mut [f32]) {
     for (b, block) in raw.chunks_exact(2 + QK / 2).enumerate() {
         let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
         let base = b * QK;
@@ -206,7 +217,6 @@ fn dequant_q4_0(raw: &[u8], n: usize) -> Vec<f32> {
             out[base + i + QK / 2] = scale * hi as f32;
         }
     }
-    out
 }
 
 /// Unpack one 6-bit sub-scale and sub-min from a `block_q4_K` `scales[12]` array.
@@ -230,14 +240,14 @@ fn get_scale_min_k4(j: usize, s: &[u8]) -> (u8, u8) {
 /// Eight 32-element sub-blocks, each with its own 6-bit scale and min. A weight is
 /// `d·scale·q − dmin·min`, where `q` is a 4-bit quant. `min` is subtracted, so this
 /// is an affine (not symmetric) quant.
-fn dequant_q4_k(raw: &[u8], n: usize) -> Vec<f32> {
-    let mut out = Vec::with_capacity(n);
-    for block in raw.chunks_exact(144) {
+fn dequant_q4_k(raw: &[u8], out: &mut [f32]) {
+    for (bi, block) in raw.chunks_exact(144).enumerate() {
         let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
         let dmin = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
         let scales = &block[4..16];
         let qs = &block[16..144];
 
+        let mut w = bi * QK_K;
         let mut is = 0;
         for chunk in qs.chunks_exact(32) {
             let (sc1, m1) = get_scale_min_k4(is, scales);
@@ -245,15 +255,16 @@ fn dequant_q4_k(raw: &[u8], n: usize) -> Vec<f32> {
             let (d1, mn1) = (d * sc1 as f32, dmin * m1 as f32);
             let (d2, mn2) = (d * sc2 as f32, dmin * m2 as f32);
             for &q in chunk {
-                out.push(d1 * (q & 0x0F) as f32 - mn1);
+                out[w] = d1 * (q & 0x0F) as f32 - mn1;
+                w += 1;
             }
             for &q in chunk {
-                out.push(d2 * (q >> 4) as f32 - mn2);
+                out[w] = d2 * (q >> 4) as f32 - mn2;
+                w += 1;
             }
             is += 2;
         }
     }
-    out
 }
 
 /// `block_q6_K` (super-block of 256): `[ u8 ql[128] | u8 qh[64] | i8 scales[16] | f16 d ]`.
@@ -262,8 +273,7 @@ fn dequant_q4_k(raw: &[u8], n: usize) -> Vec<f32> {
 /// `ql` and 2 high bits in `qh`, centred by subtracting 32, then scaled by its int8
 /// sub-scale times the super-block `d`. The interleaving follows ggml's
 /// `dequantize_row_q6_K`.
-fn dequant_q6_k(raw: &[u8], n: usize) -> Vec<f32> {
-    let mut out = vec![0.0f32; n];
+fn dequant_q6_k(raw: &[u8], out: &mut [f32]) {
     for (bi, block) in raw.chunks_exact(210).enumerate() {
         let ql = &block[0..128];
         let qh = &block[128..192];
@@ -290,22 +300,21 @@ fn dequant_q6_k(raw: &[u8], n: usize) -> Vec<f32> {
             }
         }
     }
-    out
 }
 
 /// `block_q5_K` (super-block of 256): `[ f16 d | f16 dmin | u8 scales[12] | u8 qh[32] | u8 qs[128] ]`.
 ///
 /// Like Q4_K, but each quant is 5 bits: the low 4 from `qs`, the 5th from a bit of
 /// `qh` selected per 64-element group. `y = d·scale·(q5) − dmin·min`.
-fn dequant_q5_k(raw: &[u8], n: usize) -> Vec<f32> {
-    let mut out = Vec::with_capacity(n);
-    for block in raw.chunks_exact(176) {
+fn dequant_q5_k(raw: &[u8], out: &mut [f32]) {
+    for (bi, block) in raw.chunks_exact(176).enumerate() {
         let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
         let dmin = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
         let scales = &block[4..16];
         let qh = &block[16..48];
         let qs = &block[48..176];
 
+        let mut w = bi * QK_K;
         let mut is = 0;
         let (mut u1, mut u2): (u8, u8) = (1, 2);
         for group in 0..4 {
@@ -316,32 +325,33 @@ fn dequant_q5_k(raw: &[u8], n: usize) -> Vec<f32> {
             let (d2, mn2) = (d * sc2 as f32, dmin * m2 as f32);
             for l in 0..32 {
                 let hi = if qh[l] & u1 != 0 { 16 } else { 0 };
-                out.push(d1 * ((ql[l] & 0x0F) as i32 + hi) as f32 - mn1);
+                out[w] = d1 * ((ql[l] & 0x0F) as i32 + hi) as f32 - mn1;
+                w += 1;
             }
             for l in 0..32 {
                 let hi = if qh[l] & u2 != 0 { 16 } else { 0 };
-                out.push(d2 * ((ql[l] >> 4) as i32 + hi) as f32 - mn2);
+                out[w] = d2 * ((ql[l] >> 4) as i32 + hi) as f32 - mn2;
+                w += 1;
             }
             is += 2;
             u1 <<= 2;
             u2 <<= 2;
         }
     }
-    out
 }
 
 /// `block_q2_K` (super-block of 256): `[ u8 scales[16] | u8 qs[64] | f16 d | f16 dmin ]`.
 ///
 /// Sixteen 16-element sub-blocks. Each `scales` byte packs a 4-bit scale and a 4-bit
 /// min; each quant is 2 bits. `y = d·scale·q − dmin·min`.
-fn dequant_q2_k(raw: &[u8], n: usize) -> Vec<f32> {
-    let mut out = Vec::with_capacity(n);
-    for block in raw.chunks_exact(84) {
+fn dequant_q2_k(raw: &[u8], out: &mut [f32]) {
+    for (bi, block) in raw.chunks_exact(84).enumerate() {
         let scales = &block[0..16];
         let qs = &block[16..80];
         let d = f16_to_f32(u16::from_le_bytes([block[80], block[81]]));
         let dmin = f16_to_f32(u16::from_le_bytes([block[82], block[83]]));
 
+        let mut w = bi * QK_K;
         let mut is = 0;
         for half in 0..2 {
             let q = &qs[half * 32..half * 32 + 32];
@@ -351,19 +361,20 @@ fn dequant_q2_k(raw: &[u8], n: usize) -> Vec<f32> {
                 is += 1;
                 let (dl, ml) = (d * (sc & 0x0F) as f32, dmin * (sc >> 4) as f32);
                 for &qv in &q[0..16] {
-                    out.push(dl * ((qv >> shift) & 3) as f32 - ml);
+                    out[w] = dl * ((qv >> shift) & 3) as f32 - ml;
+                    w += 1;
                 }
                 let sc = scales[is];
                 is += 1;
                 let (dl, ml) = (d * (sc & 0x0F) as f32, dmin * (sc >> 4) as f32);
                 for &qv in &q[16..32] {
-                    out.push(dl * ((qv >> shift) & 3) as f32 - ml);
+                    out[w] = dl * ((qv >> shift) & 3) as f32 - ml;
+                    w += 1;
                 }
                 shift += 2;
             }
         }
     }
-    out
 }
 
 /// `block_q3_K` (super-block of 256): `[ u8 hmask[32] | u8 qs[64] | u8 scales[12] | f16 d ]`.
@@ -371,12 +382,11 @@ fn dequant_q2_k(raw: &[u8], n: usize) -> Vec<f32> {
 /// The trickiest: 3-bit quants (2 low bits from `qs`, a high bit *inverted* from
 /// `hmask` — set means don't subtract 4), and sixteen 6-bit signed scales packed
 /// across 12 bytes via the same word juggling ggml uses.
-fn dequant_q3_k(raw: &[u8], n: usize) -> Vec<f32> {
+fn dequant_q3_k(raw: &[u8], out: &mut [f32]) {
     const KMASK1: u32 = 0x0303_0303;
     const KMASK2: u32 = 0x0f0f_0f0f;
 
-    let mut out = Vec::with_capacity(n);
-    for block in raw.chunks_exact(110) {
+    for (bi, block) in raw.chunks_exact(110).enumerate() {
         let hmask = &block[0..32];
         let qs = &block[32..96];
         let scale_bytes = &block[96..108];
@@ -399,6 +409,7 @@ fn dequant_q3_k(raw: &[u8], n: usize) -> Vec<f32> {
             }
         }
 
+        let mut w = bi * QK_K;
         let mut is = 0;
         let mut m: u8 = 1;
         for half in 0..2 {
@@ -409,20 +420,21 @@ fn dequant_q3_k(raw: &[u8], n: usize) -> Vec<f32> {
                 is += 1;
                 for l in 0..16 {
                     let hbit = if hmask[l] & m != 0 { 0 } else { 4 };
-                    out.push(dl * (((q[l] >> shift) & 3) as i32 - hbit) as f32);
+                    out[w] = dl * (((q[l] >> shift) & 3) as i32 - hbit) as f32;
+                    w += 1;
                 }
                 let dl = d_all * (scales[is] as i32 - 32) as f32;
                 is += 1;
                 for l in 0..16 {
                     let hbit = if hmask[l + 16] & m != 0 { 0 } else { 4 };
-                    out.push(dl * (((q[l + 16] >> shift) & 3) as i32 - hbit) as f32);
+                    out[w] = dl * (((q[l + 16] >> shift) & 3) as i32 - hbit) as f32;
+                    w += 1;
                 }
                 shift += 2;
                 m <<= 1;
             }
         }
     }
-    out
 }
 
 /// IEEE-754 half → single precision.
