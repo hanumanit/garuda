@@ -1,0 +1,23 @@
+<svg viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Garuda">
+  <title>Garuda</title>
+  <defs>
+    <linearGradient id="garuda-gold" x1="0" y1="0" x2="0.85" y2="1">
+      <stop offset="0" stop-color="#FFD24A"/>
+      <stop offset="0.5" stop-color="#F59E0B"/>
+      <stop offset="1" stop-color="#E4572E"/>
+    </linearGradient>
+  </defs>
+  <!-- spread wings + tail -->
+  <g fill="none" stroke="url(#garuda-gold)" stroke-width="13" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M136 108 L224 74"/>
+    <path d="M133 130 L208 106"/>
+    <path d="M130 152 L190 136"/>
+    <path d="M120 108 L32 74"/>
+    <path d="M123 130 L48 106"/>
+    <path d="M126 152 L66 136"/>
+    <path d="M128 140 L117 202"/>
+    <path d="M128 140 L139 202"/>
+  </g>
+  <!-- head: up-crest and down-beak diamond -->
+  <path d="M128 44 L150 88 L128 132 L106 88 Z" fill="url(#garuda-gold)"/>
+</svg>

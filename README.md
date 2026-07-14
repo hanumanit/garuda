@@ -1,4 +1,13 @@
-# Garuda — a Rust MoE inference runtime with tiered expert storage
+<p align="center">
+  <img src="garuda_mark.svg" alt="Garuda" width="132">
+</p>
+
+<h1 align="center">Garuda</h1>
+
+<p align="center">
+  A Rust MoE inference runtime with tiered expert storage<br>
+  <a href="ABOUT.md">About</a> · <a href="INSTALL.md">Install</a> · <a href="PLUGIN.md">Write a plugin</a>
+</p>
 
 ![Garuda Cover](./garuda_cover.jpg)
 
