@@ -213,4 +213,10 @@ registered in `Engine::build` — see **[PLUGIN.md](PLUGIN.md)** and
 
 ## Licence
 
-MIT OR Apache-2.0
+Copyright © 2026 HANUMANIT Co., Ltd.
+
+Dual-licensed under either of [Apache License 2.0](LICENSE-APACHE) or the
+[MIT license](LICENSE-MIT), at your option. Both require that the copyright
+notice be retained; under Apache-2.0 the [NOTICE](NOTICE) file must also be kept
+in redistributions and derivative works. Unless you state otherwise, any
+contribution you submit is dual-licensed the same way, with no additional terms.
