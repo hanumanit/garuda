@@ -180,8 +180,10 @@ pub fn matvec(
         )));
     }
 
-    // Q8_0 weights are already int8, so we can dot them with an int8-quantised input
-    // directly — no f32 dequantisation of the weights at all.
+    // Q8_0 weights are already int8, so the integer kernel dots them with an int8-quantised
+    // input directly, never expanding to f32 — a clear win. (Tried for the sub-byte quants
+    // too, e.g. Q4_0, but there the nibble-unpack dominates and it came out slower than
+    // dequantise-to-f32, so those keep the f32 path.)
     if qtype == Q8_0 {
         matvec_q8_0(weight, cols, x, out);
         return Ok(());
@@ -199,30 +201,34 @@ pub fn matvec(
         )
 }
 
-/// Q8_0 integer-kernel matvec: quantise `x` to int8 once (per 32-element block, with a
-/// per-block scale, the way ggml quantises activations), then dot each already-int8
-/// weight row with it using `simd::dot_i8`. The weights never touch `f32`.
-///
-/// This introduces a small activation-quantisation error — the same tradeoff llama.cpp
-/// makes for its quantised matmuls — so the result is very close to, but not bit-identical
-/// with, the exact `f32` dequantisation path.
-fn matvec_q8_0(weight: &[u8], cols: usize, x: &[f32], out: &mut [f32]) {
-    use rayon::prelude::*;
-    let nblocks = cols / 32;
-
-    let mut xq = vec![0i8; cols];
+/// Quantise an activation vector to int8, one scale per 32-element block, the way ggml
+/// quantises activations for a quantised matmul. Returns the int8 values and the
+/// per-block scales. This is the small approximation the integer kernels trade for speed.
+fn quantize_activation(x: &[f32]) -> (Vec<i8>, Vec<f32>) {
+    let nblocks = x.len() / QK;
+    let mut xq = vec![0i8; x.len()];
     let mut xs = vec![0.0f32; nblocks];
-    for (b, blk) in x.chunks_exact(32).enumerate() {
+    for (b, blk) in x.chunks_exact(QK).enumerate() {
         let amax = blk.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
         let scale = amax / 127.0;
         xs[b] = scale;
         let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
         for (j, &v) in blk.iter().enumerate() {
-            xq[b * 32 + j] = (v * inv).round().clamp(-127.0, 127.0) as i8;
+            xq[b * QK + j] = (v * inv).round().clamp(-127.0, 127.0) as i8;
         }
     }
+    (xq, xs)
+}
 
-    let row_bytes = 34 * nblocks; // Q8_0 block: 2-byte f16 scale + 32 int8
+/// Q8_0 integer-kernel matvec: the weights are already int8, so quantise `x` to int8 and
+/// dot the rows with `simd::dot_i8` — the weights never touch `f32`. Introduces a small
+/// activation-quantisation error (the same tradeoff llama.cpp makes), so the result is
+/// very close to, but not bit-identical with, the exact `f32` dequantisation path.
+fn matvec_q8_0(weight: &[u8], cols: usize, x: &[f32], out: &mut [f32]) {
+    use rayon::prelude::*;
+    let (xq, xs) = quantize_activation(x);
+    let row_bytes = 34 * (cols / QK); // Q8_0 block: 2-byte f16 scale + 32 int8
+
     out.par_iter_mut()
         .zip(weight.par_chunks_exact(row_bytes))
         .for_each(|(o, row)| {
@@ -232,7 +238,7 @@ fn matvec_q8_0(weight: &[u8], cols: usize, x: &[f32], out: &mut [f32]) {
                 // The 32 quant bytes reinterpreted as i8 — same size and alignment.
                 let wq: &[i8] =
                     unsafe { std::slice::from_raw_parts(blk[2..].as_ptr() as *const i8, 32) };
-                sum += ws * xs[b] * crate::simd::dot_i8(wq, &xq[b * 32..b * 32 + 32]) as f32;
+                sum += ws * xs[b] * crate::simd::dot_i8(wq, &xq[b * QK..b * QK + QK]) as f32;
             }
             *o = sum;
         });
