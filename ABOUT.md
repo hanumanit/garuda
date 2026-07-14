@@ -30,9 +30,9 @@ streaming.
 
 ## What it is not
 
-Garuda is honest about its edges. Only **F32/F16** checkpoints load — quantised
-weights (`Q4_K`, `Q8_0`, …) are rejected with a clear error, because the
-dequantiser is not written yet. There is **no GPU backend** (`gpu = true` is a
+Garuda is honest about its edges. **F32, F16, Q4_0 and Q8_0** checkpoints load;
+the k-quant super-block formats (`Q4_K`, `Q6_K`, …) are rejected with a clear error,
+because their decoder is not written yet. There is **no GPU backend** (`gpu = true` is a
 startup error, not a silent fallback), and **no authentication** — do not expose it
 to a network you do not control.
 

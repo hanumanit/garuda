@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - 2026-07-14
+
+First step toward running the quantised checkpoints people actually download, and
+toward the disk-streaming architecture that lets a model larger than RAM run.
+
+### Added
+
+- **`quant` module** — GGUF weight dequantisation for `Q4_0` and `Q8_0` (alongside
+  `F32`/`F16`), the two simplest linear quants. `Gguf::tensor_f32` now delegates all
+  block formats to it, so quantised `q4_0`/`q8_0` model files load whole. Verified
+  end to end: the Q8_0 and Q4_0 builds of TinyStories 15M both load and generate
+  coherent stories.
+- `garuda inspect` reports which tensor blocks a file's decoder is missing, rather
+  than lumping everything quantised together.
+
+### Changed
+
+- The "F32/F16 only" limit is now "F32/F16/Q4_0/Q8_0". The k-quant super-block
+  formats (`Q4_K`, `Q6_K`, …) that dominate modern downloads still need a decoder
+  that is not written yet — and weights are still fully expanded to `f32` at load, so
+  this does not yet enable models larger than RAM. Both are named as the next phases.
+
 ## [0.3.0] - 2026-07-13
 
 Garuda can now load and run a real model. Point it at a GGUF checkpoint and it

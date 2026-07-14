@@ -36,7 +36,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     println!("\n== tensors ({}) ==", g.tensors.len());
-    for t in g.tensors.iter().take(3) {
+    for t in g.tensors.iter() {
         println!(
             "{:40} dims={:?} type={} offset={}",
             t.name, t.dims, t.ggml_type, t.offset

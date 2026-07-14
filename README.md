@@ -31,9 +31,10 @@ $ curl -s localhost:8080/v1/completions -d '{"prompt":"Once upon a time","max_to
 
 That runs a real Llama-architecture transformer — grouped-query attention with
 RoPE, SwiGLU feed-forward, a SentencePiece tokenizer loaded from the file — through
-the same runtime, scheduler and API as everything else. Only **F32/F16**
-checkpoints load; quantised weights (`Q4_K`, `Q8_0`, …) are rejected, because no
-dequantiser exists yet. That is the one real limit on which models work.
+the same runtime, scheduler and API as everything else. **F32, F16, Q4_0 and Q8_0**
+checkpoints load; the k-quant super-block formats (`Q4_K`, `Q6_K`, …) that dominate
+modern downloads are rejected for now, because their decoder isn't written yet.
+That is the one real limit on which models work.
 
 **Without a checkpoint**, it runs a synthetic MoE whose weights are pseudo-random
 but deterministic. The transformer arithmetic is real; the weights are not, so the
@@ -43,14 +44,15 @@ the streaming, the cancellation, the load shedding.
 
 | | Status |
 |---|---|
-| Load & run a real model from GGUF (Llama, F32/F16) | Real, tested |
+| Load & run a real model from GGUF (Llama; F32/F16/Q4_0/Q8_0) | Real, tested |
 | SentencePiece tokenizer from GGUF | Real, tested |
 | Transformer forward pass (GQA + RoPE + SwiGLU; MoE routing) | Real, tested |
 | Tiered expert storage (L1 RAM → L2 disk → L3 archive) | Real, tested |
 | Paged KV cache with disk spill (multi-layer, GQA-aware) | Real, tested |
 | Scheduler (priority, concurrency limits, cancellation, timeouts, backpressure) | Real, tested |
 | OpenAI-compatible API + SSE + WebSocket | Real, tested |
-| **Quantised weights (`Q4_K`, `Q8_0`, …)** | **Not implemented** — F32/F16 only |
+| Dequantisation: F32 / F16 / Q4_0 / Q8_0 | Real, tested |
+| **k-quants (`Q4_K`, `Q6_K`, …)** | **Not implemented** — super-block decoder missing |
 | **GPU backend** | **Not implemented** (`gpu = true` is a startup error) |
 | **Authentication** | **Not implemented** — do not expose this to a network |
 
@@ -209,10 +211,11 @@ registered in `Engine::build` — see **[PLUGIN.md](PLUGIN.md)** and
 
 ### What is still missing
 
-- **Quantised weights.** [`gguf`](garuda/src/gguf/mod.rs) reads F32/F16 tensors and
-  the full container; the block-format decoders (`Q4_K`, `Q6_K`, …) that most
-  downloadable models use are not written yet. Until they are, only F32/F16
-  checkpoints (small models) load.
+- **k-quant weights.** [`quant`](garuda/src/quant/mod.rs) dequantises F32, F16, Q4_0
+  and Q8_0. The k-quant super-block formats (`Q4_K`, `Q6_K`, …) that most modern
+  downloads use need a super-block decoder that is not written yet. Weights are also
+  fully expanded to `f32` at load — keeping them packed and multiplying with an
+  integer kernel (so a model larger than RAM can run) is a later phase.
 - **Architectures beyond Llama.** `LlamaBackend` covers the Llama family (dense,
   GQA). Other architectures each need their own `InferenceBackend`.
 

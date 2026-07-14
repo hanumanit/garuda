@@ -32,6 +32,7 @@ pub mod memory;
 pub mod moe;
 pub mod predictor;
 pub mod prefetch;
+pub mod quant;
 pub mod router;
 pub mod runtime;
 pub mod scheduler;

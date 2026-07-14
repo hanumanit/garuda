@@ -67,20 +67,29 @@ fn inspect(path: &std::path::Path) -> anyhow::Result<()> {
     println!("metadata keys {}", gguf.metadata.len());
     println!("data offset   {}", gguf.data_offset);
 
-    // Report loadability honestly: F32 (type 0) and F16 (type 1) load; anything
-    // quantised does not, and only the llama architecture is wired up.
+    // Report loadability honestly: F32/F16/Q4_0/Q8_0 decode; the k-quants do not
+    // yet, and only the llama architecture is wired up.
     let arch = gguf.architecture().unwrap_or("(unknown)");
-    let quantised = gguf
+    let bad_tensor = gguf
         .tensors
         .iter()
-        .any(|t| t.ggml_type != 0 && t.ggml_type != 1);
+        .find(|t| !garuda::quant::is_supported(t.ggml_type));
     println!();
-    if arch == "llama" && !quantised {
-        println!("loadable      yes — F32/F16 llama. Run it with `model.gguf = \"{}\"`.", path.display());
-    } else if arch != "llama" {
+    if arch != "llama" {
         println!("loadable      no — only the llama architecture is supported (this is '{arch}').");
+    } else if let Some(t) = bad_tensor {
+        println!(
+            "loadable      no — tensor '{}' is {} ({}), which needs a super-block decoder \
+             that does not exist yet (F32/F16/Q4_0/Q8_0 are supported).",
+            t.name,
+            garuda::quant::type_name(t.ggml_type),
+            t.ggml_type
+        );
     } else {
-        println!("loadable      no — this checkpoint is quantised; only F32/F16 weights load today.");
+        println!(
+            "loadable      yes. Run it with `model.gguf = \"{}\"`.",
+            path.display()
+        );
     }
     Ok(())
 }
