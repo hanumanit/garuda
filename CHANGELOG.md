@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.1] - 2026-07-14
+
+The k-quants — so Garuda now loads the `*_K_M` checkpoints that make up most GGUF
+downloads.
+
+### Added
+
+- **`Q4_K` and `Q6_K` dequantisation** in the `quant` module: the super-block scale
+  and min unpacking (ggml's `get_scale_min_k4`) and the 6-bit `ql`/`qh` assembly,
+  byte-for-byte with the reference. Together they cover a `*_K_M` file whole.
+
+Verified end to end: **TinyLlama-1.1B Q4_K_M** (real Q4_K + Q6_K weights) loads and
+answers "the capital of France is" with "Paris" — a wrong decoder would produce noise.
+
+### Changed
+
+- The load limit went from "F32/F16/Q4_0/Q8_0" to add `Q4_K`/`Q6_K`. Still missing,
+  and named as the next phases: the remaining k-quants (`Q2_K`/`Q3_K`/`Q5_K`), and
+  keeping weights packed with an integer matmul kernel so a model larger than RAM can
+  run — today everything is expanded to `f32` at load.
+
 ## [0.4.0] - 2026-07-14
 
 First step toward running the quantised checkpoints people actually download, and
