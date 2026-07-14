@@ -5,7 +5,7 @@
 
 [model]
 path = "./models"
-gguf = "/Users/kongoon/models/mixtral-8x7b-instruct-v0.1.Q4_K_M.gguf"
+gguf = "/path/to/mixtral-8x7b-instruct-v0.1.Q4_K_M.gguf"
 # Essential here: keep the 26 GB packed on disk and dequantise per row, instead of
 # expanding to f32 in RAM (which would need hundreds of GB).
 mmap = true
