@@ -75,13 +75,25 @@ graph TD
     API -->|submit| Sched[Scheduler: priority heap,<br/>bounded concurrency]
     Sched -->|one token at a time| RT[Runtime: decode loop + sampler]
 
-    subgraph Forward pass
-        RT --> Embed[Embedding]
-        Embed --> Attn[Causal GQA + RoPE]
-        Attn --> Router[Router: mixtral / deepseek / qwen]
+    RT --> Embed[Embedding]
+
+    subgraph Block["Transformer block — repeated ×N layers"]
+        direction TB
+        In[block input] --> AN[RMSNorm]
+        AN --> Attn[Causal GQA + RoPE]
+        Attn --> AR(("＋"))
+        In -.->|residual| AR
+        AR --> FN[RMSNorm]
+        FN --> Router[Router: mixtral / deepseek / qwen]
         Router --> Experts[Top-k SwiGLU experts]
-        Experts --> Logits[Output head: tied or separate]
+        Experts --> FR(("＋"))
+        AR -.->|residual| FR
     end
+
+    Embed --> In
+    FR -->|next layer| In
+    FR -->|after N layers| ONorm[RMSNorm]
+    ONorm --> Logits[Output head: tied or separate]
 
     Attn <-->|read / append| KV[Paged KV cache]
     KV -.->|spill / reload| Disk[(Disk)]
