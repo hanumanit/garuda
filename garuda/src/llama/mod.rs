@@ -10,6 +10,11 @@
 //! With `mmap`, each projection — including per-expert matrices — stays packed in the
 //! mapped file and is dequantised a row at a time; for MoE that means a token only
 //! pages in the top-k experts it routes to.
+//!
+//! MoE experts load from either GGUF layout in the wild: a single stacked
+//! `..._exps` tensor (newer llama.cpp conversions), or one tensor per expert like
+//! `blk.0.ffn_gate.3.weight` (older conversions, e.g. the original TheBloke Mixtral
+//! quantisations). See [`ExpertWeight`].
 
 use crate::cache::{KVCacheState, SeqState};
 use crate::core::{GarudaError, InferenceBackend, ModelDims, Tensor, Token};
@@ -81,6 +86,37 @@ impl Weight {
                 let off = start + r * row_bytes;
                 quant::dequantize(*qtype, &src[off..off + row_bytes], *cols)
             }
+        }
+    }
+}
+
+/// One expert's slot within a gate/up/down projection: either a row-slice of a
+/// single stacked tensor, or its own separate tensor.
+///
+/// GGUF checkpoints disagree on layout. Newer llama.cpp conversions merge all
+/// experts into one `..._exps` tensor (`Stacked`, expert `e` is rows
+/// `[e·block, (e+1)·block)`). Older conversions — including the original
+/// TheBloke Mixtral quantisations — give each expert its own tensor, e.g.
+/// `blk.0.ffn_gate.3.weight` (`Split`).
+enum ExpertWeight {
+    Stacked(Weight),
+    Split(Vec<Weight>),
+}
+
+impl ExpertWeight {
+    /// Expert `e`'s matvec. `block` is one expert's row count in the stacked
+    /// layout; it is ignored for `Split`, where each tensor already holds
+    /// exactly one expert.
+    fn matvec_expert(
+        &self,
+        e: usize,
+        block: usize,
+        x: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), GarudaError> {
+        match self {
+            ExpertWeight::Stacked(w) => w.matvec_rows(e * block, x, out),
+            ExpertWeight::Split(ws) => ws[e].matvec(x, out),
         }
     }
 }
@@ -183,20 +219,20 @@ impl LlamaConfig {
 /// A block's feed-forward network: either a single dense SwiGLU, or a mixture of
 /// experts where a router picks the top-k experts to run for each token.
 ///
-/// For MoE, `gate`/`up`/`down` are the *stacked* expert tensors: expert `e`'s matrix
-/// is the row-slice `[e·d_ff, (e+1)·d_ff)` (or `d_model` for `down`), read on demand.
-/// Under `mmap`, only the selected experts' rows are ever paged in — the streaming win.
+/// For MoE, `gate`/`up`/`down` hold each expert's matrix, stacked or split (see
+/// [`ExpertWeight`]). Under `mmap`, only the selected experts' rows are ever paged
+/// in — the streaming win.
 enum Ffn {
     Dense {
-        gate: Weight,
-        up: Weight,
-        down: Weight,
+        gate: ExpertWeight,
+        up: ExpertWeight,
+        down: ExpertWeight,
     },
     Moe {
         router: Weight,
-        gate: Weight,
-        up: Weight,
-        down: Weight,
+        gate: ExpertWeight,
+        up: ExpertWeight,
+        down: ExpertWeight,
     },
 }
 
@@ -297,21 +333,39 @@ impl LlamaBackend {
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for l in 0..cfg.n_layers {
             let p = |name: &str| format!("blk.{l}.{name}.weight");
+            // Per-expert tensor name for the split (un-merged) layout, e.g.
+            // `blk.0.ffn_gate.3.weight`.
+            let pe = |name: &str, e: usize| format!("blk.{l}.{name}.{e}.weight");
+            let split = |name: &str, rows: usize, cols: usize| -> Result<ExpertWeight, GarudaError> {
+                let mut ws = Vec::with_capacity(ne);
+                for e in 0..ne {
+                    ws.push(weight(&pe(name, e), rows, cols)?);
+                }
+                Ok(ExpertWeight::Split(ws))
+            };
 
-            // A layer is MoE if the model declares experts and the block has the
-            // stacked expert tensors; otherwise it is a plain dense FFN.
+            // A layer is MoE if the model declares experts and the block has either
+            // the merged stacked tensors or the older per-expert tensors; otherwise
+            // it is a plain dense FFN.
             let ffn = if ne > 0 && g.tensor(&p("ffn_gate_exps")).is_some() {
                 Ffn::Moe {
                     router: weight(&p("ffn_gate_inp"), ne, d)?,
-                    gate: weight(&p("ffn_gate_exps"), ne * f, d)?,
-                    up: weight(&p("ffn_up_exps"), ne * f, d)?,
-                    down: weight(&p("ffn_down_exps"), ne * d, f)?,
+                    gate: ExpertWeight::Stacked(weight(&p("ffn_gate_exps"), ne * f, d)?),
+                    up: ExpertWeight::Stacked(weight(&p("ffn_up_exps"), ne * f, d)?),
+                    down: ExpertWeight::Stacked(weight(&p("ffn_down_exps"), ne * d, f)?),
+                }
+            } else if ne > 0 && g.tensor(&pe("ffn_gate", 0)).is_some() {
+                Ffn::Moe {
+                    router: weight(&p("ffn_gate_inp"), ne, d)?,
+                    gate: split("ffn_gate", f, d)?,
+                    up: split("ffn_up", f, d)?,
+                    down: split("ffn_down", d, f)?,
                 }
             } else {
                 Ffn::Dense {
-                    gate: weight(&p("ffn_gate"), f, d)?,
-                    up: weight(&p("ffn_up"), f, d)?,
-                    down: weight(&p("ffn_down"), d, f)?,
+                    gate: ExpertWeight::Stacked(weight(&p("ffn_gate"), f, d)?),
+                    up: ExpertWeight::Stacked(weight(&p("ffn_up"), f, d)?),
+                    down: ExpertWeight::Stacked(weight(&p("ffn_down"), d, f)?),
                 }
             };
 
@@ -440,21 +494,21 @@ impl LlamaBackend {
     /// FFN (a single expert spanning the whole tensor).
     fn expert(
         &self,
-        gate: &Weight,
-        up: &Weight,
-        down: &Weight,
+        gate: &ExpertWeight,
+        up: &ExpertWeight,
+        down: &ExpertWeight,
         e: usize,
         h: &[f32],
     ) -> Result<Vec<f32>, GarudaError> {
         let (d, f) = (self.cfg.d_model, self.cfg.d_ff);
         let mut g = vec![0.0; f];
         let mut u = vec![0.0; f];
-        gate.matvec_rows(e * f, h, &mut g)?;
-        up.matvec_rows(e * f, h, &mut u)?;
+        gate.matvec_expert(e, f, h, &mut g)?;
+        up.matvec_expert(e, f, h, &mut u)?;
         simd::silu(&mut g);
         simd::mul_assign(&mut g, &u);
         let mut out = vec![0.0; d];
-        down.matvec_rows(e * d, &g, &mut out)?;
+        down.matvec_expert(e, d, &g, &mut out)?;
         Ok(out)
     }
 
@@ -600,23 +654,35 @@ mod tests {
             .collect()
     }
 
-    /// Build a tiny MoE llama GGUF (F32 weights) entirely in memory.
-    fn build_moe_gguf() -> Vec<u8> {
+    /// Which GGUF tensor layout to emit for MoE experts.
+    #[derive(Clone, Copy)]
+    enum ExpertLayout {
+        /// One stacked `..._exps` tensor, expert `e` at rows `[e·block, (e+1)·block)`.
+        Merged,
+        /// One tensor per expert, e.g. `blk.0.ffn_gate.3.weight`.
+        Split,
+    }
+
+    /// Build a tiny MoE llama GGUF (F32 weights) entirely in memory, in either
+    /// expert tensor layout. Both layouts get identical numbers (each gate/up/down
+    /// is generated once as a flat array and either kept whole or sliced per
+    /// expert), so outputs from the two layouts can be compared directly.
+    fn build_moe_gguf(layout: ExpertLayout) -> Vec<u8> {
         let (d, kv_dim, ff, nl, vocab, ne) = (32usize, 16usize, 32usize, 2usize, 64usize, 4usize);
 
         // (name, ne-order dims, data)
         let mut tensors: Vec<(String, Vec<u64>, Vec<f32>)> = Vec::new();
         let add = |name: String,
-                   ne: Vec<u64>,
+                   dims: Vec<u64>,
                    seed: usize,
                    tv: &mut Vec<(String, Vec<u64>, Vec<f32>)>| {
-            let n: usize = ne.iter().product::<u64>() as usize;
+            let n: usize = dims.iter().product::<u64>() as usize;
             let data = if name.contains("norm") {
                 vec![1.0; n] // norms near 1 so rmsnorm output is sane
             } else {
                 r#gen(seed, n)
             };
-            tv.push((name, ne, data));
+            tv.push((name, dims, data));
         };
         let mut s = 1;
         add(
@@ -637,7 +703,7 @@ mod tests {
         s += 1;
         for l in 0..nl {
             let p = |n: &str| format!("blk.{l}.{n}.weight");
-            for (name, ne) in [
+            for (name, dims) in [
                 (p("attn_norm"), vec![d as u64]),
                 (p("attn_q"), vec![d as u64, d as u64]),
                 (p("attn_k"), vec![d as u64, kv_dim as u64]),
@@ -645,12 +711,31 @@ mod tests {
                 (p("attn_output"), vec![d as u64, d as u64]),
                 (p("ffn_norm"), vec![d as u64]),
                 (p("ffn_gate_inp"), vec![d as u64, ne as u64]),
-                (p("ffn_gate_exps"), vec![d as u64, ff as u64, ne as u64]),
-                (p("ffn_up_exps"), vec![d as u64, ff as u64, ne as u64]),
-                (p("ffn_down_exps"), vec![ff as u64, d as u64, ne as u64]),
             ] {
-                add(name, ne, s, &mut tensors);
+                add(name, dims, s, &mut tensors);
                 s += 1;
+            }
+
+            for (base, out_rows, cols) in [("ffn_gate", ff, d), ("ffn_up", ff, d), ("ffn_down", d, ff)] {
+                let flat = r#gen(s, ne * out_rows * cols);
+                s += 1;
+                match layout {
+                    ExpertLayout::Merged => tensors.push((
+                        format!("blk.{l}.{base}_exps.weight"),
+                        vec![cols as u64, out_rows as u64, ne as u64],
+                        flat,
+                    )),
+                    ExpertLayout::Split => {
+                        let block = out_rows * cols;
+                        for e in 0..ne {
+                            tensors.push((
+                                format!("blk.{l}.{base}.{e}.weight"),
+                                vec![cols as u64, out_rows as u64],
+                                flat[e * block..(e + 1) * block].to_vec(),
+                            ));
+                        }
+                    }
+                }
             }
         }
 
@@ -693,10 +778,10 @@ mod tests {
 
         // tensor infos
         let mut infos = Vec::new();
-        for ((name, ne, _), &off) in tensors.iter().zip(&offsets) {
+        for ((name, dims, _), &off) in tensors.iter().zip(&offsets) {
             put_str(&mut infos, name);
-            infos.extend_from_slice(&(ne.len() as u32).to_le_bytes());
-            for &dim in ne {
+            infos.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+            for &dim in dims {
                 infos.extend_from_slice(&dim.to_le_bytes());
             }
             infos.extend_from_slice(&0u32.to_le_bytes()); // type F32
@@ -784,7 +869,7 @@ mod tests {
 
     #[test]
     fn synthetic_moe_model_loads_routes_and_runs() {
-        let bytes = build_moe_gguf();
+        let bytes = build_moe_gguf(ExpertLayout::Merged);
 
         // f32-expand path
         let f32b = LlamaBackend::load(&bytes).unwrap();
@@ -828,5 +913,22 @@ mod tests {
             assert!((x - y).abs() < 1e-3, "f32 {x} vs mmap {y}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Older llama.cpp conversions (e.g. the original TheBloke Mixtral GGUFs) store
+    /// each expert as its own tensor (`blk.0.ffn_gate.3.weight`) instead of one
+    /// stacked `..._exps` tensor. Both must load and produce the same logits, since
+    /// [`build_moe_gguf`] gives the two layouts identical numbers.
+    #[test]
+    fn split_expert_tensors_match_merged_layout() {
+        let merged = LlamaBackend::load(&build_moe_gguf(ExpertLayout::Merged)).unwrap();
+        let split = LlamaBackend::load(&build_moe_gguf(ExpertLayout::Split)).unwrap();
+        assert_eq!(split.config().n_experts, 4);
+
+        let mut s1 = seq_for(&merged);
+        let mut s2 = seq_for(&split);
+        let a = merged.logits(&[3, 7, 1], &mut s1).unwrap();
+        let b = split.logits(&[3, 7, 1], &mut s2).unwrap();
+        assert_eq!(a.data(), b.data());
     }
 }

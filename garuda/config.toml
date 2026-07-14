@@ -8,8 +8,9 @@
 path = "./models"
 # Path to a GGUF checkpoint. Leave empty to run the synthetic MoE (meaningless
 # output). Set it to load a real model instead — the router/experts/top_k knobs are
-# then ignored. Only F32/F16 checkpoints load; quantised weights are not yet
-# supported. A tiny real model to try:
+# then ignored. F32/F16/Q4_0/Q8_0 and the k-quants Q2_K-Q6_K decode; MoE experts may
+# be either the merged `..._exps` tensor layout or the older per-expert layout. A
+# tiny real model to try:
 #   curl -L https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf -o stories260K.gguf
 # gguf = "stories260K.gguf"
 gguf = ""

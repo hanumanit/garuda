@@ -52,8 +52,12 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn inspect(path: &std::path::Path) -> anyhow::Result<()> {
-    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    let gguf = garuda::gguf::Gguf::parse(&bytes)?;
+    // mmap rather than read: a checkpoint can be far larger than RAM, and printing
+    // its metadata should not require loading the whole file first.
+    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mmap = unsafe { memmap2::Mmap::map(&file) }
+        .with_context(|| format!("mmapping {}", path.display()))?;
+    let gguf = garuda::gguf::Gguf::parse(&mmap)?;
 
     println!("file          {}", path.display());
     println!("gguf version  {}", gguf.version);
@@ -71,23 +75,39 @@ fn inspect(path: &std::path::Path) -> anyhow::Result<()> {
     println!("metadata keys {}", gguf.metadata.len());
     println!("data offset   {}", gguf.data_offset);
 
-    // Report loadability honestly: F32/F16/Q4_0/Q8_0 decode; the k-quants do not
-    // yet, and only the llama architecture is wired up.
+    // Report loadability honestly: F32/F16/Q4_0/Q8_0/k-quants decode, only the
+    // llama architecture is wired up, and MoE blocks need either the merged
+    // `..._exps` tensors or the older per-expert tensors — matching exactly what
+    // `LlamaBackend::from_gguf` requires, so this never promises a load that fails.
     let arch = gguf.architecture().unwrap_or("(unknown)");
     let bad_tensor = gguf
         .tensors
         .iter()
         .find(|t| !garuda::quant::is_supported(t.ggml_type));
+    let missing_experts = match (gguf.expert_count(), gguf.arch_u64("block_count")) {
+        (Some(ne), Some(nl)) if ne > 0 => (0..nl).find(|&l| {
+            let stacked = gguf.tensor(&format!("blk.{l}.ffn_gate_exps.weight")).is_some();
+            let split = gguf.tensor(&format!("blk.{l}.ffn_gate.0.weight")).is_some();
+            !stacked && !split
+        }),
+        _ => None,
+    };
     println!();
     if arch != "llama" {
         println!("loadable      no — only the llama architecture is supported (this is '{arch}').");
     } else if let Some(t) = bad_tensor {
         println!(
             "loadable      no — tensor '{}' is {} ({}), which needs a super-block decoder \
-             that does not exist yet (F32/F16/Q4_0/Q8_0 are supported).",
+             that does not exist yet.",
             t.name,
             garuda::quant::type_name(t.ggml_type),
             t.ggml_type
+        );
+    } else if let Some(l) = missing_experts {
+        println!(
+            "loadable      no — block {l} declares experts but has neither `ffn_gate_exps` \
+             (merged) nor `ffn_gate.0` (per-expert) tensors; this checkpoint's MoE tensor \
+             layout is not recognised."
         );
     } else {
         println!(

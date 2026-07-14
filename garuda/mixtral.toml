@@ -1,0 +1,39 @@
+# Run config for a real Mixtral-8x7B Q4_K_M checkpoint (~26 GB) on a 16 GB machine.
+# The point of this config is to exercise the mmap + per-expert streaming path with
+# a model far larger than RAM: only the top-k experts a token routes to are ever
+# touched, paged from the memory-mapped file on demand.
+
+[model]
+path = "./models"
+gguf = "/Users/kongoon/models/mixtral-8x7b-instruct-v0.1.Q4_K_M.gguf"
+# Essential here: keep the 26 GB packed on disk and dequantise per row, instead of
+# expanding to f32 in RAM (which would need hundreds of GB).
+mmap = true
+# Cap the KV cache. Mixtral was trained for 32k, but a small window keeps the cache
+# tiny on a memory-constrained box; it only limits sequence length, not correctness.
+context = 2048
+gpu = false
+
+[memory]
+kv_resident_blocks = 256
+prompt_cache_entries = 8
+kv_spill = true
+
+[runtime]
+threads = 0
+prefetch = true
+predictor = true
+
+[server]
+host = "127.0.0.1"
+port = 8090
+# One sequence at a time: paged inference over a >RAM model is memory-sensitive.
+max_concurrent = 1
+queue_capacity = 16
+request_timeout_secs = 900
+
+[sampling]
+temperature = 0.7
+top_p = 0.95
+top_k = 40
+max_tokens = 48
