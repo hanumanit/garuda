@@ -9,8 +9,6 @@
   <a href="ABOUT.md">About</a> · <a href="INSTALL.md">Install</a> · <a href="PLUGIN.md">Write a plugin</a>
 </p>
 
-![Garuda Cover](./garuda_cover.jpg)
-
 Garuda is an inference **engine** for Mixture-of-Experts models: a scheduler, a
 tiered expert cache, a paged KV cache, and an OpenAI-compatible API, written in
 Rust.
