@@ -14,7 +14,7 @@
 //! MoE experts load from either GGUF layout in the wild: a single stacked
 //! `..._exps` tensor (newer llama.cpp conversions), or one tensor per expert like
 //! `blk.0.ffn_gate.3.weight` (older conversions, e.g. the original TheBloke Mixtral
-//! quantisations). See [`ExpertWeight`].
+//! quantisations). See `ExpertWeight`.
 
 use crate::cache::{KVCacheState, SeqState};
 use crate::core::{GarudaError, InferenceBackend, ModelDims, Tensor, Token};
