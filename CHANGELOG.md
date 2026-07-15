@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.0] - 2026-07-15
+
+API key authentication — off by default, one config key away from on.
+
+### Added
+
+- **`server.api_keys`**: a list of shared secrets. When set, every request except
+  `GET /health` and `GET /` (the chat page's static HTML) must present one, as
+  `Authorization: Bearer <key>` or `x-api-key: <key>` — whichever a client's own
+  ecosystem convention sends (OpenAI/llama.cpp/Ollama clients default to the
+  former, Anthropic clients to the latter), so nothing about picking a wire
+  protocol changes because auth is on. Keys compare in constant time
+  (`constant_time_eq`), and a request with a present-but-empty key never matches
+  even a misconfigured empty-string key — `AppConfig::validate` rejects those
+  outright.
+- The built-in chat page gained an API key field under Settings, stored in
+  `localStorage`. A 401 opens Settings automatically and shows a clear error
+  instead of hanging; the model badge shows "needs API key" until one is set.
+- `auth::require_key`, an axum middleware wrapping the whole merged router (every
+  protocol front end, not just the OpenAI-shaped one), so no adapter needed its own
+  auth logic.
+
+Verified: unit tests cover missing/wrong/correct keys, both header styles, multiple
+configured keys, the exempt paths, and the empty-key edge case; a Playwright pass
+against the real chat page confirms the full flow — blocked, prompted, unblocked,
+and that the key survives a reload.
+
 ## [0.9.0] - 2026-07-15
 
 A real MoE at scale, finally: Mixtral-8x7B (Q4_K_M, 26 GB) now loads and runs on a

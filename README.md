@@ -59,8 +59,8 @@ the streaming, the cancellation, the load shedding.
 | A real MoE checkpoint at scale (Mixtral-8x7B, Q4_K_M, 26 GB) | Real, tested — loads and generates on a 16 GB machine via `mmap`; both GGUF expert-tensor layouts (merged `..._exps` and the older per-expert tensors some conversions use) load correctly |
 | Speculative expert prefetch against a real checkpoint | Real, tested — a per-layer Markov predictor warms the likely next experts' mmap pages on a background thread while the current step still computes |
 | Built-in chat page (`GET /`) | Real — talks to `/v1/chat/completions`, same origin, no separate frontend |
+| API key authentication (`Authorization: Bearer` or `x-api-key`) | Real, tested — off by default; set `server.api_keys` to require one |
 | **GPU backend** | **Not implemented** (`gpu = true` is a startup error) |
-| **Authentication** | **Not implemented** — do not expose this to a network |
 
 The real model runs as a **plugin**: `llama::LlamaBackend` implements the same
 `core::InferenceBackend` trait as the synthetic MoE, and `SpmTokenizer` implements
@@ -221,8 +221,17 @@ Two extensions beyond the OpenAI shape:
 
 - `X-Garuda-User` identifies the caller for per-user concurrency limits. Absent, everyone
   shares the `anonymous` bucket. **This is not authentication** — anyone can claim any
-  name. It is a fairness knob, not a security control.
+  name. It is a fairness knob, not a security control. Real authentication is
+  `server.api_keys` (below), a separate, independent mechanism.
 - `"priority": "low" | "normal" | "high"` on any request.
+
+**Authentication** — off by default. Set `server.api_keys` to one or more shared
+secrets and every request except `GET /health` and `GET /` needs one, sent as
+`Authorization: Bearer <key>` (OpenAI, llama.cpp, Ollama clients) or `x-api-key: <key>`
+(Anthropic clients) — whichever a client sends is checked, so nothing downstream needs
+to know or care which scheme was used. Keys are compared in constant time. The
+built-in chat page has an API key field under Settings, stored in the browser's
+`localStorage`.
 
 **About `/v1/embeddings`:** the vectors are the model's real pooled hidden state,
 L2-normalised. With a trained checkpoint loaded they mean something; on the

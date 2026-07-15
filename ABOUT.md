@@ -41,8 +41,9 @@ use instead). That MoE path is verified against a real large MoE now — Mixtral
 Q4_K_M, 26 GB — loading and generating on a 16 GB machine via `mmap`. `Q8_0` and
 `Q4_K` (the dominant tensor type in that file) dot directly against an int8-quantised
 activation rather than expanding to `f32` first. There is **no GPU backend**
-(`gpu = true` is a startup error, not a silent fallback), and **no authentication** —
-do not expose it to a network you do not control.
+(`gpu = true` is a startup error, not a silent fallback), and authentication is off
+by default — set `server.api_keys` to require one, or do not expose it to a network
+you do not control.
 
 The plugin architecture is what makes the real model a first-class citizen rather
 than a special case: a checkpoint is just another `InferenceBackend` behind a trait
@@ -51,7 +52,7 @@ the runtime already depended on. See [PLUGIN.md](PLUGIN.md).
 ## Facts
 
 - **Language:** Rust (edition 2024, 1.85+)
-- **Tests:** 141 (129 unit + 12 end-to-end HTTP)
+- **Tests:** 147 (135 unit + 12 end-to-end HTTP)
 - **Verified:** loads and runs both the TinyStories 260K checkpoint and a real
   Mixtral-8x7B (Q4_K_M, 26 GB) end to end, the latter on a 16 GB machine via `mmap`
 - **API:** OpenAI-compatible REST + SSE + WebSocket, plus a built-in chat page at `/`

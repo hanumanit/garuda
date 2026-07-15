@@ -3,8 +3,8 @@
 Garuda is a single Rust binary with no system dependencies beyond a Rust
 toolchain. Everything below is verified against a clean checkout.
 
-For a quick orientation to what Garuda is (and its real limits — no GPU backend, no
-authentication), read the [README](README.md) first.
+For a quick orientation to what Garuda is (and its real limits — no GPU backend,
+authentication off by default), read the [README](README.md) first.
 
 ## Requirements
 
@@ -114,6 +114,20 @@ than being silently ignored.
 
 Set the log level with the `GARUDA_LOG` environment variable (e.g.
 `GARUDA_LOG=debug garuda serve`).
+
+## Authentication
+
+Off by default — anyone who can reach the port can use the server. Before exposing
+it beyond `localhost`, set one or more keys:
+
+```toml
+[server]
+api_keys = ["sk-change-me"]
+```
+
+Every request needs one then, sent as `Authorization: Bearer sk-change-me` or
+`x-api-key: sk-change-me` — except `GET /health` (so a load balancer can probe it)
+and `GET /` (the built-in chat page, which has its own API key field under Settings).
 
 ## Run the tests
 
