@@ -1027,8 +1027,13 @@ mod tests {
         assert_eq!(a.data(), b.data());
     }
 
+    /// A fresh, uniquely-named temp directory per call — tests run in parallel, and
+    /// a shared fixed path lets one test's `remove_dir_all` cleanup race another
+    /// test (or another loop iteration) still using it.
     fn mmap_of(bytes: &[u8], name: &str) -> (std::path::PathBuf, Arc<Mmap>) {
-        let dir = std::env::temp_dir().join("garuda_prefetch_test");
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("garuda_prefetch_test_{n}"));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join(name);
         std::fs::File::create(&path).unwrap().write_all(bytes).unwrap();
@@ -1102,9 +1107,12 @@ mod tests {
             assert_eq!(got.data(), want.data(), "prefetch changed output at step {n}");
         }
 
-        // Background warms are spawned on rayon; give them a moment, then confirm
-        // the engine actually attempted something over these steps.
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // Background warms are spawned on rayon; poll rather than trust a fixed
+        // sleep to outrace them when the full suite is loading every core.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pf.launched() + pf.skipped() == 0 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
         assert!(
             pf.launched() + pf.skipped() > 0,
             "prefetcher predicted nothing across {} decode steps",
