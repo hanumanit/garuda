@@ -55,8 +55,10 @@ the streaming, the cancellation, the load shedding.
 | OpenAI + Ollama + Anthropic + llama.cpp + TGI APIs, SSE / NDJSON / WebSocket | Real, tested |
 | Dequantisation: F32 / F16 / Q4_0 / Q8_0 / Q2_K–Q6_K | Real, tested (runs Q2_K…Q5_K_M models) |
 | Memory-mapped packed weights (`mmap = true`), incl. per-expert streaming | Real, tested (~6× less RAM, same output) |
-| Integer (NEON `i8`) matmul kernel for Q8_0 | Real, tested (2.6× faster on Apple M2, same output) |
-| **A real MoE checkpoint at scale (e.g. Mixtral)** | **Not run** — the MoE path is verified on a synthetic model; no large MoE was downloadable here |
+| Integer (NEON `i8`) matmul kernel for Q8_0 and Q4_K | Real, tested (2.6× / ~10× faster respectively than dequantise-then-dot, same output within quantisation tolerance) |
+| A real MoE checkpoint at scale (Mixtral-8x7B, Q4_K_M, 26 GB) | Real, tested — loads and generates on a 16 GB machine via `mmap`; both GGUF expert-tensor layouts (merged `..._exps` and the older per-expert tensors some conversions use) load correctly |
+| Speculative expert prefetch against a real checkpoint | Real, tested — a per-layer Markov predictor warms the likely next experts' mmap pages on a background thread while the current step still computes |
+| Built-in chat page (`GET /`) | Real — talks to `/v1/chat/completions`, same origin, no separate frontend |
 | **GPU backend** | **Not implemented** (`gpu = true` is a startup error) |
 | **Authentication** | **Not implemented** — do not expose this to a network |
 
@@ -114,6 +116,13 @@ a first-order Markov model over which experts actually fire, and the prefetcher
 warms its guesses on a background thread while the current token is still
 computing. A wrong guess costs one wasted load and can never change the output.
 
+The same predictor/prefetcher pair also runs against a real mmapped checkpoint —
+there is no L1/L2/L3 tier there, so instead of warming an expert into the tiered
+cache, it touches that expert's mmap pages directly on a background thread. The
+page fault the forward pass would otherwise pay synchronously happens ahead of
+time instead; each of a real model's 32 layers routes independently, so the
+routing history and predictions are tracked per layer, not globally.
+
 ---
 
 ## Getting started
@@ -123,6 +132,8 @@ cd garuda
 
 # Run the API server on the synthetic MoE (config.toml is read if present)
 cargo run --release -- serve
+# Open http://localhost:8080/ for a built-in chat page — same origin, no
+# separate frontend, talks to the same /v1/chat/completions any client uses.
 
 # Run a real model: set model.gguf in config.toml, or drop the file in and go
 curl -L https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf -o stories260K.gguf
@@ -232,7 +243,7 @@ matter; read the doc comments in the source for the authoritative contract.
 | Compute backend | [`core::InferenceBackend`](garuda/src/core/mod.rs) | context → logits | `moe::MoeEngine`, `llama::LlamaBackend` |
 | Tokenizer | [`tokenizer::Tokenize`](garuda/src/tokenizer/mod.rs) | text ↔ tokens | `Tokenizer` (byte), `spm::SpmTokenizer` |
 | Storage tier | [`core::StorageBackend`](garuda/src/core/mod.rs) | bytes on some medium | `storage::LocalStorageBackend` |
-| Expert source | [`core::ExpertLoader`](garuda/src/core/mod.rs) | id → expert weights | `memory::MemoryManager` |
+| Expert source | [`core::ExpertLoader`](garuda/src/core/mod.rs) | id → expert weights | `memory::MemoryManager`, `prefetch::GgufPagePrefetcher` |
 
 ### The `InferenceBackend` contract
 
@@ -264,18 +275,15 @@ registered in `Engine::build` — see **[PLUGIN.md](PLUGIN.md)** and
 
 ### What is still missing
 
-- **A large MoE at scale.** The Llama backend runs both dense and mixture-of-experts
-  FFNs: a router scores the experts, and only the top-k a token selects are executed,
-  reading just their slice of the stacked expert tensors — so under `mmap` a token
-  pages in only those experts. This is verified on a synthetic MoE model (routing,
-  blending, and packed-vs-expanded equivalence all tested), but **not** yet on a real
-  large MoE like Mixtral — none was downloadable in this environment (16 GB checkpoint,
-  5 GB of disk). (The `*_1` linear quants and IQ imatrix quants still need decoders.)
-- **Integer kernels for the k-quants.** Q8_0 already uses a NEON `i8` dot
-  ([`simd::dot_i8`](garuda/src/simd/mod.rs)) that runs 2.6× faster than dequantising to
-  f32. The k-quants (`Q4_K`…) could too, but they are bottlenecked on unpacking their
-  sub-byte quants rather than on the dot, so the win there is smaller and the code much
-  fiddlier.
+- **Integer kernels for the rest of the k-quants.** `Q8_0` and `Q4_K` both dot
+  directly against an int8-quantised activation now, without ever expanding a row to
+  `f32` — 2.6× and ~10× faster respectively than dequantise-then-dot, measured at
+  Mixtral's own row width. `Q4_K` turned out to be worth it despite the nibble-unpack
+  cost that made the smaller-block `Q4_0` not worth it: its 256-element super-blocks
+  amortise that cost across enough dot-product work to win big. `Q2_K`/`Q3_K`/`Q5_K`/
+  `Q6_K` still take the slower dequantise-to-`f32` path — the same trick likely applies,
+  just not done yet. The `*_1` linear quants and IQ imatrix quants still need decoders
+  entirely.
 - **Architectures beyond Llama.** `LlamaBackend` covers the Llama family (dense and
   MoE, GQA). Other architectures each need their own `InferenceBackend`.
 
