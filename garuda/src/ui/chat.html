@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Garuda</title>
+<style>
+  :root {
+    color-scheme: dark light;
+    --bg: #16181d;
+    --panel: #1d1f26;
+    --border: #2c2f38;
+    --text: #e7e9ee;
+    --muted: #8b8f9c;
+    --accent: #6ea8fe;
+    --user-bubble: #2a3b57;
+    --assistant-bubble: #23252c;
+    --danger: #e6707c;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f5f6f8;
+      --panel: #ffffff;
+      --border: #e1e3e8;
+      --text: #1c1e22;
+      --muted: #6b6f7a;
+      --accent: #2f6fed;
+      --user-bubble: #dce8ff;
+      --assistant-bubble: #eef0f3;
+      --danger: #c8323f;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  header h1 {
+    font-size: 15px;
+    font-weight: 600;
+    margin: 0;
+  }
+  #model-badge {
+    font-size: 12px;
+    color: var(--muted);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 2px 10px;
+  }
+  header .spacer { flex: 1; }
+  header button {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    border-radius: 8px;
+    padding: 6px 10px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  header button:hover { color: var(--text); border-color: var(--accent); }
+
+  #settings {
+    display: none;
+    gap: 16px;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+    color: var(--muted);
+    flex-wrap: wrap;
+    align-items: center;
+  }
+  #settings.open { display: flex; }
+  #settings label { display: flex; align-items: center; gap: 6px; }
+  #settings input[type="range"] { width: 120px; }
+  #settings input[type="number"] {
+    width: 70px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 3px 6px;
+  }
+
+  main {
+    flex: 1;
+    overflow-y: auto;
+    display: flex;
+    justify-content: center;
+  }
+  #thread {
+    width: 100%;
+    max-width: 780px;
+    padding: 20px 16px 40px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .row { display: flex; }
+  .row.user { justify-content: flex-end; }
+  .row.assistant { justify-content: flex-start; }
+  .bubble {
+    max-width: 85%;
+    padding: 10px 14px;
+    border-radius: 14px;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+  }
+  .row.user .bubble {
+    background: var(--user-bubble);
+    border-bottom-right-radius: 4px;
+  }
+  .row.assistant .bubble {
+    background: var(--assistant-bubble);
+    border-bottom-left-radius: 4px;
+  }
+  .row.error .bubble {
+    background: transparent;
+    border: 1px solid var(--danger);
+    color: var(--danger);
+  }
+  .cursor {
+    display: inline-block;
+    width: 7px;
+    height: 1em;
+    background: var(--muted);
+    vertical-align: text-bottom;
+    margin-left: 1px;
+    animation: blink 1s step-start infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+  #empty {
+    color: var(--muted);
+    text-align: center;
+    margin-top: 20vh;
+    font-size: 14px;
+  }
+
+  footer {
+    border-top: 1px solid var(--border);
+    padding: 12px 16px 16px;
+    display: flex;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+  #composer {
+    width: 100%;
+    max-width: 780px;
+    display: flex;
+    align-items: flex-end;
+    gap: 8px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 8px 8px 8px 14px;
+  }
+  #composer:focus-within { border-color: var(--accent); }
+  #input {
+    flex: 1;
+    resize: none;
+    border: none;
+    background: transparent;
+    color: var(--text);
+    font: inherit;
+    max-height: 200px;
+    outline: none;
+    padding: 6px 0;
+  }
+  #send, #stop {
+    border: none;
+    border-radius: 10px;
+    padding: 8px 14px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  #send { background: var(--accent); color: #0b1220; }
+  #send:disabled { opacity: 0.4; cursor: default; }
+  #stop { background: var(--danger); color: #1a0d0f; display: none; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Garuda</h1>
+  <span id="model-badge">…</span>
+  <div class="spacer"></div>
+  <button id="settings-toggle" type="button">Settings</button>
+  <button id="clear" type="button">New chat</button>
+</header>
+
+<div id="settings">
+  <label>Temperature
+    <input type="range" id="temperature" min="0" max="2" step="0.05" value="0.8">
+    <span id="temperature-val">0.80</span>
+  </label>
+  <label>Max tokens
+    <input type="number" id="max-tokens" min="1" max="8192" value="512">
+  </label>
+</div>
+
+<main><div id="thread"><div id="empty">Ask garuda anything. Runs entirely on this machine.</div></div></main>
+
+<footer>
+  <div id="composer">
+    <textarea id="input" rows="1" placeholder="Message garuda…"></textarea>
+    <button id="send" type="button">Send</button>
+    <button id="stop" type="button">Stop</button>
+  </div>
+</footer>
+
+<script>
+(() => {
+  const thread = document.getElementById('thread');
+  const empty = document.getElementById('empty');
+  const input = document.getElementById('input');
+  const sendBtn = document.getElementById('send');
+  const stopBtn = document.getElementById('stop');
+  const clearBtn = document.getElementById('clear');
+  const settingsToggle = document.getElementById('settings-toggle');
+  const settingsPanel = document.getElementById('settings');
+  const temperatureInput = document.getElementById('temperature');
+  const temperatureVal = document.getElementById('temperature-val');
+  const maxTokensInput = document.getElementById('max-tokens');
+  const modelBadge = document.getElementById('model-badge');
+
+  /** @type {{role: string, content: string}[]} */
+  let history = [];
+  let controller = null;
+
+  fetch('/v1/models').then(r => r.json()).then(j => {
+    modelBadge.textContent = j.data?.[0]?.id ?? 'unknown model';
+  }).catch(() => { modelBadge.textContent = 'unreachable'; });
+
+  settingsToggle.addEventListener('click', () => settingsPanel.classList.toggle('open'));
+  temperatureInput.addEventListener('input', () => {
+    temperatureVal.textContent = Number(temperatureInput.value).toFixed(2);
+  });
+
+  clearBtn.addEventListener('click', () => {
+    if (controller) controller.abort();
+    history = [];
+    thread.innerHTML = '';
+    thread.appendChild(empty);
+    input.value = '';
+    autosize();
+  });
+
+  function autosize() {
+    input.style.height = 'auto';
+    input.style.height = Math.min(input.scrollHeight, 200) + 'px';
+  }
+  input.addEventListener('input', autosize);
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      send();
+    }
+  });
+  sendBtn.addEventListener('click', send);
+  stopBtn.addEventListener('click', () => controller && controller.abort());
+
+  function addRow(role) {
+    empty.remove();
+    const row = document.createElement('div');
+    row.className = 'row ' + role;
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble';
+    row.appendChild(bubble);
+    thread.appendChild(row);
+    thread.parentElement.scrollTop = thread.parentElement.scrollHeight;
+    return bubble;
+  }
+
+  function setBusy(busy) {
+    sendBtn.style.display = busy ? 'none' : 'inline-block';
+    stopBtn.style.display = busy ? 'inline-block' : 'none';
+    input.disabled = busy;
+  }
+
+  async function send() {
+    const text = input.value.trim();
+    if (!text || controller) return;
+
+    history.push({ role: 'user', content: text });
+    addRow('user').textContent = text;
+    input.value = '';
+    autosize();
+
+    const bubble = addRow('assistant');
+    const cursor = document.createElement('span');
+    cursor.className = 'cursor';
+    bubble.appendChild(cursor);
+
+    controller = new AbortController();
+    setBusy(true);
+    let assistantText = '';
+
+    try {
+      const res = await fetch('/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify({
+          messages: history,
+          stream: true,
+          temperature: Number(temperatureInput.value),
+          max_tokens: Number(maxTokensInput.value),
+        }),
+      });
+      if (!res.ok || !res.body) {
+        throw new Error('server responded with ' + res.status);
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+
+        let sep;
+        while ((sep = buf.indexOf('\n\n')) !== -1) {
+          const event = buf.slice(0, sep);
+          buf = buf.slice(sep + 2);
+          const line = event.split('\n').find(l => l.startsWith('data:'));
+          if (!line) continue;
+          const data = line.slice(5).trim();
+          if (data === '[DONE]') continue;
+
+          const payload = JSON.parse(data);
+          if (payload.error) {
+            throw new Error(payload.error.message || 'generation error');
+          }
+          const delta = payload.choices?.[0]?.delta?.content;
+          if (delta) {
+            assistantText += delta;
+            bubble.insertBefore(document.createTextNode(delta), cursor);
+            thread.parentElement.scrollTop = thread.parentElement.scrollHeight;
+          }
+        }
+      }
+      history.push({ role: 'assistant', content: assistantText });
+    } catch (err) {
+      if (err.name !== 'AbortError') {
+        const row = bubble.closest('.row');
+        row.classList.add('error');
+        bubble.textContent = 'Error: ' + err.message;
+        if (assistantText) history.push({ role: 'assistant', content: assistantText });
+      } else if (assistantText) {
+        history.push({ role: 'assistant', content: assistantText });
+      }
+    } finally {
+      cursor.remove();
+      controller = null;
+      setBusy(false);
+      input.focus();
+    }
+  }
+})();
+</script>
+
+</body>
+</html>

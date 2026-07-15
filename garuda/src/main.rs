@@ -9,6 +9,7 @@ use garuda::ollama::create_ollama_router;
 use garuda::scheduler::Scheduler;
 use garuda::server::{Backend, Engine, configure_thread_pool};
 use garuda::tgi::create_tgi_router;
+use garuda::ui::create_ui_router;
 use garuda::websocket::create_ws_router;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -160,6 +161,7 @@ async fn serve(config: AppConfig) -> anyhow::Result<()> {
     });
 
     let mut app = create_router(state.clone())
+        .merge(create_ui_router())
         .merge(create_ws_router(state.clone()))
         .merge(create_ollama_router(state.clone()))
         .merge(create_anthropic_router(state.clone()))
