@@ -34,11 +34,15 @@ Garuda is honest about its edges. It decodes **F32, F16, Q4_0, Q8_0 and every k-
 from `Q2_K` to `Q6_K`** — the formats nearly every GGUF download uses — and with
 `mmap = true` keeps the weights packed so the model uses roughly its on-disk size.
 The backend runs both dense and mixture-of-experts FFNs, executing only the top-k
-experts a token routes to (and, under `mmap`, paging in only those). That MoE path is
-verified on a synthetic model but has not been run on a real large MoE like Mixtral —
-none fit the disk here. There is **no GPU backend** (`gpu = true` is a
-startup error, not a silent fallback), and **no authentication** — do not expose it
-to a network you do not control.
+experts a token routes to (and, under `mmap`, paging in only those); both GGUF expert
+tensor layouts load (the merged `..._exps` tensors newer conversions use, and the
+older per-expert tensors some, including the original TheBloke Mixtral quantisations,
+use instead). That MoE path is verified against a real large MoE now — Mixtral-8x7B,
+Q4_K_M, 26 GB — loading and generating on a 16 GB machine via `mmap`. `Q8_0` and
+`Q4_K` (the dominant tensor type in that file) dot directly against an int8-quantised
+activation rather than expanding to `f32` first. There is **no GPU backend**
+(`gpu = true` is a startup error, not a silent fallback), and **no authentication** —
+do not expose it to a network you do not control.
 
 The plugin architecture is what makes the real model a first-class citizen rather
 than a special case: a checkpoint is just another `InferenceBackend` behind a trait
@@ -47,9 +51,10 @@ the runtime already depended on. See [PLUGIN.md](PLUGIN.md).
 ## Facts
 
 - **Language:** Rust (edition 2024, 1.85+)
-- **Tests:** 121 (109 unit + 12 end-to-end HTTP)
-- **Verified:** loads and runs the TinyStories 260K checkpoint end to end
-- **API:** OpenAI-compatible REST + SSE + WebSocket
+- **Tests:** 141 (129 unit + 12 end-to-end HTTP)
+- **Verified:** loads and runs both the TinyStories 260K checkpoint and a real
+  Mixtral-8x7B (Q4_K_M, 26 GB) end to end, the latter on a 16 GB machine via `mmap`
+- **API:** OpenAI-compatible REST + SSE + WebSocket, plus a built-in chat page at `/`
 - **Licence:** MIT OR Apache-2.0
 
 ---

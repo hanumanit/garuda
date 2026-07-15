@@ -2,6 +2,66 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.0] - 2026-07-15
+
+A real MoE at scale, finally: Mixtral-8x7B (Q4_K_M, 26 GB) now loads and runs on a
+16 GB machine, plus the integer-kernel and prefetch work that made it fast enough to
+be worth doing.
+
+### Added
+
+- **The older per-expert GGUF tensor layout.** The Llama backend only recognised the
+  merged `..._exps` tensor layout newer llama.cpp conversions use. Older ones —
+  including the original TheBloke Mixtral quantisations — store each expert as its
+  own tensor (`blk.0.ffn_gate.3.weight`); `ExpertWeight::Split` handles that layout
+  now, alongside the existing `Stacked` one. Verified: a test builder emits both
+  layouts from the same underlying numbers and asserts the logits match exactly.
+- **An integer (NEON `i8`) kernel for `Q4_K`** (`quant::matvec_q4_k`), the same trick
+  0.6.1 used for `Q8_0`: quantise the activation to int8 once per matvec, then dot
+  each row's nibbles against it directly, without ever expanding to `f32`. 0.6.1
+  guessed this would be a smaller win than `Q8_0` because of the nibble-unpack cost —
+  measured at Mixtral's own row width (14336×4096) it's actually the bigger win,
+  **~10× faster**, p90 relative error 2.9% against the exact `f32` path. `Q4_K` is
+  the dominant tensor type in a real checkpoint (833 of ~1000 tensors in the Mixtral
+  file), so this is the main matvec cost for a real model.
+- **Prefetch against a real checkpoint**, not just the synthetic MoE.
+  `GgufPagePrefetcher` "loads" an expert by touching its mmap pages on a background
+  rayon worker instead of materialising an `Expert`, so the page fault happens ahead
+  of the forward pass needing it. Each of a real model's 32 layers routes
+  independently, so routing history moved from the flat `SeqState.last_experts` /
+  `last_predicted` (fine for the synthetic MoE's single block) to per-layer fields on
+  `KVCacheState`. Verified: attaching the engine doesn't change a single logit across
+  a multi-step decode, and its launched/skipped counters prove it actually predicts
+  and warms rather than sitting inert.
+- **A built-in chat page** (`GET /`) — a single dependency-free HTML/JS page that
+  streams against the existing `/v1/chat/completions` SSE endpoint, same origin, no
+  separate frontend to build or deploy.
+- `mixtral.toml` — an example config for exactly this scenario: a checkpoint far
+  larger than RAM, `mmap = true`, one sequence at a time.
+
+### Changed
+
+- `garuda inspect` used to `std::fs::read` the whole file just to print its metadata
+  — for a checkpoint larger than RAM, that alone could exhaust it. It mmaps now
+  (peak RSS ~8 MB measured against the 26 GB Mixtral file), and its loadability check
+  now verifies a MoE model's expert tensors actually exist under either layout,
+  instead of only checking quant-type support.
+- The crate-level doc comment said garuda "cannot load a trained checkpoint" and that
+  this was "the gap between this and a usable runtime" — stale since the `llama`
+  module was added. Corrected to describe both backends. The `Cargo.toml` package
+  description had the same problem ("no trained weights") and is fixed too.
+
+### Not done
+
+- `Q2_K`/`Q3_K`/`Q5_K`/`Q6_K` still take the slower dequantise-to-`f32` path; the
+  same int8-kernel trick likely applies, just not done yet.
+
+Verified end to end against the real file: `garuda serve -c mixtral.toml` loads
+Mixtral-8x7B Q4_K_M in ~20 ms (mmap, nothing to expand), `prefetch=true` in the log,
+and generates real, coherent text — RSS stays around 6–7 GB, well under the 16 GB
+machine's budget, the whole point of the mmap-streaming path this release finally
+exercises against a model that actually needs it.
+
 ## [0.8.0] - 2026-07-14
 
 Two more API front ends — llama.cpp and TGI — and a shared engine core so the

@@ -3,14 +3,14 @@
 Garuda is a single Rust binary with no system dependencies beyond a Rust
 toolchain. Everything below is verified against a clean checkout.
 
-For a quick orientation to what Garuda is (and its one real limit — only F32/F16
-checkpoints load), read the [README](README.md) first.
+For a quick orientation to what Garuda is (and its real limits — no GPU backend, no
+authentication), read the [README](README.md) first.
 
 ## Requirements
 
 | | |
 |---|---|
-| **Rust** | 1.82 or newer (2021 edition). Check with `rustc --version`. |
+| **Rust** | 1.85 or newer (2024 edition). Check with `rustc --version`. |
 | **Platform** | Linux or macOS (x86-64 or ARM64). Portable Rust; no platform-specific code. |
 | **Disk** | ~1 GB for the build (the `target/` directory). |
 | **Network** | Only to fetch crates on first build, and to download a model if you want one. |
@@ -70,7 +70,8 @@ curl -s localhost:8080/v1/chat/completions \
 
 ### Run a real model
 
-Download a small F32 checkpoint and point the config at it:
+Download a checkpoint and point the config at it — F32, F16, Q4_0, Q8_0, and every
+k-quant from `Q2_K` to `Q6_K` all load:
 
 ```bash
 curl -L https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf \
@@ -96,8 +97,12 @@ curl -s localhost:8080/v1/completions \
   -d '{"prompt":"Once upon a time","max_tokens":60,"temperature":0}'
 ```
 
-> Only F32/F16 checkpoints load. Quantised models (`Q4_K`, `Q8_0`, …) are rejected
-> with a clear error — the dequantiser is not written yet. See the README.
+Or open `http://localhost:8080/` for the built-in chat page instead of `curl`.
+
+For a checkpoint larger than RAM — a full-size Mixtral, say — set `mmap = true`. The
+weights stay packed on disk and are dequantised a row at a time instead of expanding
+to `f32`, so the process uses roughly the file's on-disk size. See
+[`garuda/mixtral.toml`](garuda/mixtral.toml) for a worked example.
 
 ## Configuration
 
@@ -122,7 +127,12 @@ cargo test
 - **`error: package requires rustc 1.82`** — update your toolchain: `rustup update`.
 - **`Address already in use`** — another process holds the port; pick another with
   `garuda serve --port 8090`.
-- **`gguf: tensor '…' has ggml type N; only F32 and F16 are supported`** — the model
-  is quantised. Use an F32/F16 checkpoint, or wait for a dequantiser.
+- **`tensor type … is not supported`** — the model uses a format Garuda doesn't decode
+  yet: the `*_1` linear quants or an IQ imatrix quant. F32, F16, Q4_0, Q8_0, and
+  `Q2_K`–`Q6_K` all load.
+- **`this checkpoint's MoE tensor layout is not recognised`** (from `garuda inspect`)
+  — a mixture-of-experts model whose expert tensors are named differently from either
+  layout Garuda knows: the merged `blk.N.ffn_gate_exps.weight` or the per-expert
+  `blk.N.ffn_gate.0.weight` style.
 - **`configuration error: … unknown field`** — a key in your `config.toml` is
   misspelled or unsupported; the message names it.
