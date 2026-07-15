@@ -17,7 +17,7 @@
 //! quantisations). See `ExpertWeight`.
 
 use crate::cache::{KVCacheState, SeqState};
-use crate::core::{GarudaError, InferenceBackend, ModelDims, Tensor, Token};
+use crate::core::{ExpertId, GarudaError, InferenceBackend, ModelDims, Tensor, Token};
 use crate::gguf::Gguf;
 use crate::{quant, simd};
 use memmap2::Mmap;
@@ -117,6 +117,33 @@ impl ExpertWeight {
         match self {
             ExpertWeight::Stacked(w) => w.matvec_rows(e * block, x, out),
             ExpertWeight::Split(ws) => ws[e].matvec(x, out),
+        }
+    }
+
+    /// Byte range of expert `e`'s packed weight in the backing mmap, for
+    /// prefetching. `block` is one expert's row count, as in [`Self::matvec_expert`].
+    /// `None` if this weight is not packed (mmap is off) or `e` is out of range.
+    fn byte_range(&self, e: usize, block: usize) -> Option<(usize, usize)> {
+        match self {
+            ExpertWeight::Stacked(Weight::Packed {
+                qtype,
+                cols,
+                start,
+                ..
+            }) => {
+                let row_bytes = quant::byte_size(*qtype, *cols).ok()?;
+                Some((start + e * block * row_bytes, block * row_bytes))
+            }
+            ExpertWeight::Split(ws) => match ws.get(e) {
+                Some(Weight::Packed {
+                    qtype, cols, start, ..
+                }) => {
+                    let len = quant::byte_size(*qtype, block * *cols).ok()?;
+                    Some((*start, len))
+                }
+                _ => None,
+            },
+            ExpertWeight::Stacked(Weight::Full { .. }) => None,
         }
     }
 }
@@ -254,6 +281,7 @@ pub struct LlamaBackend {
     output_norm: Vec<f32>,
     output: Weight,
     layers: Vec<Layer>,
+    prefetch: Option<Arc<crate::prefetch::PrefetchEngine>>,
 }
 
 impl LlamaBackend {
@@ -386,12 +414,55 @@ impl LlamaBackend {
             output_norm,
             output,
             layers,
+            prefetch: None,
         })
     }
 
     /// True when weights are kept packed in a memory-mapped file.
     pub fn is_mmapped(&self) -> bool {
         matches!(self.token_embd, Weight::Packed { .. })
+    }
+
+    /// The backing memory map, if this checkpoint was loaded with `mmap`.
+    pub fn mmap(&self) -> Option<Arc<Mmap>> {
+        match &self.token_embd {
+            Weight::Packed { src, .. } => Some(src.clone()),
+            Weight::Full { .. } => None,
+        }
+    }
+
+    /// Byte ranges in the backing mmap for every `(layer, expert)` pair's gate/up/
+    /// down weights, indexed `[layer * n_experts + expert]` — what a
+    /// [`crate::prefetch::PrefetchEngine`] should warm ahead of a token routing
+    /// there. Empty for a dense model or a backend that is not mmapped.
+    pub fn expert_page_ranges(&self) -> Vec<Vec<(usize, usize)>> {
+        let ne = self.cfg.n_experts;
+        if ne == 0 {
+            return Vec::new();
+        }
+        let (d, f) = (self.cfg.d_model, self.cfg.d_ff);
+        let mut out = vec![Vec::new(); self.cfg.n_layers * ne];
+        for (l, layer) in self.layers.iter().enumerate() {
+            let Ffn::Moe {
+                gate, up, down, ..
+            } = &layer.ffn
+            else {
+                continue;
+            };
+            for (e, slot) in out[l * ne..(l + 1) * ne].iter_mut().enumerate() {
+                slot.extend(gate.byte_range(e, f));
+                slot.extend(up.byte_range(e, f));
+                slot.extend(down.byte_range(e, d));
+            }
+        }
+        out
+    }
+
+    /// Attach a prefetch engine, so each MoE layer's routing decision warms the
+    /// likely next-step experts' pages while the rest of this step still computes.
+    pub fn with_prefetch(mut self, prefetch: Arc<crate::prefetch::PrefetchEngine>) -> Self {
+        self.prefetch = Some(prefetch);
+        self
     }
 
     pub fn config(&self) -> LlamaConfig {
@@ -415,7 +486,7 @@ impl LlamaBackend {
         simd::add_assign(x, &attn);
 
         let h = self.norm(x, &layer.ffn_norm);
-        let ffn = self.feed_forward(layer, &h)?;
+        let ffn = self.feed_forward(l, layer, &h, kv)?;
         simd::add_assign(x, &ffn);
         Ok(())
     }
@@ -513,7 +584,13 @@ impl LlamaBackend {
     }
 
     /// The block's feed-forward, dense or mixture-of-experts.
-    fn feed_forward(&self, layer: &Layer, h: &[f32]) -> Result<Vec<f32>, GarudaError> {
+    fn feed_forward(
+        &self,
+        l: usize,
+        layer: &Layer,
+        h: &[f32],
+        kv: &mut KVCacheState,
+    ) -> Result<Vec<f32>, GarudaError> {
         match &layer.ffn {
             Ffn::Dense { gate, up, down } => self.expert(gate, up, down, 0, h),
             Ffn::Moe {
@@ -536,6 +613,21 @@ impl LlamaBackend {
                 ranked.truncate(k);
                 let sum: f32 = ranked.iter().map(|(_, w)| w).sum();
                 let norm = if sum > 0.0 { 1.0 / sum } else { 1.0 / k as f32 };
+
+                // Learn from this step and warm what the next one probably needs at
+                // this layer, on a background thread, while the experts below are
+                // still computing. Advisory: a wrong or missing prediction just means
+                // the forward pass below pays the page fault itself, as it always did.
+                // `ExpertId`s are layer-scoped (`layer * n_experts + expert`), so one
+                // shared predictor never mixes routing history across layers.
+                if let Some(pf) = &self.prefetch {
+                    let base = (l * ne) as ExpertId;
+                    let used: Vec<ExpertId> =
+                        ranked.iter().map(|&(e, _)| base + e as ExpertId).collect();
+                    let predicted = pf.observe_step(&kv.last_experts, &used, &kv.last_predicted);
+                    kv.last_predicted = predicted;
+                    kv.last_experts = used;
+                }
 
                 // Run only the chosen experts and blend by weight. Under mmap, this is
                 // the only place a token touches expert weights — top-k of ne per layer.
@@ -609,6 +701,9 @@ impl InferenceBackend for LlamaBackend {
 mod tests {
     use super::*;
     use crate::cache::{KvConfig, SeqState};
+    use crate::core::ExpertLoader;
+    use crate::predictor::ExpertPredictor;
+    use crate::prefetch::{GgufPagePrefetcher, PrefetchEngine};
     use std::io::Write;
 
     // ---- a minimal GGUF writer, to build a synthetic MoE model with real data ----
@@ -930,5 +1025,92 @@ mod tests {
         let a = merged.logits(&[3, 7, 1], &mut s1).unwrap();
         let b = split.logits(&[3, 7, 1], &mut s2).unwrap();
         assert_eq!(a.data(), b.data());
+    }
+
+    fn mmap_of(bytes: &[u8], name: &str) -> (std::path::PathBuf, Arc<Mmap>) {
+        let dir = std::env::temp_dir().join("garuda_prefetch_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(name);
+        std::fs::File::create(&path).unwrap().write_all(bytes).unwrap();
+        let mmap = Arc::new(unsafe { Mmap::map(&std::fs::File::open(&path).unwrap()).unwrap() });
+        (dir, mmap)
+    }
+
+    /// A mmapped model's expert page ranges must be non-empty, in-bounds, and
+    /// distinct per (layer, expert) — the table [`GgufPagePrefetcher`] warms from.
+    #[test]
+    fn expert_page_ranges_are_in_bounds_and_distinct() {
+        for layout in [ExpertLayout::Merged, ExpertLayout::Split] {
+            let bytes = build_moe_gguf(layout);
+            let (dir, mmap) = mmap_of(&bytes, "ranges.gguf");
+            let g = Gguf::parse(&mmap).unwrap();
+            let backend = LlamaBackend::from_gguf(&g, &mmap, Some(mmap.clone())).unwrap();
+
+            let cfg = backend.config();
+            let ranges = backend.expert_page_ranges();
+            assert_eq!(ranges.len(), cfg.n_layers * cfg.n_experts);
+
+            let mut seen = std::collections::HashSet::new();
+            for id_ranges in &ranges {
+                // 3 weights (gate, up, down) per expert, each present under mmap.
+                assert_eq!(id_ranges.len(), 3);
+                for &(start, len) in id_ranges {
+                    assert!(len > 0);
+                    assert!(start + len <= mmap.len(), "range runs past the file");
+                    assert!(seen.insert((start, len)), "duplicate range {start}..{}", start + len);
+                }
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Attaching a `PrefetchEngine` must not change what the model produces — it is
+    /// advisory only — but across a real multi-step decode it must actually predict
+    /// and warm pages, proving the wiring is live rather than plumbing that merely
+    /// compiles.
+    #[test]
+    fn prefetch_engine_warms_experts_without_changing_logits() {
+        let bytes = build_moe_gguf(ExpertLayout::Merged);
+        let (dir, mmap) = mmap_of(&bytes, "moe.gguf");
+        let g = Gguf::parse(&mmap).unwrap();
+        let tokens: Vec<Token> = vec![3, 7, 1, 9, 2, 5, 4, 8, 6, 0];
+
+        // Baseline: no prefetch.
+        let plain = LlamaBackend::from_gguf(&g, &mmap, Some(mmap.clone())).unwrap();
+        let mut s_plain = seq_for(&plain);
+        let baseline: Vec<_> = (1..=tokens.len())
+            .map(|n| plain.logits(&tokens[..n], &mut s_plain).unwrap())
+            .collect();
+
+        // Same model, with a real prefetch engine attached.
+        let with_pf = LlamaBackend::from_gguf(&g, &mmap, Some(mmap.clone())).unwrap();
+        let cfg = with_pf.config();
+        let ranges = with_pf.expert_page_ranges();
+        let predictor = Arc::new(ExpertPredictor::new(cfg.n_layers * cfg.n_experts));
+        let loader: Arc<dyn ExpertLoader> = Arc::new(GgufPagePrefetcher::new(mmap.clone(), ranges));
+        let pf = Arc::new(PrefetchEngine::new(
+            loader,
+            predictor,
+            true,
+            cfg.n_experts_used.max(1),
+        ));
+        let with_pf = with_pf.with_prefetch(pf.clone());
+
+        let mut s_pf = seq_for(&with_pf);
+        for (n, want) in (1..=tokens.len()).zip(&baseline) {
+            let got = with_pf.logits(&tokens[..n], &mut s_pf).unwrap();
+            assert_eq!(got.data(), want.data(), "prefetch changed output at step {n}");
+        }
+
+        // Background warms are spawned on rayon; give them a moment, then confirm
+        // the engine actually attempted something over these steps.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            pf.launched() + pf.skipped() > 0,
+            "prefetcher predicted nothing across {} decode steps",
+            tokens.len()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

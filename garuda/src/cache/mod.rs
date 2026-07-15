@@ -213,6 +213,11 @@ pub struct KVCacheState {
     layer: usize,
     spills: u64,
     reloads: u64,
+    /// MoE prefetch bookkeeping for this layer: experts that fired here last step,
+    /// and what the predictor guessed this step would need. Each transformer layer
+    /// routes independently, so this lives per-layer rather than on `SeqState`.
+    pub last_experts: Vec<ExpertId>,
+    pub last_predicted: Vec<ExpertId>,
 }
 
 impl Clone for KVCacheState {
@@ -233,6 +238,8 @@ impl Clone for KVCacheState {
             layer: self.layer,
             spills: self.spills,
             reloads: self.reloads,
+            last_experts: self.last_experts.clone(),
+            last_predicted: self.last_predicted.clone(),
         }
     }
 }
@@ -269,6 +276,8 @@ impl KVCacheState {
             layer,
             spills: 0,
             reloads: 0,
+            last_experts: Vec::new(),
+            last_predicted: Vec::new(),
         }
     }
 
@@ -497,7 +506,8 @@ impl KVCacheState {
 // ---------------------------------------------------------------------------
 
 /// Everything one in-flight sequence carries between decode steps: one attention
-/// cache per transformer layer, plus the routing history the prefetcher learns from.
+/// cache per transformer layer. Each layer's [`KVCacheState`] also carries that
+/// layer's own MoE routing history, since a real model's layers route independently.
 ///
 /// A single-block engine (the MoE) has one layer; a real model has one per block.
 /// All layers advance together — each token appends exactly one position to every
@@ -505,10 +515,6 @@ impl KVCacheState {
 #[derive(Debug, Clone)]
 pub struct SeqState {
     kvs: Vec<KVCacheState>,
-    /// Experts that fired on the previous step (MoE prefetch bookkeeping).
-    pub last_experts: Vec<ExpertId>,
-    /// What the predictor guessed the current step would need.
-    pub last_predicted: Vec<ExpertId>,
 }
 
 impl SeqState {
@@ -518,8 +524,6 @@ impl SeqState {
             kvs: (0..n)
                 .map(|l| KVCacheState::for_layer(&cfg, seq_id, l))
                 .collect(),
-            last_experts: Vec::new(),
-            last_predicted: Vec::new(),
         }
     }
 

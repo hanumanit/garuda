@@ -135,6 +135,70 @@ impl PrefetchEngine {
     }
 }
 
+/// An [`ExpertLoader`] for a real, mmapped GGUF checkpoint: "loading" an expert
+/// means touching the mmap pages its packed weights live on, so the page fault
+/// happens now, on a background rayon worker, instead of synchronously the next
+/// time the forward pass actually dots against them.
+///
+/// It never materialises an [`crate::core::Expert`] — `LlamaBackend` reads straight
+/// out of the same mmap via `Weight::Packed`, so there is nothing to hand back.
+/// `load`/`unload` exist only to satisfy the trait; [`PrefetchEngine`] never calls
+/// them (only `prefetch`/`is_resident`), so they error/no-op rather than pretend.
+pub struct GgufPagePrefetcher {
+    mmap: Arc<memmap2::Mmap>,
+    /// `ranges[id]` = the byte ranges (start, len) to warm for expert `id`, where
+    /// `id` is `layer * n_experts + expert`. Empty for a dense layer or an
+    /// out-of-range id.
+    ranges: Vec<Vec<(usize, usize)>>,
+}
+
+impl GgufPagePrefetcher {
+    pub fn new(mmap: Arc<memmap2::Mmap>, ranges: Vec<Vec<(usize, usize)>>) -> Self {
+        Self { mmap, ranges }
+    }
+}
+
+impl ExpertLoader for GgufPagePrefetcher {
+    fn load(&self, id: ExpertId) -> Result<Arc<crate::core::Expert>, crate::core::GarudaError> {
+        Err(crate::core::GarudaError::Model(format!(
+            "GgufPagePrefetcher only warms mmap pages for expert {id}; it never \
+             materialises an Expert, and nothing should call load() on it"
+        )))
+    }
+
+    fn unload(&self, _id: ExpertId) {}
+
+    fn prefetch(&self, id: ExpertId) -> Result<(), crate::core::GarudaError> {
+        // One touch per (likely) page is enough to fault it in; page size varies by
+        // platform, so stride conservatively rather than query it.
+        const STRIDE: usize = 4096;
+        let Some(ranges) = self.ranges.get(id as usize) else {
+            return Ok(());
+        };
+        let mut sink = 0u8;
+        for &(start, len) in ranges {
+            let end = (start + len).min(self.mmap.len());
+            let mut i = start;
+            while i < end {
+                sink ^= self.mmap.get(i).copied().unwrap_or(0);
+                i += STRIDE;
+            }
+        }
+        // Nothing reads `sink`; without this the touching loop above is dead code an
+        // optimiser is free to remove entirely.
+        std::hint::black_box(sink);
+        Ok(())
+    }
+
+    fn is_resident(&self, _id: ExpertId) -> bool {
+        // Unknown from user space, and a wrong "yes" would skip a genuinely cold
+        // expert. Touching an already-hot page costs a cheap page-table lookup, so
+        // always attempting is the safe default; `PrefetchEngine`'s own in-flight
+        // set still dedupes concurrent requests for the same id.
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

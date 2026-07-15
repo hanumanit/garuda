@@ -128,11 +128,12 @@ impl MoeEngine {
         // Learn from this step and warm what the next one probably needs. This is
         // advisory: if it predicts nothing, or predicts wrong, the next step still
         // loads whatever it routes to.
+        let kv = seq.kv();
         if let Some(pf) = &self.prefetch {
-            let predicted = pf.observe_step(&seq.last_experts, &used, &seq.last_predicted);
-            seq.last_predicted = predicted;
+            let predicted = pf.observe_step(&kv.last_experts, &used, &kv.last_predicted);
+            kv.last_predicted = predicted;
         }
-        seq.last_experts = used;
+        kv.last_experts = used;
 
         Ok(x)
     }

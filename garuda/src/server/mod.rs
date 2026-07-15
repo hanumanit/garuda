@@ -12,7 +12,7 @@ use crate::llama::LlamaBackend;
 use crate::memory::MemoryManager;
 use crate::moe::MoeEngine;
 use crate::predictor::ExpertPredictor;
-use crate::prefetch::PrefetchEngine;
+use crate::prefetch::{GgufPagePrefetcher, PrefetchEngine};
 use crate::router::Router;
 use crate::runtime::InferenceRuntime;
 use crate::storage::LocalStorageBackend;
@@ -91,6 +91,31 @@ impl Engine {
         let lc = backend.config();
         let dims = backend.dims();
 
+        // Prefetching only helps a mmapped MoE checkpoint: it hides an expert's page
+        // faults by touching its pages on a background thread while the current step
+        // still computes. A dense model, or one expanded to f32 in RAM, has nothing
+        // to warm — mmap is what makes touching a page ever cost a disk read.
+        let prefetch = if config.runtime.prefetch && config.runtime.predictor && lc.n_experts > 0
+        {
+            mmap.clone().map(|m| {
+                let ranges = backend.expert_page_ranges();
+                let predictor = Arc::new(ExpertPredictor::new(lc.n_layers * lc.n_experts));
+                let loader: Arc<dyn ExpertLoader> = Arc::new(GgufPagePrefetcher::new(m, ranges));
+                Arc::new(PrefetchEngine::new(
+                    loader,
+                    predictor,
+                    true,
+                    lc.n_experts_used.max(1),
+                ))
+            })
+        } else {
+            None
+        };
+        let backend = match &prefetch {
+            Some(pf) => backend.with_prefetch(pf.clone()),
+            None => backend,
+        };
+
         // Never promise a longer context than the model was trained for.
         let max_positions = config.model.context.min(lc.context).max(1);
 
@@ -119,7 +144,7 @@ impl Engine {
             },
             memory: None,
             runtime,
-            prefetch: None,
+            prefetch,
         })
     }
 

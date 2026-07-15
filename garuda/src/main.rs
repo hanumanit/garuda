@@ -144,6 +144,7 @@ async fn serve(config: AppConfig) -> anyhow::Result<()> {
                 vocab = engine.dims.vocab_size,
                 context = engine.runtime.max_context(),
                 mmap = config.model.mmap,
+                prefetch = engine.prefetch.is_some(),
                 "loaded GGUF model"
             );
             warn!("this server has no authentication; do not expose it to an untrusted network");
