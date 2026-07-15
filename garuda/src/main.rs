@@ -2,6 +2,7 @@ use anyhow::Context;
 use clap::Parser;
 use garuda::anthropic::create_anthropic_router;
 use garuda::api::{ApiState, create_router};
+use garuda::auth::{self, ApiKeys};
 use garuda::cli::{Cli, Commands};
 use garuda::config::AppConfig;
 use garuda::llamacpp::create_llamacpp_router;
@@ -121,6 +122,7 @@ fn inspect(path: &std::path::Path) -> anyhow::Result<()> {
 
 async fn serve(config: AppConfig) -> anyhow::Result<()> {
     let engine = Engine::build(&config)?;
+    let auth = ApiKeys::new(config.server.api_keys.clone());
     match &engine.backend {
         Backend::SyntheticMoe => {
             info!(
@@ -129,12 +131,10 @@ async fn serve(config: AppConfig) -> anyhow::Result<()> {
                 context = config.model.context,
                 router = %config.model.router,
                 prefetch = engine.prefetch.is_some(),
+                auth = auth.is_enabled(),
                 "synthetic MoE engine ready"
             );
-            warn!(
-                "this runtime has no trained weights: generated text is meaningless. \
-                 it also has no authentication."
-            );
+            warn!("this runtime has no trained weights: generated text is meaningless.");
         }
         Backend::Gguf { path, layers } => {
             info!(
@@ -145,10 +145,15 @@ async fn serve(config: AppConfig) -> anyhow::Result<()> {
                 context = engine.runtime.max_context(),
                 mmap = config.model.mmap,
                 prefetch = engine.prefetch.is_some(),
+                auth = auth.is_enabled(),
                 "loaded GGUF model"
             );
-            warn!("this server has no authentication; do not expose it to an untrusted network");
         }
+    }
+    if auth.is_enabled() {
+        info!(keys = config.server.api_keys.len(), "API key authentication enabled");
+    } else {
+        warn!("this server has no authentication; do not expose it to an untrusted network");
     }
 
     let scheduler = Scheduler::new(engine.runtime.clone(), config.scheduler());
@@ -167,10 +172,18 @@ async fn serve(config: AppConfig) -> anyhow::Result<()> {
         .merge(create_ollama_router(state.clone()))
         .merge(create_anthropic_router(state.clone()))
         .merge(create_llamacpp_router(state.clone()))
-        .merge(create_tgi_router(state));
+        .merge(create_tgi_router(state))
+        .layer(axum::middleware::from_fn_with_state(
+            auth.clone(),
+            auth::require_key,
+        ));
 
     if config.server.cors {
-        warn!("permissive CORS is enabled and this server has no auth");
+        if auth.is_enabled() {
+            warn!("permissive CORS is enabled; requests still need a valid API key");
+        } else {
+            warn!("permissive CORS is enabled and this server has no auth");
+        }
         app = app.layer(tower_http::cors::CorsLayer::permissive());
     }
     app = app.layer(tower_http::trace::TraceLayer::new_for_http());

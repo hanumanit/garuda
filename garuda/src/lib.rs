@@ -20,11 +20,13 @@
 //!
 //! - There is no GPU backend. [`core::InferenceBackend`] is where one would go;
 //!   `gpu = true` in the config is a startup error, not a silent fallback.
-//! - There is no authentication. Do not expose it to a network you do not control.
+//! - There is no authentication unless `server.api_keys` is set (see [`auth`]). Do
+//!   not expose an unauthenticated instance to a network you do not control.
 
 pub mod anthropic;
 pub mod api;
 pub mod attention;
+pub mod auth;
 pub mod benchmark;
 pub mod cache;
 pub mod cli;

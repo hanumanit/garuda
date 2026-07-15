@@ -64,15 +64,15 @@ fn now() -> u64 {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Serialize)]
-struct ErrorBody {
-    message: String,
-    r#type: String,
-    code: String,
+pub(crate) struct ErrorBody {
+    pub(crate) message: String,
+    pub(crate) r#type: String,
+    pub(crate) code: String,
 }
 
 #[derive(Debug, Serialize)]
-struct ErrorEnvelope {
-    error: ErrorBody,
+pub(crate) struct ErrorEnvelope {
+    pub(crate) error: ErrorBody,
 }
 
 /// Map a domain error onto the status code a client should act on.

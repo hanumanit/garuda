@@ -111,9 +111,16 @@ pub struct ServerConfig {
     /// Concurrent requests one user may have in flight.
     pub max_concurrent_per_user: usize,
     pub request_timeout_secs: u64,
-    /// Permissive CORS. Off by default: this server has no authentication, so
-    /// letting any origin call it is a decision the operator has to make.
+    /// Permissive CORS. Off by default: unless `api_keys` is set, this server has
+    /// no authentication, so letting any origin call it is a decision the operator
+    /// has to make.
     pub cors: bool,
+    /// API keys accepted on every request except `GET /health` and `GET /`. Checked
+    /// against `Authorization: Bearer <key>` (OpenAI/llama.cpp clients) or
+    /// `x-api-key: <key>` (Anthropic clients), whichever the caller sends. Empty
+    /// (the default) means no authentication at all — do not expose the port to a
+    /// network you do not control unless this is set.
+    pub api_keys: Vec<String>,
 }
 
 impl Default for ServerConfig {
@@ -126,6 +133,7 @@ impl Default for ServerConfig {
             max_concurrent_per_user: 8,
             request_timeout_secs: 120,
             cors: false,
+            api_keys: Vec::new(),
         }
     }
 }
@@ -260,6 +268,13 @@ impl AppConfig {
         if self.server.request_timeout_secs == 0 {
             return Err(GarudaError::Config(
                 "server.request_timeout_secs must be at least 1".into(),
+            ));
+        }
+        if self.server.api_keys.iter().any(|k| k.is_empty()) {
+            return Err(GarudaError::Config(
+                "server.api_keys must not contain an empty string — a request with an \
+                 empty (but present) key would then authenticate"
+                    .into(),
             ));
         }
         Ok(())

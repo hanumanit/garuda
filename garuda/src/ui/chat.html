@@ -86,14 +86,16 @@
   #settings.open { display: flex; }
   #settings label { display: flex; align-items: center; gap: 6px; }
   #settings input[type="range"] { width: 120px; }
-  #settings input[type="number"] {
-    width: 70px;
+  #settings input[type="number"],
+  #settings input[type="password"] {
     background: var(--panel);
     border: 1px solid var(--border);
     color: var(--text);
     border-radius: 6px;
     padding: 3px 6px;
   }
+  #settings input[type="number"] { width: 70px; }
+  #settings input[type="password"] { width: 160px; }
 
   main {
     flex: 1;
@@ -210,6 +212,9 @@
   <label>Max tokens
     <input type="number" id="max-tokens" min="1" max="8192" value="512">
   </label>
+  <label>API key
+    <input type="password" id="api-key" placeholder="only if the server requires one" autocomplete="off">
+  </label>
 </div>
 
 <main><div id="thread"><div id="empty">Ask garuda anything. Runs entirely on this machine.</div></div></main>
@@ -235,15 +240,39 @@
   const temperatureInput = document.getElementById('temperature');
   const temperatureVal = document.getElementById('temperature-val');
   const maxTokensInput = document.getElementById('max-tokens');
+  const apiKeyInput = document.getElementById('api-key');
   const modelBadge = document.getElementById('model-badge');
 
   /** @type {{role: string, content: string}[]} */
   let history = [];
   let controller = null;
 
-  fetch('/v1/models').then(r => r.json()).then(j => {
-    modelBadge.textContent = j.data?.[0]?.id ?? 'unknown model';
-  }).catch(() => { modelBadge.textContent = 'unreachable'; });
+  const API_KEY_STORAGE = 'garuda_api_key';
+  apiKeyInput.value = localStorage.getItem(API_KEY_STORAGE) ?? '';
+  apiKeyInput.addEventListener('change', () => {
+    if (apiKeyInput.value) localStorage.setItem(API_KEY_STORAGE, apiKeyInput.value);
+    else localStorage.removeItem(API_KEY_STORAGE);
+    refreshModelBadge();
+  });
+
+  function authHeaders() {
+    const key = apiKeyInput.value;
+    return key ? { Authorization: 'Bearer ' + key } : {};
+  }
+
+  function refreshModelBadge() {
+    fetch('/v1/models', { headers: authHeaders() }).then((r) => {
+      if (r.status === 401) {
+        modelBadge.textContent = 'needs API key';
+        settingsPanel.classList.add('open');
+        return null;
+      }
+      return r.json();
+    }).then((j) => {
+      if (j) modelBadge.textContent = j.data?.[0]?.id ?? 'unknown model';
+    }).catch(() => { modelBadge.textContent = 'unreachable'; });
+  }
+  refreshModelBadge();
 
   settingsToggle.addEventListener('click', () => settingsPanel.classList.toggle('open'));
   temperatureInput.addEventListener('input', () => {
@@ -312,7 +341,7 @@
     try {
       const res = await fetch('/v1/chat/completions', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         signal: controller.signal,
         body: JSON.stringify({
           messages: history,
@@ -321,6 +350,10 @@
           max_tokens: Number(maxTokensInput.value),
         }),
       });
+      if (res.status === 401) {
+        settingsPanel.classList.add('open');
+        throw new Error('this server needs an API key — set it under Settings');
+      }
       if (!res.ok || !res.body) {
         throw new Error('server responded with ' + res.status);
       }

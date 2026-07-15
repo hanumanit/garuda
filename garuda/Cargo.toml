@@ -1,6 +1,6 @@
 [package]
 name = "garuda"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Rust MoE inference runtime with tiered expert storage"
@@ -22,6 +22,7 @@ rayon = "1.10"
 parking_lot = "0.12"
 blake3 = "1.5"
 memmap2 = "0.9"
+constant_time_eq = "0.4"
 
 clap = { version = "4.5", features = ["derive"] }
 tracing = "0.1"

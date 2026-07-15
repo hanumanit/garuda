@@ -58,8 +58,16 @@ queue_capacity = 256
 # Concurrent requests one caller may have in flight (identified by X-Garuda-User).
 max_concurrent_per_user = 8
 request_timeout_secs = 120
-# Permissive CORS. Off by default: this server has no authentication.
+# Permissive CORS. Off by default: unless api_keys is set below, this server has
+# no authentication.
 cors = false
+# Keys accepted on every request except GET /health and GET /. Checked against
+# `Authorization: Bearer <key>` (OpenAI/llama.cpp/Ollama clients) or
+# `x-api-key: <key>` (Anthropic clients), whichever a caller sends. Empty (the
+# default) means no authentication at all — do not expose this port to a network
+# you do not control unless this is set, e.g.:
+#   api_keys = ["sk-change-me"]
+api_keys = []
 
 [sampling]
 temperature = 0.8
