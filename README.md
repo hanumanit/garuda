@@ -79,23 +79,23 @@ graph TD
 
     RT --> Embed[Embedding]
 
-    subgraph Block["Transformer block — repeated ×N layers"]
+    subgraph Block["Transformer block — ×1 for the synthetic MoE,<br/>×N layers for a real checkpoint"]
         direction TB
         In[block input] --> AN[RMSNorm]
-        AN --> Attn[Causal GQA + RoPE]
+        AN --> Attn["Causal attention + RoPE<br/>MHA (synthetic) / GQA (real)"]
         Attn --> AR(("＋"))
         In -.->|residual| AR
         AR --> FN[RMSNorm]
-        FN --> Router[Router: mixtral / deepseek / qwen]
+        FN --> Router["Router: mixtral / deepseek / qwen<br/>synthetic engine only"]:::synthOnly
         Router --> Experts[Top-k SwiGLU experts]
         Experts --> FR(("＋"))
         AR -.->|residual| FR
     end
 
     Embed --> In
-    FR -->|next layer| In
+    FR -->|next layer — real checkpoint only| In
     FR -->|after N layers| ONorm[RMSNorm]
-    ONorm --> Logits[Output head: tied or separate]
+    ONorm --> Logits["Output head<br/>tied (synthetic) / tied or separate (real)"]
 
     Attn <-->|read / append| KV[Paged KV cache]
     KV -.->|spill / reload| Disk[(Disk)]
@@ -108,7 +108,15 @@ graph TD
     Experts -->|experts used| Pred[Markov predictor]
     Pred -->|likely next experts| Pre[Prefetcher]
     Pre -.->|warm in background| L1
+
+    classDef synthOnly fill:#eef2ff,stroke:#6366f1,stroke-width:2px;
 ```
+
+The shaded node runs only on the synthetic engine — a real checkpoint never touches
+`router::Router` and ignores the config's `router`/`experts`/`top_k` keys entirely,
+using a fixed Mixtral-style gate instead (see [Read this first](#read-this-first)).
+Likewise, GQA and the ×N layer loop are real-checkpoint-only: the synthetic engine
+is a single block with plain multi-head attention.
 
 **Expert streaming** means what it says: a token pulls in only the `top_k` experts
 it routes to, through the tiered cache — not the whole layer. The predictor learns
