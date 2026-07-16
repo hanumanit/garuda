@@ -9,6 +9,7 @@
     color-scheme: dark light;
     --bg: #16181d;
     --panel: #1d1f26;
+    --sidebar: #191b21;
     --border: #2c2f38;
     --text: #e7e9ee;
     --muted: #8b8f9c;
@@ -21,6 +22,7 @@
     :root {
       --bg: #f5f6f8;
       --panel: #ffffff;
+      --sidebar: #ececef;
       --border: #e1e3e8;
       --text: #1c1e22;
       --muted: #6b6f7a;
@@ -34,12 +36,95 @@
   html, body { height: 100%; }
   body {
     margin: 0;
-    background: var(--bg);
     color: var(--text);
     font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+
+  #app {
+    display: flex;
+    height: 100%;
+  }
+
+  #sidebar {
+    width: 260px;
+    flex-shrink: 0;
+    background: var(--sidebar);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    padding: 10px;
+    overflow-y: auto;
+    transition: margin-left 0.15s ease;
+  }
+  #app.sidebar-collapsed #sidebar { margin-left: -260px; }
+
+  #new-chat-btn {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 8px;
+    padding: 9px 12px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    margin-bottom: 10px;
+    flex-shrink: 0;
+  }
+  #new-chat-btn:hover { border-color: var(--accent); }
+
+  #conversations {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    overflow-y: auto;
+  }
+  .conv-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    cursor: pointer;
+    color: var(--muted);
+    font-size: 13px;
+  }
+  .conv-item:hover { background: var(--panel); color: var(--text); }
+  .conv-item.active { background: var(--panel); color: var(--text); }
+  .conv-title {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .conv-delete {
+    background: transparent;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 15px;
+    line-height: 1;
+    padding: 2px 4px;
+    border-radius: 4px;
+    visibility: hidden;
+  }
+  .conv-item:hover .conv-delete { visibility: visible; }
+  .conv-delete:hover { color: var(--danger); }
+  #conv-empty {
+    color: var(--muted);
+    font-size: 12px;
+    padding: 8px 10px;
+  }
+
+  #page {
+    flex: 1;
+    min-width: 0;
     display: flex;
     flex-direction: column;
   }
+
   header {
     display: flex;
     align-items: center;
@@ -72,6 +157,7 @@
     cursor: pointer;
   }
   header button:hover { color: var(--text); border-color: var(--accent); }
+  #sidebar-toggle { font-size: 14px; padding: 6px 9px; }
 
   #settings {
     display: none;
@@ -196,45 +282,57 @@
 </head>
 <body>
 
-<header>
-  <h1>Garuda</h1>
-  <span id="model-badge">…</span>
-  <div class="spacer"></div>
-  <button id="settings-toggle" type="button">Settings</button>
-  <button id="clear" type="button">New chat</button>
-</header>
+<div id="app">
+  <aside id="sidebar">
+    <button id="new-chat-btn" type="button">+ New chat</button>
+    <div id="conversations"></div>
+  </aside>
 
-<div id="settings">
-  <label>Temperature
-    <input type="range" id="temperature" min="0" max="2" step="0.05" value="0.8">
-    <span id="temperature-val">0.80</span>
-  </label>
-  <label>Max tokens
-    <input type="number" id="max-tokens" min="1" max="8192" value="512">
-  </label>
-  <label>API key
-    <input type="password" id="api-key" placeholder="only if the server requires one" autocomplete="off">
-  </label>
-</div>
+  <div id="page">
+    <header>
+      <button id="sidebar-toggle" type="button" title="Toggle sidebar">☰</button>
+      <h1>Garuda</h1>
+      <span id="model-badge">…</span>
+      <div class="spacer"></div>
+      <button id="settings-toggle" type="button">Settings</button>
+    </header>
 
-<main><div id="thread"><div id="empty">Ask garuda anything. Runs entirely on this machine.</div></div></main>
+    <div id="settings">
+      <label>Temperature
+        <input type="range" id="temperature" min="0" max="2" step="0.05" value="0.8">
+        <span id="temperature-val">0.80</span>
+      </label>
+      <label>Max tokens
+        <input type="number" id="max-tokens" min="1" max="8192" value="512">
+      </label>
+      <label>API key
+        <input type="password" id="api-key" placeholder="only if the server requires one" autocomplete="off">
+      </label>
+    </div>
 
-<footer>
-  <div id="composer">
-    <textarea id="input" rows="1" placeholder="Message garuda…"></textarea>
-    <button id="send" type="button">Send</button>
-    <button id="stop" type="button">Stop</button>
+    <main><div id="thread"><div id="empty">Ask garuda anything. Runs entirely on this machine.</div></div></main>
+
+    <footer>
+      <div id="composer">
+        <textarea id="input" rows="1" placeholder="Message garuda…"></textarea>
+        <button id="send" type="button">Send</button>
+        <button id="stop" type="button">Stop</button>
+      </div>
+    </footer>
   </div>
-</footer>
+</div>
 
 <script>
 (() => {
+  const app = document.getElementById('app');
+  const sidebarToggle = document.getElementById('sidebar-toggle');
+  const newChatBtn = document.getElementById('new-chat-btn');
+  const conversationList = document.getElementById('conversations');
   const thread = document.getElementById('thread');
   const empty = document.getElementById('empty');
   const input = document.getElementById('input');
   const sendBtn = document.getElementById('send');
   const stopBtn = document.getElementById('stop');
-  const clearBtn = document.getElementById('clear');
   const settingsToggle = document.getElementById('settings-toggle');
   const settingsPanel = document.getElementById('settings');
   const temperatureInput = document.getElementById('temperature');
@@ -243,8 +341,35 @@
   const apiKeyInput = document.getElementById('api-key');
   const modelBadge = document.getElementById('model-badge');
 
+  // ---- conversations: each { id, title, messages: [{role, content}], updatedAt } ----
+  const CONV_STORAGE = 'garuda_conversations';
+  const ACTIVE_STORAGE = 'garuda_active_conversation';
+
+  function loadConversations() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(CONV_STORAGE) ?? '[]');
+      return Array.isArray(raw) ? raw : [];
+    } catch {
+      return [];
+    }
+  }
+  function saveConversations() {
+    localStorage.setItem(CONV_STORAGE, JSON.stringify(conversations));
+  }
+  function titleFor(text) {
+    const t = text.trim().replace(/\s+/g, ' ');
+    return t.length > 40 ? t.slice(0, 40) + '…' : t;
+  }
+
+  let conversations = loadConversations();
+  let activeId = localStorage.getItem(ACTIVE_STORAGE);
+  if (activeId && !conversations.some((c) => c.id === activeId)) activeId = null;
+
   /** @type {{role: string, content: string}[]} */
   let history = [];
+  const active = conversations.find((c) => c.id === activeId);
+  if (active) history = [...active.messages];
+
   let controller = null;
 
   const API_KEY_STORAGE = 'garuda_api_key';
@@ -275,17 +400,9 @@
   refreshModelBadge();
 
   settingsToggle.addEventListener('click', () => settingsPanel.classList.toggle('open'));
+  sidebarToggle.addEventListener('click', () => app.classList.toggle('sidebar-collapsed'));
   temperatureInput.addEventListener('input', () => {
     temperatureVal.textContent = Number(temperatureInput.value).toFixed(2);
-  });
-
-  clearBtn.addEventListener('click', () => {
-    if (controller) controller.abort();
-    history = [];
-    thread.innerHTML = '';
-    thread.appendChild(empty);
-    input.value = '';
-    autosize();
   });
 
   function autosize() {
@@ -301,6 +418,101 @@
   });
   sendBtn.addEventListener('click', send);
   stopBtn.addEventListener('click', () => controller && controller.abort());
+  newChatBtn.addEventListener('click', newChat);
+
+  function renderThread() {
+    thread.innerHTML = '';
+    if (history.length === 0) {
+      thread.appendChild(empty);
+      return;
+    }
+    for (const m of history) {
+      addRow(m.role).textContent = m.content;
+    }
+  }
+
+  function renderSidebar() {
+    conversationList.innerHTML = '';
+    if (conversations.length === 0) {
+      const p = document.createElement('div');
+      p.id = 'conv-empty';
+      p.textContent = 'No conversations yet.';
+      conversationList.appendChild(p);
+      return;
+    }
+    const sorted = [...conversations].sort((a, b) => b.updatedAt - a.updatedAt);
+    for (const c of sorted) {
+      const item = document.createElement('div');
+      item.className = 'conv-item' + (c.id === activeId ? ' active' : '');
+      item.addEventListener('click', () => selectConversation(c.id));
+
+      const title = document.createElement('span');
+      title.className = 'conv-title';
+      title.textContent = c.title;
+      item.appendChild(title);
+
+      const del = document.createElement('button');
+      del.className = 'conv-delete';
+      del.type = 'button';
+      del.textContent = '×';
+      del.title = 'Delete';
+      del.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        deleteConversation(c.id);
+      });
+      item.appendChild(del);
+
+      conversationList.appendChild(item);
+    }
+  }
+
+  function setActive(id) {
+    activeId = id;
+    if (id) localStorage.setItem(ACTIVE_STORAGE, id);
+    else localStorage.removeItem(ACTIVE_STORAGE);
+  }
+
+  function newChat() {
+    if (controller) controller.abort();
+    setActive(null);
+    history = [];
+    renderThread();
+    renderSidebar();
+    input.value = '';
+    autosize();
+    input.focus();
+  }
+
+  function selectConversation(id) {
+    if (id === activeId) return;
+    if (controller) controller.abort();
+    const c = conversations.find((c) => c.id === id);
+    if (!c) return;
+    setActive(id);
+    history = [...c.messages];
+    renderThread();
+    renderSidebar();
+  }
+
+  function deleteConversation(id) {
+    conversations = conversations.filter((c) => c.id !== id);
+    saveConversations();
+    if (id === activeId) newChat();
+    else renderSidebar();
+  }
+
+  // Persists `messages` onto conversation `convId` regardless of which
+  // conversation is currently active — `send()` captures its own `convId` up
+  // front precisely so a mid-stream switch can't leak a reply into the wrong
+  // conversation (see `send()`'s comment).
+  function persistMessages(convId, messages) {
+    const c = conversations.find((c) => c.id === convId);
+    if (!c) return;
+    c.messages = messages;
+    c.updatedAt = Date.now();
+    saveConversations();
+    if (convId === activeId) renderSidebar();
+  }
 
   function addRow(role) {
     empty.remove();
@@ -324,10 +536,24 @@
     const text = input.value.trim();
     if (!text || controller) return;
 
-    history.push({ role: 'user', content: text });
+    if (!activeId) {
+      const id = crypto.randomUUID();
+      conversations.unshift({ id, title: titleFor(text), messages: [], updatedAt: Date.now() });
+      setActive(id);
+    }
+
+    // Captured once, up front: `activeId`/`history` are shared mutable state
+    // that `selectConversation`/`newChat` reassign the moment the user switches
+    // away mid-stream. Everything below keys off `convId`/`localHistory`
+    // instead, so a switch can never leak this reply into whatever conversation
+    // the user switched *to*.
+    const convId = activeId;
+    let localHistory = [...history, { role: 'user', content: text }];
+    history = localHistory;
     addRow('user').textContent = text;
     input.value = '';
     autosize();
+    persistMessages(convId, localHistory);
 
     const bubble = addRow('assistant');
     const cursor = document.createElement('span');
@@ -344,7 +570,7 @@
         headers: { 'Content-Type': 'application/json', ...authHeaders() },
         signal: controller.signal,
         body: JSON.stringify({
-          messages: history,
+          messages: localHistory,
           stream: true,
           temperature: Number(temperatureInput.value),
           max_tokens: Number(maxTokensInput.value),
@@ -388,15 +614,19 @@
           }
         }
       }
-      history.push({ role: 'assistant', content: assistantText });
+      localHistory = [...localHistory, { role: 'assistant', content: assistantText }];
+      if (convId === activeId) history = localHistory;
+      persistMessages(convId, localHistory);
     } catch (err) {
       if (err.name !== 'AbortError') {
         const row = bubble.closest('.row');
         row.classList.add('error');
         bubble.textContent = 'Error: ' + err.message;
-        if (assistantText) history.push({ role: 'assistant', content: assistantText });
-      } else if (assistantText) {
-        history.push({ role: 'assistant', content: assistantText });
+      }
+      if (assistantText) {
+        localHistory = [...localHistory, { role: 'assistant', content: assistantText }];
+        if (convId === activeId) history = localHistory;
+        persistMessages(convId, localHistory);
       }
     } finally {
       cursor.remove();
@@ -405,6 +635,9 @@
       input.focus();
     }
   }
+
+  renderThread();
+  renderSidebar();
 })();
 </script>
 

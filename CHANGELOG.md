@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.0] - 2026-07-16
+
+Multiple conversations in the built-in chat page — a sidebar to hold more than one
+at a time, matching what every other chat UI already does.
+
+### Added
+
+- A conversation sidebar: "+ New chat", a switchable list of past conversations
+  (title auto-derived from the first message), per-conversation delete, and a
+  collapse toggle. Conversations persist in the browser's `localStorage` — a page
+  reload restores the full list and whichever one was open.
+
+### Fixed
+
+- A conversation switch (or "New chat") while a reply was still streaming used to
+  be able to save that reply onto whichever conversation the user switched *to*,
+  since the in-flight request read and wrote the same shared, mutable
+  `history`/`activeId` state that the switch itself reassigned out from under it.
+  `send()` now captures its own conversation id and a local copy of the message
+  list up front and closes over them for its whole lifetime, so a switch mid-stream
+  can no longer cross-contaminate two conversations. Caught by a Playwright test
+  that starts a reply, switches away before it finishes, and asserts neither
+  conversation's saved messages mention the other's content.
+
+Verified with Playwright against a live server: create/switch/delete conversations,
+title derivation, empty "New chat" not littering the list with blanks, persistence
+across a full page reload, the sidebar collapse toggle, and the mid-stream-switch
+fix above — all against the real rendered page, not simulated.
+
 ## [0.10.0] - 2026-07-15
 
 API key authentication — off by default, one config key away from on.
