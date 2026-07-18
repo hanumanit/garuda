@@ -126,10 +126,7 @@ impl ExpertWeight {
     fn byte_range(&self, e: usize, block: usize) -> Option<(usize, usize)> {
         match self {
             ExpertWeight::Stacked(Weight::Packed {
-                qtype,
-                cols,
-                start,
-                ..
+                qtype, cols, start, ..
             }) => {
                 let row_bytes = quant::byte_size(*qtype, *cols).ok()?;
                 Some((start + e * block * row_bytes, block * row_bytes))
@@ -364,13 +361,14 @@ impl LlamaBackend {
             // Per-expert tensor name for the split (un-merged) layout, e.g.
             // `blk.0.ffn_gate.3.weight`.
             let pe = |name: &str, e: usize| format!("blk.{l}.{name}.{e}.weight");
-            let split = |name: &str, rows: usize, cols: usize| -> Result<ExpertWeight, GarudaError> {
-                let mut ws = Vec::with_capacity(ne);
-                for e in 0..ne {
-                    ws.push(weight(&pe(name, e), rows, cols)?);
-                }
-                Ok(ExpertWeight::Split(ws))
-            };
+            let split =
+                |name: &str, rows: usize, cols: usize| -> Result<ExpertWeight, GarudaError> {
+                    let mut ws = Vec::with_capacity(ne);
+                    for e in 0..ne {
+                        ws.push(weight(&pe(name, e), rows, cols)?);
+                    }
+                    Ok(ExpertWeight::Split(ws))
+                };
 
             // A layer is MoE if the model declares experts and the block has either
             // the merged stacked tensors or the older per-expert tensors; otherwise
@@ -443,10 +441,7 @@ impl LlamaBackend {
         let (d, f) = (self.cfg.d_model, self.cfg.d_ff);
         let mut out = vec![Vec::new(); self.cfg.n_layers * ne];
         for (l, layer) in self.layers.iter().enumerate() {
-            let Ffn::Moe {
-                gate, up, down, ..
-            } = &layer.ffn
-            else {
+            let Ffn::Moe { gate, up, down, .. } = &layer.ffn else {
                 continue;
             };
             for (e, slot) in out[l * ne..(l + 1) * ne].iter_mut().enumerate() {
@@ -811,7 +806,9 @@ mod tests {
                 s += 1;
             }
 
-            for (base, out_rows, cols) in [("ffn_gate", ff, d), ("ffn_up", ff, d), ("ffn_down", d, ff)] {
+            for (base, out_rows, cols) in
+                [("ffn_gate", ff, d), ("ffn_up", ff, d), ("ffn_down", d, ff)]
+            {
                 let flat = r#gen(s, ne * out_rows * cols);
                 s += 1;
                 match layout {
@@ -1036,7 +1033,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("garuda_prefetch_test_{n}"));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join(name);
-        std::fs::File::create(&path).unwrap().write_all(bytes).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
         let mmap = Arc::new(unsafe { Mmap::map(&std::fs::File::open(&path).unwrap()).unwrap() });
         (dir, mmap)
     }
@@ -1062,7 +1062,11 @@ mod tests {
                 for &(start, len) in id_ranges {
                     assert!(len > 0);
                     assert!(start + len <= mmap.len(), "range runs past the file");
-                    assert!(seen.insert((start, len)), "duplicate range {start}..{}", start + len);
+                    assert!(
+                        seen.insert((start, len)),
+                        "duplicate range {start}..{}",
+                        start + len
+                    );
                 }
             }
             let _ = std::fs::remove_dir_all(&dir);
@@ -1104,7 +1108,11 @@ mod tests {
         let mut s_pf = seq_for(&with_pf);
         for (n, want) in (1..=tokens.len()).zip(&baseline) {
             let got = with_pf.logits(&tokens[..n], &mut s_pf).unwrap();
-            assert_eq!(got.data(), want.data(), "prefetch changed output at step {n}");
+            assert_eq!(
+                got.data(),
+                want.data(),
+                "prefetch changed output at step {n}"
+            );
         }
 
         // Background warms are spawned on rayon; poll rather than trust a fixed

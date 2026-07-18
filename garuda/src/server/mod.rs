@@ -95,8 +95,7 @@ impl Engine {
         // faults by touching its pages on a background thread while the current step
         // still computes. A dense model, or one expanded to f32 in RAM, has nothing
         // to warm — mmap is what makes touching a page ever cost a disk read.
-        let prefetch = if config.runtime.prefetch && config.runtime.predictor && lc.n_experts > 0
-        {
+        let prefetch = if config.runtime.prefetch && config.runtime.predictor && lc.n_experts > 0 {
             mmap.clone().map(|m| {
                 let ranges = backend.expert_page_ranges();
                 let predictor = Arc::new(ExpertPredictor::new(lc.n_layers * lc.n_experts));

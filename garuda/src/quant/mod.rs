@@ -939,7 +939,10 @@ mod tests {
         rel_errs.sort_by(|a, b| a.total_cmp(b));
         let n = rel_errs.len();
         let (p50, p90, max) = (rel_errs[n / 2], rel_errs[n * 9 / 10], rel_errs[n - 1]);
-        eprintln!("relative error: min={:.4} p50={p50:.4} p90={p90:.4} max={max:.4}", rel_errs[0]);
+        eprintln!(
+            "relative error: min={:.4} p50={p50:.4} p90={p90:.4} max={max:.4}",
+            rel_errs[0]
+        );
         assert!(p90 < 0.10, "p90 relative error regressed: {p90:.4}");
     }
 }
