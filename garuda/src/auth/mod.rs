@@ -11,11 +11,11 @@
 //! `Authorization: Bearer <key>`, Anthropic clients send `x-api-key: <key>`.
 
 use crate::api::{ErrorBody, ErrorEnvelope};
+use axum::Json;
 use axum::extract::{Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use std::sync::Arc;
 
 /// The configured keys, cheap to clone (shares one `Vec` via `Arc`) so it can be
@@ -33,12 +33,17 @@ impl ApiKeys {
         !self.0.is_empty()
     }
 
-    /// Constant-time against every configured key, so response timing cannot leak
-    /// how many characters of a guess were right.
+    /// Compare against every configured key, so response timing cannot reveal how
+    /// many characters of a guess were right or where a matching key sits in the
+    /// configured list.
     fn accepts(&self, presented: &str) -> bool {
-        self.0
-            .iter()
-            .any(|k| constant_time_eq::constant_time_eq(k.as_bytes(), presented.as_bytes()))
+        let mut accepted = false;
+        for key in self.0.iter() {
+            // Deliberately do not short-circuit: doing so would expose the index of
+            // a valid key through the total comparison time.
+            accepted |= constant_time_eq::constant_time_eq(key.as_bytes(), presented.as_bytes());
+        }
+        accepted
     }
 }
 
@@ -82,10 +87,10 @@ fn unauthorized() -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Router;
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
     use axum::routing::get;
-    use axum::Router;
     use tower::ServiceExt;
 
     fn app(keys: Vec<&str>) -> Router {
@@ -94,10 +99,7 @@ mod tests {
             .route("/health", get(|| async { "ok" }))
             .route("/", get(|| async { "chat page" }))
             .route("/v1/models", get(|| async { "models" }))
-            .layer(axum::middleware::from_fn_with_state(
-                keys,
-                require_key,
-            ))
+            .layer(axum::middleware::from_fn_with_state(keys, require_key))
     }
 
     async fn status(app: &Router, path: &str, header: Option<(&str, &str)>) -> StatusCode {

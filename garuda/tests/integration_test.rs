@@ -19,6 +19,7 @@ use tower::ServiceExt;
 
 struct Harness {
     app: Router,
+    state: Arc<ApiState>,
     _dir: TempDir,
 }
 
@@ -50,13 +51,15 @@ fn harness(tag: &str, tune: impl FnOnce(&mut AppConfig)) -> Harness {
     let state = Arc::new(ApiState {
         runtime: engine.runtime.clone(),
         scheduler,
+        embedding_slots: Arc::new(tokio::sync::Semaphore::new(config.server.max_concurrent)),
         defaults: config.sampling().unwrap(),
         request_timeout: config.request_timeout(),
         started: std::time::Instant::now(),
     });
 
     Harness {
-        app: create_router(state),
+        app: create_router(state.clone()),
+        state,
         _dir: TempDir(dir),
     }
 }
@@ -374,6 +377,22 @@ async fn embeddings_reject_a_malformed_input_field() {
         let (status, _) = h.post("/v1/embeddings", bad.clone()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "accepted {bad}");
     }
+}
+
+#[tokio::test]
+async fn saturated_embedding_capacity_answers_503_without_queuing_cpu_work() {
+    let h = harness("embed_busy", |c| c.server.max_concurrent = 1);
+    let permit = h.state.embedding_slots.clone().try_acquire_owned().unwrap();
+
+    let (status, body) = h
+        .post(
+            "/v1/embeddings",
+            serde_json::json!({ "input": "would otherwise start a blocking task" }),
+        )
+        .await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    drop(permit);
 }
 
 #[tokio::test]

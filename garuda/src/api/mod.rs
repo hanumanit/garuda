@@ -6,8 +6,9 @@
 //! OpenAI's error envelope with the status code clients retry on (429 for rate
 //! limits, 503 when the queue is full).
 //!
-//! The one place it deliberately differs: there is no authentication. Do not put
-//! this on a public interface.
+//! Authentication is applied when the application router is assembled in `main`:
+//! see [`crate::auth`]. It is intentionally kept outside this protocol adapter so
+//! every supported wire format shares the same policy.
 
 use crate::core::GarudaError;
 use crate::runtime::{InferenceRuntime, SamplingParams};
@@ -33,6 +34,9 @@ pub const MODEL_ID: &str = "garuda-moe-v1";
 pub struct ApiState {
     pub runtime: Arc<InferenceRuntime>,
     pub scheduler: Arc<Scheduler>,
+    /// Bounds CPU-bound embedding work, which does not flow through the token
+    /// scheduler because it has no streaming decode loop.
+    pub embedding_slots: Arc<tokio::sync::Semaphore>,
     /// Applied when the request does not override them.
     pub defaults: SamplingParams,
     pub request_timeout: Duration,
@@ -554,6 +558,14 @@ async fn embeddings(
     if inputs.is_empty() || inputs.iter().all(|s| s.is_empty()) {
         return bad_request("input must not be empty");
     }
+
+    // Embeddings are CPU-bound and do not use the generation scheduler. Refuse
+    // excess work rather than allowing an unbounded number of blocking tasks to
+    // accumulate and starve generation requests.
+    let _permit = match state.embedding_slots.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return error_response(&GarudaError::Busy),
+    };
 
     let runtime = state.runtime.clone();
     let model = req.model.unwrap_or_else(|| MODEL_ID.to_owned());

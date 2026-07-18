@@ -88,7 +88,9 @@ fn inspect(path: &std::path::Path) -> anyhow::Result<()> {
         .find(|t| !garuda::quant::is_supported(t.ggml_type));
     let missing_experts = match (gguf.expert_count(), gguf.arch_u64("block_count")) {
         (Some(ne), Some(nl)) if ne > 0 => (0..nl).find(|&l| {
-            let stacked = gguf.tensor(&format!("blk.{l}.ffn_gate_exps.weight")).is_some();
+            let stacked = gguf
+                .tensor(&format!("blk.{l}.ffn_gate_exps.weight"))
+                .is_some();
             let split = gguf.tensor(&format!("blk.{l}.ffn_gate.0.weight")).is_some();
             !stacked && !split
         }),
@@ -151,7 +153,10 @@ async fn serve(config: AppConfig) -> anyhow::Result<()> {
         }
     }
     if auth.is_enabled() {
-        info!(keys = config.server.api_keys.len(), "API key authentication enabled");
+        info!(
+            keys = config.server.api_keys.len(),
+            "API key authentication enabled"
+        );
     } else {
         warn!("this server has no authentication; do not expose it to an untrusted network");
     }
@@ -161,6 +166,7 @@ async fn serve(config: AppConfig) -> anyhow::Result<()> {
     let state = Arc::new(ApiState {
         runtime: engine.runtime.clone(),
         scheduler,
+        embedding_slots: Arc::new(tokio::sync::Semaphore::new(config.server.max_concurrent)),
         defaults: config.sampling()?,
         request_timeout: config.request_timeout(),
         started: std::time::Instant::now(),
