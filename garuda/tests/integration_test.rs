@@ -51,6 +51,7 @@ fn harness(tag: &str, tune: impl FnOnce(&mut AppConfig)) -> Harness {
     let state = Arc::new(ApiState {
         runtime: engine.runtime.clone(),
         scheduler,
+        model_kind: "synthetic",
         embedding_slots: Arc::new(tokio::sync::Semaphore::new(config.server.max_concurrent)),
         defaults: config.sampling().unwrap(),
         request_timeout: config.request_timeout(),
@@ -483,4 +484,5 @@ async fn stats_reports_measured_counters() {
     assert_eq!(v["scheduler"]["completed"], 2);
     assert_eq!(v["scheduler"]["rejected_rate_limit"], 0);
     assert_eq!(v["context_window"], 512);
+    assert_eq!(v["model"]["kind"], "synthetic");
 }

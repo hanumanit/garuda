@@ -125,6 +125,10 @@ fn inspect(path: &std::path::Path) -> anyhow::Result<()> {
 async fn serve(config: AppConfig) -> anyhow::Result<()> {
     let engine = Engine::build(&config)?;
     let auth = ApiKeys::new(config.server.api_keys.clone());
+    let model_kind = match &engine.backend {
+        Backend::SyntheticMoe => "synthetic",
+        Backend::Gguf { .. } => "gguf",
+    };
     match &engine.backend {
         Backend::SyntheticMoe => {
             info!(
@@ -166,6 +170,7 @@ async fn serve(config: AppConfig) -> anyhow::Result<()> {
     let state = Arc::new(ApiState {
         runtime: engine.runtime.clone(),
         scheduler,
+        model_kind,
         embedding_slots: Arc::new(tokio::sync::Semaphore::new(config.server.max_concurrent)),
         defaults: config.sampling()?,
         request_timeout: config.request_timeout(),

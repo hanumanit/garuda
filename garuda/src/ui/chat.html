@@ -146,6 +146,15 @@
     border-radius: 999px;
     padding: 2px 10px;
   }
+  #notice {
+    color: var(--muted);
+    font-size: 12px;
+    max-width: min(42vw, 420px);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  #notice.warning { color: var(--danger); }
   header .spacer { flex: 1; }
   header button {
     background: transparent;
@@ -293,6 +302,7 @@
       <button id="sidebar-toggle" type="button" title="Toggle sidebar">☰</button>
       <h1>Garuda</h1>
       <span id="model-badge">…</span>
+      <span id="notice" role="status" aria-live="polite"></span>
       <div class="spacer"></div>
       <button id="settings-toggle" type="button">Settings</button>
     </header>
@@ -340,6 +350,7 @@
   const maxTokensInput = document.getElementById('max-tokens');
   const apiKeyInput = document.getElementById('api-key');
   const modelBadge = document.getElementById('model-badge');
+  const notice = document.getElementById('notice');
 
   // ---- conversations: each { id, title, messages: [{role, content}], updatedAt } ----
   const CONV_STORAGE = 'garuda_conversations';
@@ -372,30 +383,70 @@
 
   let controller = null;
 
+  // Keep credentials only for this browser tab. Conversations remain in
+  // localStorage, but an API key must not be persisted with them.
   const API_KEY_STORAGE = 'garuda_api_key';
-  apiKeyInput.value = localStorage.getItem(API_KEY_STORAGE) ?? '';
+  apiKeyInput.value = sessionStorage.getItem(API_KEY_STORAGE) ?? '';
   apiKeyInput.addEventListener('change', () => {
-    if (apiKeyInput.value) localStorage.setItem(API_KEY_STORAGE, apiKeyInput.value);
-    else localStorage.removeItem(API_KEY_STORAGE);
+    const key = apiKeyInput.value.trim();
+    if (key) sessionStorage.setItem(API_KEY_STORAGE, key);
+    else sessionStorage.removeItem(API_KEY_STORAGE);
     refreshModelBadge();
   });
 
   function authHeaders() {
-    const key = apiKeyInput.value;
+    const key = apiKeyInput.value.trim();
     return key ? { Authorization: 'Bearer ' + key } : {};
   }
 
-  function refreshModelBadge() {
-    fetch('/v1/models', { headers: authHeaders() }).then((r) => {
-      if (r.status === 401) {
+  function setNotice(message = '', warning = false) {
+    notice.textContent = message;
+    notice.title = message;
+    notice.classList.toggle('warning', warning);
+  }
+
+  async function responseMessage(res) {
+    try {
+      const body = await res.json();
+      if (body.error?.message) return body.error.message;
+    } catch (_) {
+      // Non-JSON errors still get a useful status-specific message below.
+    }
+    return ({
+      400: 'The request was rejected by the server.',
+      401: 'An API key is required or invalid.',
+      429: 'Too many requests. Try again shortly.',
+      503: 'The server is busy. Try again shortly.',
+      504: 'The request timed out.',
+    })[res.status] ?? `Server responded with ${res.status}.`;
+  }
+
+  async function refreshModelBadge() {
+    try {
+      const models = await fetch('/v1/models', { headers: authHeaders() });
+      if (models.status === 401) {
         modelBadge.textContent = 'needs API key';
+        setNotice('Set a valid API key in Settings to start chatting.', true);
         settingsPanel.classList.add('open');
-        return null;
+        return;
       }
-      return r.json();
-    }).then((j) => {
-      if (j) modelBadge.textContent = j.data?.[0]?.id ?? 'unknown model';
-    }).catch(() => { modelBadge.textContent = 'unreachable'; });
+      if (!models.ok) throw new Error(await responseMessage(models));
+      const model = (await models.json()).data?.[0]?.id ?? 'unknown model';
+
+      const stats = await fetch('/v1/stats', { headers: authHeaders() });
+      if (!stats.ok) throw new Error(await responseMessage(stats));
+      const kind = (await stats.json()).model?.kind;
+      if (kind === 'synthetic') {
+        modelBadge.textContent = `${model} · synthetic`;
+        setNotice('Synthetic weights: responses have no semantic meaning.', true);
+      } else {
+        modelBadge.textContent = `${model}${kind === 'gguf' ? ' · GGUF' : ''}`;
+        setNotice('');
+      }
+    } catch (err) {
+      modelBadge.textContent = 'unreachable';
+      setNotice(err.message || 'Cannot reach the server.', true);
+    }
   }
   refreshModelBadge();
 
@@ -417,7 +468,12 @@
     }
   });
   sendBtn.addEventListener('click', send);
-  stopBtn.addEventListener('click', () => controller && controller.abort());
+  stopBtn.addEventListener('click', () => {
+    if (!controller) return;
+    stopBtn.disabled = true;
+    setNotice('Stopping generation…');
+    controller.abort();
+  });
   newChatBtn.addEventListener('click', newChat);
 
   function renderThread() {
@@ -530,6 +586,7 @@
     sendBtn.style.display = busy ? 'none' : 'inline-block';
     stopBtn.style.display = busy ? 'inline-block' : 'none';
     input.disabled = busy;
+    stopBtn.disabled = false;
   }
 
   async function send() {
@@ -578,10 +635,10 @@
       });
       if (res.status === 401) {
         settingsPanel.classList.add('open');
-        throw new Error('this server needs an API key — set it under Settings');
+        throw new Error(await responseMessage(res));
       }
       if (!res.ok || !res.body) {
-        throw new Error('server responded with ' + res.status);
+        throw new Error(!res.ok ? await responseMessage(res) : 'The server returned no response stream.');
       }
 
       const reader = res.body.getReader();
@@ -622,6 +679,9 @@
         const row = bubble.closest('.row');
         row.classList.add('error');
         bubble.textContent = 'Error: ' + err.message;
+        setNotice(err.message || 'Generation failed.', true);
+      } else {
+        setNotice('Generation stopped.');
       }
       if (assistantText) {
         localHistory = [...localHistory, { role: 'assistant', content: assistantText }];

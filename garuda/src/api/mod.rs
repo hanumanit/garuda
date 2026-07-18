@@ -34,6 +34,8 @@ pub const MODEL_ID: &str = "garuda-moe-v1";
 pub struct ApiState {
     pub runtime: Arc<InferenceRuntime>,
     pub scheduler: Arc<Scheduler>,
+    /// `synthetic` for the built-in deterministic MoE, `gguf` for a loaded model.
+    pub model_kind: &'static str,
     /// Bounds CPU-bound embedding work, which does not flow through the token
     /// scheduler because it has no streaming decode loop.
     pub embedding_slots: Arc<tokio::sync::Semaphore>,
@@ -322,6 +324,9 @@ async fn stats(State(state): State<SharedState>) -> impl IntoResponse {
             "hit_ratio": prompt.hit_ratio(),
         },
         "context_window": state.runtime.max_context(),
+        "model": {
+            "kind": state.model_kind,
+        },
     }))
 }
 
