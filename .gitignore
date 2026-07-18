@@ -5,3 +5,6 @@ target/
 
 # Runtime state: the L2 expert cache and KV spill directory (model.path in config.toml)
 /garuda/models/
+
+# Machine-specific model locations.
+/garuda/mixtral-local.toml
