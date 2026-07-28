@@ -52,6 +52,7 @@ the streaming, the cancellation, the load shedding.
 | Tiered expert storage (L1 RAM → L2 disk → L3 archive) | Real, tested |
 | Paged KV cache with disk spill (multi-layer, GQA-aware) | Real, tested — pair spilling with `sliding_window`; under full attention every step reads the whole prefix, so a spilled block is reloaded the moment it is written. Garuda warns at startup when the configuration would do that |
 | Scheduler (priority, concurrency limits, cancellation, timeouts, backpressure) | Real, tested |
+| Speculative decoding (prompt lookup, no draft model) | Real, measured — on Mixtral (25 GB, 16 GB RAM) a grounded prompt decodes **2.6× faster** (12.5 → 4.8 s/token) and an open-ended one is unaffected (13.2 → 11.6 s/token). Guesses are copied from earlier in the context and kept only where the model agrees, so greedy output is unchanged; each sequence sizes its own lookahead to what its guesses have been winning |
 | Continuous batching — concurrent requests decode in one pass over the weights | Real, tested — ~1.6–1.8× aggregate throughput and about half the median latency at 8 concurrent, measured against one task per request |
 | Chunked prefill — a long prompt does not stall the clients already streaming | Real, tested — the worst inter-token gap a streamer sees while a 1474-token prompt is absorbed drops from ~13 s to ~0.2 s. Chunk size is measured from what a decode step actually costs, not fixed |
 | OpenAI + Ollama + Anthropic + llama.cpp + TGI APIs, SSE / NDJSON / WebSocket | Real, tested |
@@ -311,11 +312,13 @@ registered in `Engine::build` — see **[PLUGIN.md](PLUGIN.md)** and
   are refused rather than run.
 - **Architectures beyond Llama.** `LlamaBackend` covers the Llama family (dense and
   MoE, GQA). Other architectures each need their own `InferenceBackend`.
-- **Decode on a larger-than-RAM checkpoint.** Prefill there is now measured and
-  fast, but decoding a single sequence still touches every layer for one token, so a
-  25 GB model decodes at well under a token a second on a 16 GB machine. Batching
-  across concurrent requests amortises it; one lonely request cannot be helped
-  without either speculative decoding or keeping more of the model resident.
+- **Speculation for sampled requests.** Guessing is greedy-only: keeping a guess
+  because it matches the argmax would replace the caller's distribution with a greedy
+  one. Doing it properly needs the rejection-sampling scheme, which preserves the
+  distribution exactly — worth having, since `temperature > 0` is the default.
+- **A draft model.** Prompt lookup only fires where the output echoes the input. A
+  small draft checkpoint sharing the vocabulary would speculate on open-ended text
+  too, at the cost of a second model to load and keep resident.
 
 ---
 

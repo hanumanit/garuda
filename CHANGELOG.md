@@ -2,6 +2,56 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.22.0] - 2026-07-29
+
+Speculative decoding, by prompt lookup. This is the answer to the finding in 0.21.0
+that decode on a larger-than-RAM checkpoint is bandwidth-bound: the fix is to read
+the model fewer times, not to read it more cleverly.
+
+### Added
+
+- **`model.speculative_lookahead`.** A lone request guesses the next few tokens by
+  finding where its recent context occurred earlier and copying what followed, then
+  checks the whole run in one pass. Guesses are kept only where the model would have
+  chosen them anyway, so greedy output is unchanged — the tests assert exactly that
+  against plain decoding, including that the caches end up identical.
+
+  No draft model and no extra memory, which matters on the machine this is for: one
+  already running a 25 GB checkpoint in 16 GB of RAM.
+
+  Measured on Mixtral-8x7B Q4_K_M, greedy, paired runs:
+
+  | | no speculation | speculating |
+  |---|---|---|
+  | grounded prompt (answer echoes the input) | 12.47 s/token | **4.84 s/token** |
+  | open-ended prompt | 13.15 s/token | 11.55 s/token |
+
+  So ~2.6× where the guessing suits the workload, and no cost where it does not.
+
+- `SeqState::truncate`, `InferenceBackend::logits_multi` and
+  `speculation_supported`. Verifying a run of guesses needs logits at several
+  positions from one pass and the ability to give back the positions belonging to
+  guesses that were wrong. `logits_multi` defaults to handling one position by
+  delegating and refusing more, so a backend that cannot do it says so.
+
+### The bit that needed measuring twice
+
+A first cut used the configured lookahead every round. On the grounded prompt that
+was faster still — 3.6 s/token — but on the open-ended one it was **1.6× slower than
+not guessing at all**: 16.0 s/token against 9.9. A guess is not free, because the
+verification pass computes every position drafted, so six guesses that win one token
+do six positions of expert arithmetic for it.
+
+So each sequence now keeps a running average of what its guesses have been winning
+and asks for a little more than that, or stops asking entirely when it falls behind
+(retrying occasionally, since text turns repetitive halfway through often enough).
+That trades a little of the best case — 4.84 s/token rather than 3.58 — for removing
+the bad one. An operator who knows their workload echoes can raise the ceiling.
+
+Sampled requests (`temperature > 0`) take the ordinary path throughout. Keeping a
+guess because it matches the argmax would quietly replace the caller's distribution
+with a greedy one; doing it properly needs rejection sampling, which is not here yet.
+
 ## [0.21.0] - 2026-07-29
 
 Expert prefetch, measured on the case it was built for. It turns out to help
