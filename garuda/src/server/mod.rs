@@ -48,68 +48,14 @@ impl Engine {
         }
     }
 
-    /// Physical RAM in bytes, or `None` when it cannot be determined.
+    /// How many prompt tokens share one pass over a layer's weights.
     ///
-    /// Used only to guess whether a checkpoint can live in the page cache. An unknown
-    /// answer is treated as "assume it fits", which selects the order that is faster
-    /// in that case and never worse than what the code did before.
-    fn physical_memory() -> Option<u64> {
-        #[cfg(target_os = "macos")]
-        {
-            let mut bytes: u64 = 0;
-            let mut len = std::mem::size_of::<u64>();
-            let name = c"hw.memsize";
-            // Safety: `name` is a valid C string, and the out-pointer and its length
-            // describe the `u64` above.
-            let rc = unsafe {
-                libc::sysctlbyname(
-                    name.as_ptr(),
-                    (&raw mut bytes).cast(),
-                    &raw mut len,
-                    std::ptr::null_mut(),
-                    0,
-                )
-            };
-            return (rc == 0 && bytes > 0).then_some(bytes);
-        }
-        #[cfg(target_os = "linux")]
-        {
-            let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-            let kb: u64 = text
-                .lines()
-                .find_map(|l| l.strip_prefix("MemTotal:"))?
-                .split_whitespace()
-                .next()?
-                .parse()
-                .ok()?;
-            return Some(kb * 1024);
-        }
-        #[allow(unreachable_code)]
-        None
-    }
-
-    /// How many prompt tokens should share one pass over a layer's weights.
-    ///
-    /// Layer-major prefill trades CPU-cache locality for page-cache locality, so it
-    /// is only worth it when the checkpoint cannot sit in the page cache — see
-    /// `LlamaBackend::prefill_chunk` for the measurements on both sides. The rule of
-    /// thumb: if the file is over half of physical RAM, the page cache is not going
-    /// to hold it alongside everything else, and re-reading every layer once per
-    /// prompt token becomes the dominant cost.
-    ///
-    /// Only applies to a memory-mapped checkpoint. Without `mmap` the weights are
-    /// already expanded in RAM and there is no paging to avoid.
-    fn prefill_chunk(config: &AppConfig, checkpoint_bytes: u64) -> usize {
+    /// Batching is a straight win — see [`crate::llama::LlamaBackend::with_prefill_chunk`]
+    /// for the measurements — so this is only about honouring an override.
+    fn prefill_chunk(config: &AppConfig) -> usize {
         match config.model.prefill_batch {
-            0 => {}               // auto: decide below
-            n => return n.max(1), // operator override, including 1 = off
-        }
-        if !config.model.mmap {
-            return 1;
-        }
-        match Self::physical_memory() {
-            Some(ram) if checkpoint_bytes * 2 > ram => crate::llama::DEFAULT_PREFILL_CHUNK,
-            _ => 1,
+            0 => crate::llama::DEFAULT_PREFILL_CHUNK,
+            n => n.max(1),
         }
     }
 
@@ -177,18 +123,16 @@ impl Engine {
         let lc = backend.config();
         let dims = backend.dims();
 
-        let chunk = Self::prefill_chunk(config, bytes.len() as u64);
-        let why = match (config.model.prefill_batch, chunk) {
-            (0, 1) => "token-major (the checkpoint should fit in the page cache)",
-            (0, _) => "layer-major (the checkpoint is large relative to RAM)",
-            (_, 1) => "token-major (set by model.prefill_batch)",
-            (_, _) => "layer-major (set by model.prefill_batch)",
-        };
+        let chunk = Self::prefill_chunk(config);
         tracing::info!(
             prefill_batch = chunk,
             checkpoint_mb = bytes.len() / 1_048_576,
-            ram_mb = Self::physical_memory().map(|r| r / 1_048_576),
-            "prefill order: {why}"
+            "prefill: {}",
+            if chunk > 1 {
+                "layer-major, tokens grouped by expert"
+            } else {
+                "token-major (batching disabled by model.prefill_batch)"
+            }
         );
         let backend = backend.with_prefill_chunk(chunk);
 
@@ -339,47 +283,21 @@ pub fn configure_thread_pool(threads: usize) {
 mod tests {
     use super::*;
 
-    fn cfg(mmap: bool, prefill_batch: usize) -> AppConfig {
+    #[test]
+    fn prefill_batching_is_on_by_default_and_overridable() {
         let mut c = AppConfig::default();
-        c.model.mmap = mmap;
-        c.model.prefill_batch = prefill_batch;
-        c
-    }
-
-    #[test]
-    fn physical_memory_is_readable_on_this_platform() {
-        // The prefill heuristic degrades to token-major without it, so a silent
-        // `None` would quietly disable the optimisation on a machine that needs it.
-        let ram = Engine::physical_memory();
-        assert!(ram.is_some(), "could not read physical memory");
-        assert!(
-            ram.unwrap() > 256 << 20,
-            "implausible RAM reading: {ram:?} bytes"
-        );
-    }
-
-    #[test]
-    fn prefill_batching_turns_on_only_for_a_checkpoint_too_big_to_cache() {
-        let ram = Engine::physical_memory().expect("physical memory");
-
-        // Comfortably cacheable: token-major, which measures faster in that case.
-        assert_eq!(Engine::prefill_chunk(&cfg(true, 0), ram / 8), 1);
-        // Over half of RAM: the page cache will not hold it beside everything else.
+        assert_eq!(c.model.prefill_batch, 0, "0 means 'use the default'");
         assert_eq!(
-            Engine::prefill_chunk(&cfg(true, 0), ram),
+            Engine::prefill_chunk(&c),
             crate::llama::DEFAULT_PREFILL_CHUNK
         );
-        // Without mmap the weights are already expanded in RAM; there is no paging
-        // to avoid, however big the file was on disk.
-        assert_eq!(Engine::prefill_chunk(&cfg(false, 0), ram * 4), 1);
-    }
 
-    #[test]
-    fn an_explicit_prefill_batch_overrides_the_heuristic_both_ways() {
-        let ram = Engine::physical_memory().expect("physical memory");
-        // Forced on for a small checkpoint the heuristic would leave token-major.
-        assert_eq!(Engine::prefill_chunk(&cfg(true, 64), ram / 8), 64);
-        // Forced off for a huge one it would have batched.
-        assert_eq!(Engine::prefill_chunk(&cfg(true, 1), ram * 4), 1);
+        // Grouping tokens by expert makes batching a win on both the packed and the
+        // f32 paths, so there is no configuration it is withheld for — only an
+        // explicit opt-out.
+        c.model.prefill_batch = 1;
+        assert_eq!(Engine::prefill_chunk(&c), 1);
+        c.model.prefill_batch = 64;
+        assert_eq!(Engine::prefill_chunk(&c), 64);
     }
 }

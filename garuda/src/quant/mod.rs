@@ -217,6 +217,124 @@ pub fn matvec(
         )
 }
 
+/// `out[b*rows + r] = dot(row r, xs[b])` for `n` activation vectors at once.
+///
+/// The point is that a packed row is decoded **once** and then dotted against every
+/// vector, instead of once per vector. Under `mmap` that decode is the dominant cost
+/// of the forward pass — and the row's bytes are also read from memory once instead
+/// of `n` times, which is what makes an MoE expert affordable to run for a batch of
+/// tokens rather than one.
+///
+/// `xs` is `n * cols` (vector-major) and `out` is `n * rows` (likewise), so one
+/// vector's results are contiguous and can feed straight into the next matmul.
+/// Internally the rows are the parallel axis, so results land transposed and are
+/// flipped back at the end; that copy is `rows * n` against `rows * cols * n`
+/// multiply-accumulates, i.e. noise.
+///
+/// `n == 1` is exactly [`matvec`] and delegates to it.
+pub fn matmul(
+    qtype: u32,
+    weight: &[u8],
+    rows: usize,
+    cols: usize,
+    xs: &[f32],
+    n: usize,
+    out: &mut [f32],
+) -> Result<(), GarudaError> {
+    use rayon::prelude::*;
+
+    if n == 1 {
+        return matvec(qtype, weight, rows, cols, xs, out);
+    }
+    let row_bytes = byte_size(qtype, cols)?;
+    if weight.len() != rows * row_bytes {
+        return Err(GarudaError::Model(format!(
+            "{} matmul: weight is {} bytes, expected {} ({rows} rows × {row_bytes})",
+            type_name(qtype),
+            weight.len(),
+            rows * row_bytes
+        )));
+    }
+    if xs.len() != n * cols || out.len() != n * rows {
+        return Err(GarudaError::Inference(format!(
+            "matmul dimension mismatch: xs={}, out={}, expected {} and {}",
+            xs.len(),
+            out.len(),
+            n * cols,
+            n * rows
+        )));
+    }
+
+    // Row-major scratch: each row task owns one contiguous run of `n` results.
+    let mut by_row = vec![0.0f32; rows * n];
+
+    match qtype {
+        Q8_0 | Q4_K | Q6_K => {
+            // Quantise every activation once, then decode each row once and dot it
+            // against all of them through the integer kernels.
+            let (xq, xs_scales) = quantize_activations(xs, n, cols);
+            let sums = (qtype == Q4_K).then(|| block_sums(&xq));
+            by_row
+                .par_chunks_exact_mut(n)
+                .zip(weight.par_chunks_exact(row_bytes))
+                .for_each(|(dst, row)| {
+                    let blocks = cols / QK;
+                    for (b, o) in dst.iter_mut().enumerate() {
+                        let xqb = &xq[b * cols..(b + 1) * cols];
+                        let xsb = &xs_scales[b * blocks..(b + 1) * blocks];
+                        *o = match qtype {
+                            Q8_0 => q8_0_dot(row, xqb, xsb),
+                            Q6_K => q6_k_dot(row, xqb, xsb),
+                            _ => q4_k_dot(row, xqb, xsb, &sums.as_ref().unwrap()[b * blocks..]),
+                        };
+                    }
+                });
+        }
+        _ => {
+            by_row
+                .par_chunks_exact_mut(n)
+                .zip(weight.par_chunks_exact(row_bytes))
+                .try_for_each_init(
+                    || vec![0.0f32; cols],
+                    |buf, (dst, row)| -> Result<(), GarudaError> {
+                        dequant_into(qtype, row, buf)?;
+                        for (b, o) in dst.iter_mut().enumerate() {
+                            *o = crate::simd::dot(buf, &xs[b * cols..(b + 1) * cols]);
+                        }
+                        Ok(())
+                    },
+                )?;
+        }
+    }
+
+    for (r, dst) in by_row.chunks_exact(n).enumerate() {
+        for (b, &v) in dst.iter().enumerate() {
+            out[b * rows + r] = v;
+        }
+    }
+    Ok(())
+}
+
+/// [`quantize_activation`] over `n` concatenated vectors, each `cols` long.
+fn quantize_activations(xs: &[f32], n: usize, cols: usize) -> (Vec<i8>, Vec<f32>) {
+    let mut xq = vec![0i8; n * cols];
+    let mut scales = vec![0.0f32; n * (cols / QK)];
+    for b in 0..n {
+        let (q, s) = quantize_activation(&xs[b * cols..(b + 1) * cols]);
+        xq[b * cols..(b + 1) * cols].copy_from_slice(&q);
+        let blocks = cols / QK;
+        scales[b * blocks..(b + 1) * blocks].copy_from_slice(&s);
+    }
+    (xq, scales)
+}
+
+/// Per-32-block sums of an int8 activation, which Q4_K's affine min-term needs.
+fn block_sums(xq: &[i8]) -> Vec<i32> {
+    xq.chunks_exact(QK)
+        .map(|blk| blk.iter().map(|&v| v as i32).sum())
+        .collect()
+}
+
 /// Quantise an activation vector to int8, one scale per 32-element block, the way ggml
 /// quantises activations for a quantised matmul. Returns the int8 values and the
 /// per-block scales. This is the small approximation the integer kernels trade for speed.
@@ -247,17 +365,20 @@ fn matvec_q8_0(weight: &[u8], cols: usize, x: &[f32], out: &mut [f32]) {
 
     out.par_iter_mut()
         .zip(weight.par_chunks_exact(row_bytes))
-        .for_each(|(o, row)| {
-            let mut sum = 0.0f32;
-            for (b, blk) in row.chunks_exact(34).enumerate() {
-                let ws = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
-                // The 32 quant bytes reinterpreted as i8 — same size and alignment.
-                let wq: &[i8] =
-                    unsafe { std::slice::from_raw_parts(blk[2..].as_ptr() as *const i8, 32) };
-                sum += ws * xs[b] * crate::simd::dot_i8(wq, &xq[b * QK..b * QK + QK]) as f32;
-            }
-            *o = sum;
-        });
+        .for_each(|(o, row)| *o = q8_0_dot(row, &xq, &xs));
+}
+
+/// One Q8_0-quantised row dotted against an int8-quantised activation. The weights
+/// are already int8, so there is nothing to unpack — just the per-block scales.
+fn q8_0_dot(row: &[u8], xq: &[i8], xs: &[f32]) -> f32 {
+    let mut sum = 0.0f32;
+    for (b, blk) in row.chunks_exact(2 + QK).enumerate() {
+        let ws = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        // The 32 quant bytes reinterpreted as i8 — same size and alignment.
+        let wq: &[i8] = unsafe { std::slice::from_raw_parts(blk[2..].as_ptr() as *const i8, QK) };
+        sum += ws * xs[b] * crate::simd::dot_i8(wq, &xq[b * QK..b * QK + QK]) as f32;
+    }
+    sum
 }
 
 /// Q4_K integer-kernel matvec: quantise `x` to int8 once, then dot each row's nibbles
@@ -270,10 +391,7 @@ fn matvec_q4_k(weight: &[u8], cols: usize, x: &[f32], out: &mut [f32]) {
     // Q4_K is affine (`w = d·scale·q − dmin·min`), so the min-term needs the sum of
     // each 32-wide block of `xq` too. It does not depend on the row, so it is computed
     // once here and shared by every row's dot product below.
-    let sums: Vec<i32> = xq
-        .chunks_exact(QK)
-        .map(|blk| blk.iter().map(|&v| v as i32).sum())
-        .collect();
+    let sums = block_sums(&xq);
     let row_bytes = 144 * (cols / QK_K);
 
     out.par_iter_mut()
@@ -976,6 +1094,91 @@ mod tests {
                 want
             );
         }
+    }
+
+    /// Valid random bytes for whichever type, so the matmul test can cover them all.
+    fn random_rows(qtype: u32, rows: usize, cols: usize, seed: &mut u64) -> Vec<u8> {
+        let n = byte_size(qtype, cols).unwrap() * rows;
+        match qtype {
+            Q4_K => (0..n / 144).flat_map(|_| random_q4_k_block(seed)).collect(),
+            Q6_K => (0..n / 210).flat_map(|_| random_q6_k_block(seed)).collect(),
+            F32 => (0..n / 4)
+                .flat_map(|_| (((splitmix64(seed) % 2000) as f32 / 1000.0) - 1.0).to_le_bytes())
+                .collect(),
+            // Q8_0 / Q4_0 / the other k-quants are all plain byte soup plus an f16
+            // scale, and any bit pattern decodes to something finite here.
+            _ => (0..n)
+                .map(|i| {
+                    // Keep the f16 scales small so nothing overflows to infinity.
+                    let stride = byte_size(qtype, block_layout(qtype).unwrap().0).unwrap();
+                    if i % stride < 2 || (qtype != Q8_0 && qtype != Q4_0) {
+                        (splitmix64(seed) % 64) as u8
+                    } else {
+                        (splitmix64(seed) % 256) as u8
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// `matmul` decodes each row once and dots it against every activation vector.
+    /// Doing that must not change a single result: for each type it has a path for,
+    /// the batched answer has to equal `n` separate `matvec` calls exactly.
+    #[test]
+    fn matmul_agrees_with_repeated_matvec_for_every_supported_type() {
+        for qtype in [F32, F16, Q4_0, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K] {
+            let (elems, _) = block_layout(qtype).unwrap();
+            let cols = if elems == 1 { 256 } else { elems * 2 };
+            let rows = 7;
+            let n = 5;
+
+            let mut seed = 0xC0FFEE + qtype as u64;
+            let weight = random_rows(qtype, rows, cols, &mut seed);
+            let xs: Vec<f32> = (0..n * cols)
+                .map(|i| {
+                    ((splitmix64(&mut seed) % 2000) as f32 / 1000.0 - 1.0) * (1 + i % 3) as f32
+                })
+                .collect();
+
+            let mut batched = vec![0.0f32; n * rows];
+            matmul(qtype, &weight, rows, cols, &xs, n, &mut batched).unwrap();
+
+            for b in 0..n {
+                let mut single = vec![0.0f32; rows];
+                matvec(
+                    qtype,
+                    &weight,
+                    rows,
+                    cols,
+                    &xs[b * cols..(b + 1) * cols],
+                    &mut single,
+                )
+                .unwrap();
+                assert_eq!(
+                    &batched[b * rows..(b + 1) * rows],
+                    &single[..],
+                    "{} vector {b}: batched result differs from matvec",
+                    type_name(qtype)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn matmul_of_one_vector_is_matvec_and_bad_shapes_are_refused() {
+        let mut seed = 5u64;
+        let (rows, cols) = (4usize, 256usize);
+        let weight = random_rows(Q6_K, rows, cols, &mut seed);
+        let x: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.01).sin()).collect();
+
+        let mut a = vec![0.0f32; rows];
+        let mut b = vec![0.0f32; rows];
+        matmul(Q6_K, &weight, rows, cols, &x, 1, &mut a).unwrap();
+        matvec(Q6_K, &weight, rows, cols, &x, &mut b).unwrap();
+        assert_eq!(a, b);
+
+        let mut small = vec![0.0f32; rows]; // should be 2 * rows
+        assert!(matmul(Q6_K, &weight, rows, cols, &x, 2, &mut small).is_err());
     }
 
     #[test]

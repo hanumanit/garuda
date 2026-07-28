@@ -23,8 +23,6 @@ parking_lot = "0.12"
 blake3 = "1.5"
 memmap2 = "0.9"
 constant_time_eq = "0.4"
-# Only for querying physical RAM, to size the prefill batch against the checkpoint.
-libc = "0.2"
 
 clap = { version = "4.5", features = ["derive"] }
 tracing = "0.1"

@@ -85,6 +85,49 @@ pub fn matvec(m: &[f32], rows: usize, cols: usize, x: &[f32], out: &mut [f32]) {
     }
 }
 
+/// `out[b*rows + r] = dot(m[r], xs[b])` for `n` vectors at once.
+///
+/// The f32 twin of [`crate::quant::matmul`]: there is no decode to amortise here, but
+/// each row is still read from memory once for the whole batch instead of once per
+/// vector. `xs` is `n * cols` and `out` is `n * rows`, both vector-major.
+///
+/// # Panics
+/// If the slice lengths disagree with `rows`/`cols`/`n`.
+pub fn matmul(m: &[f32], rows: usize, cols: usize, xs: &[f32], n: usize, out: &mut [f32]) {
+    assert_eq!(m.len(), rows * cols, "matrix len does not match rows*cols");
+    assert_eq!(xs.len(), n * cols, "input len does not match n*cols");
+    assert_eq!(out.len(), n * rows, "output len does not match n*rows");
+
+    if n == 1 {
+        return matvec(m, rows, cols, xs, out);
+    }
+
+    // Rows are the parallel axis, so results land row-major and are flipped back.
+    let mut by_row = vec![0.0f32; rows * n];
+    let compute = |(dst, row): (&mut [f32], &[f32])| {
+        for (b, o) in dst.iter_mut().enumerate() {
+            *o = dot(row, &xs[b * cols..(b + 1) * cols]);
+        }
+    };
+    if rows >= PAR_ROW_THRESHOLD {
+        by_row
+            .par_chunks_exact_mut(n)
+            .zip(m.par_chunks_exact(cols))
+            .for_each(compute);
+    } else {
+        by_row
+            .chunks_exact_mut(n)
+            .zip(m.chunks_exact(cols))
+            .for_each(compute);
+    }
+
+    for (r, dst) in by_row.chunks_exact(n).enumerate() {
+        for (b, &v) in dst.iter().enumerate() {
+            out[b * rows + r] = v;
+        }
+    }
+}
+
 /// Numerically stable softmax, in place.
 pub fn softmax(x: &mut [f32]) {
     let max = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);

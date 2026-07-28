@@ -467,7 +467,6 @@ dependencies = [
  "constant_time_eq",
  "futures-util",
  "http-body-util",
- "libc",
  "memmap2",
  "parking_lot",
  "rayon",

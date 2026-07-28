@@ -80,6 +80,43 @@ impl Weight {
         }
     }
 
+    /// `out[b*n + i] = dot(row (row_start + i), xs[b])` over `n` vectors at once,
+    /// where `n = xs.len() / cols`. The batched twin of [`Self::matvec_rows`].
+    fn matmul_rows(
+        &self,
+        row_start: usize,
+        xs: &[f32],
+        n: usize,
+        out: &mut [f32],
+    ) -> Result<(), GarudaError> {
+        let rows = out.len() / n.max(1);
+        match self {
+            Weight::Full { data, cols } => {
+                let off = row_start * cols;
+                simd::matmul(&data[off..off + rows * cols], rows, *cols, xs, n, out);
+                Ok(())
+            }
+            Weight::Packed {
+                qtype,
+                cols,
+                src,
+                start,
+            } => {
+                let row_bytes = quant::byte_size(*qtype, *cols)?;
+                let off = start + row_start * row_bytes;
+                quant::matmul(
+                    *qtype,
+                    &src[off..off + rows * row_bytes],
+                    rows,
+                    *cols,
+                    xs,
+                    n,
+                    out,
+                )
+            }
+        }
+    }
+
     /// Dequantise a single row (e.g. one embedding).
     fn row(&self, r: usize) -> Result<Vec<f32>, GarudaError> {
         match self {
@@ -112,19 +149,21 @@ enum ExpertWeight {
 }
 
 impl ExpertWeight {
-    /// Expert `e`'s matvec. `block` is one expert's row count in the stacked
-    /// layout; it is ignored for `Split`, where each tensor already holds
-    /// exactly one expert.
-    fn matvec_expert(
+    /// Expert `e` applied to `n` activation vectors at once — the batched twin of
+    /// [`Self::matvec_expert`]. This is where an MoE layer stops paying for its
+    /// weights once per token: the expert's rows are decoded once for every token
+    /// that routed to it.
+    fn matmul_expert(
         &self,
         e: usize,
         block: usize,
-        x: &[f32],
+        xs: &[f32],
+        n: usize,
         out: &mut [f32],
     ) -> Result<(), GarudaError> {
         match self {
-            ExpertWeight::Stacked(w) => w.matvec_rows(e * block, x, out),
-            ExpertWeight::Split(ws) => ws[e].matvec(x, out),
+            ExpertWeight::Stacked(w) => w.matmul_rows(e * block, xs, n, out),
+            ExpertWeight::Split(ws) => ws[e].matmul_rows(0, xs, n, out),
         }
     }
 
@@ -151,6 +190,15 @@ impl ExpertWeight {
             ExpertWeight::Stacked(Weight::Full { .. }) => None,
         }
     }
+}
+
+/// The three matrices a SwiGLU expert is made of. They are always used together, and
+/// always for the same expert index, so they travel as one.
+#[derive(Clone, Copy)]
+struct Swiglu<'a> {
+    gate: &'a ExpertWeight,
+    up: &'a ExpertWeight,
+    down: &'a ExpertWeight,
 }
 
 /// The architecture parameters read from GGUF metadata.
@@ -481,32 +529,37 @@ impl LlamaBackend {
     }
 
     /// Set how many prompt tokens share one pass over a layer's weights. `0` and
-    /// `1` both mean token-major: a token traverses every layer before the next
-    /// one starts.
+    /// `1` both mean token-major: a token traverses every layer before the next one
+    /// starts, which is what this did before batching existed.
     ///
-    /// Which order wins depends entirely on whether the weights fit in the page
-    /// cache, and the two cases point opposite ways.
+    /// Batching prefill saves work at two levels at once.
     ///
-    /// **When the checkpoint fits**, token-major is faster — measured ~8% on a
-    /// 620 MB mmapped MoE model (512-token prefill: 9.49 s token-major against
-    /// 10.25 s layer-major). Neither order gets reuse out of the CPU caches, because
-    /// one layer's weights already exceed L3; layer-major just additionally keeps
-    /// `chunk` activations live instead of one, and pays for the worse locality.
+    /// **Page cache.** Token-major re-reads every layer once per prompt token, so
+    /// the working set is the whole model *per token* — 7.1 GB for Mixtral-8x7B
+    /// Q4_K_M, against 816 MB for a single layer with all eight experts. Above what
+    /// the page cache holds, that is the difference between streaming the model off
+    /// disk once per token and once per chunk.
     ///
-    /// **When it does not fit**, token-major re-reads every layer once per prompt
-    /// token, so the working set is the whole model per token — 7.1 GB for
-    /// Mixtral-8x7B Q4_K_M, against 816 MB for a single layer with all eight
-    /// experts. Above the page cache that is the difference between streaming the
-    /// model from disk once per token and once per chunk.
+    /// **Row decode.** Within a layer the tokens are grouped by the expert they
+    /// routed to, so an expert's packed rows are decoded once for every token that
+    /// chose it rather than once per token. Under `mmap` that decode is the dominant
+    /// cost of the forward pass, and it is why batching wins even when the whole
+    /// model already fits in RAM.
     ///
-    /// [`crate::server::Engine`] therefore chooses from the checkpoint's size
-    /// against physical RAM rather than fixing one. The crossover has not been
-    /// measured directly — it needs a checkpoint larger than the host's RAM — which
-    /// is why `model.prefill_batch` exists to override the guess.
+    /// Measured on a 620 MB MoE checkpoint resident in RAM, 128-token prefill,
+    /// warm cache, best of three — the case that has *nothing* to gain from the page
+    /// cache, so this is the decode saving alone:
     ///
-    /// Either order computes the same thing: each token's hidden state flows through
-    /// the layers independently, and the only coupling — layer `l`'s attention
-    /// reading layer `l`'s KV — is appended in token order either way.
+    /// | | token-major | batched (256) |
+    /// |---|---|---|
+    /// | mmapped (packed) | 2.68 s | 1.34 s (2.0×) |
+    /// | expanded to `f32` | 2.12 s | 1.28 s (1.7×) |
+    ///
+    /// Either order computes the same thing, and the tests assert it: each token's
+    /// hidden state flows through the layers independently, and the only coupling —
+    /// layer `l`'s attention reading layer `l`'s KV — is appended in token order
+    /// either way. Attention itself stays strictly sequential for that reason; only
+    /// the feed-forward is batched.
     pub fn with_prefill_chunk(mut self, chunk: usize) -> Self {
         self.prefill_chunk = chunk.max(1);
         self
@@ -529,20 +582,6 @@ impl LlamaBackend {
         simd::rmsnorm(&mut h, self.cfg.rms_eps);
         simd::mul_assign(&mut h, weight);
         h
-    }
-
-    /// One block: `x + attn(norm(x))`, then `x + ffn(norm(x))`.
-    fn block(&self, l: usize, x: &mut [f32], kv: &mut KVCacheState) -> Result<(), GarudaError> {
-        let layer = &self.layers[l];
-
-        let h = self.norm(x, &layer.attn_norm);
-        let attn = self.attention(layer, &h, kv)?;
-        simd::add_assign(x, &attn);
-
-        let h = self.norm(x, &layer.ffn_norm);
-        let ffn = self.feed_forward(l, layer, &h, kv)?;
-        simd::add_assign(x, &ffn);
-        Ok(())
     }
 
     /// Grouped-query causal attention with rotary embeddings for one token.
@@ -615,84 +654,158 @@ impl LlamaBackend {
         Ok(out)
     }
 
-    /// One SwiGLU expert `e`: `down_e(silu(gate_e·h) ⊙ (up_e·h))`. `e = 0` for a dense
-    /// FFN (a single expert spanning the whole tensor).
-    fn expert(
+    /// One layer over a whole batch of tokens.
+    ///
+    /// Attention stays strictly token-by-token: it is causal, and each token's keys
+    /// and values have to be in the cache before the next one attends to them. The
+    /// feed-forward has no such ordering — a token's FFN depends only on its own
+    /// hidden state — so the whole batch goes through it at once, which is what lets
+    /// [`Self::feed_forward_batch`] group tokens by expert.
+    fn layer_batch(
         &self,
-        gate: &ExpertWeight,
-        up: &ExpertWeight,
-        down: &ExpertWeight,
-        e: usize,
-        h: &[f32],
-    ) -> Result<Vec<f32>, GarudaError> {
-        let (d, f) = (self.cfg.d_model, self.cfg.d_ff);
-        let mut g = vec![0.0; f];
-        let mut u = vec![0.0; f];
-        gate.matvec_expert(e, f, h, &mut g)?;
-        up.matvec_expert(e, f, h, &mut u)?;
-        simd::silu(&mut g);
-        simd::mul_assign(&mut g, &u);
-        let mut out = vec![0.0; d];
-        down.matvec_expert(e, d, &g, &mut out)?;
-        Ok(out)
+        l: usize,
+        xs: &mut [Vec<f32>],
+        kv: &mut KVCacheState,
+    ) -> Result<(), GarudaError> {
+        let layer = &self.layers[l];
+
+        let mut hs: Vec<f32> = Vec::with_capacity(xs.len() * self.cfg.d_model);
+        for x in xs.iter_mut() {
+            let h = self.norm(x, &layer.attn_norm);
+            let attn = self.attention(layer, &h, kv)?;
+            simd::add_assign(x, &attn);
+            hs.extend_from_slice(&self.norm(x, &layer.ffn_norm));
+        }
+
+        let ffn = self.feed_forward_batch(l, layer, &hs, xs.len(), kv)?;
+        let d = self.cfg.d_model;
+        for (i, x) in xs.iter_mut().enumerate() {
+            simd::add_assign(x, &ffn[i * d..(i + 1) * d]);
+        }
+        Ok(())
     }
 
-    /// The block's feed-forward, dense or mixture-of-experts.
-    fn feed_forward(
+    /// The block's feed-forward over `n` tokens, `hs` being their `n * d_model`
+    /// hidden states.
+    ///
+    /// For MoE this is the whole point of batching. Run token by token, an expert's
+    /// gate/up/down matrices are read — and, when packed, decoded — once per token
+    /// that routes to it. Gathered into one call per expert, they are read once for
+    /// all of them: with 256 tokens choosing 2 of 8 experts, each expert serves ~64
+    /// tokens per pass instead of one.
+    fn feed_forward_batch(
         &self,
         l: usize,
         layer: &Layer,
-        h: &[f32],
+        hs: &[f32],
+        n: usize,
         kv: &mut KVCacheState,
     ) -> Result<Vec<f32>, GarudaError> {
-        match &layer.ffn {
-            Ffn::Dense { gate, up, down } => self.expert(gate, up, down, 0, h),
+        let d = self.cfg.d_model;
+
+        let (router, w) = match &layer.ffn {
+            Ffn::Dense { gate, up, down } => {
+                // A dense FFN is one expert spanning the whole tensor: every token
+                // goes through it, so the batch needs no grouping at all.
+                let mut out = vec![0.0; n * d];
+                let w = Swiglu { gate, up, down };
+                self.expert_batch(w, 0, hs, n, &mut out)?;
+                return Ok(out);
+            }
             Ffn::Moe {
                 router,
                 gate,
                 up,
                 down,
-            } => {
-                let d = self.cfg.d_model;
-                let (ne, k) = (self.cfg.n_experts, self.cfg.n_experts_used.max(1));
+            } => (router, Swiglu { gate, up, down }),
+        };
 
-                // Route: score every expert, softmax, take the top-k, renormalise their
-                // weights — the standard Mixtral gating.
-                let mut scores = vec![0.0; ne];
-                router.matvec(h, &mut scores)?;
-                simd::softmax(&mut scores);
+        let (ne, k) = (self.cfg.n_experts, self.cfg.n_experts_used.max(1));
 
-                let mut ranked: Vec<(usize, f32)> = scores.iter().copied().enumerate().collect();
-                ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
-                ranked.truncate(k);
-                let sum: f32 = ranked.iter().map(|(_, w)| w).sum();
-                let norm = if sum > 0.0 { 1.0 / sum } else { 1.0 / k as f32 };
+        // Route every token, in order. The order matters only for the predictor: its
+        // model is a token-to-token transition, so it has to see the same sequence of
+        // steps a token-at-a-time run would have produced.
+        let mut picks: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n);
+        for t in 0..n {
+            let h = &hs[t * d..(t + 1) * d];
+            let mut scores = vec![0.0; ne];
+            router.matvec(h, &mut scores)?;
+            simd::softmax(&mut scores);
 
-                // Learn from this step and warm what the next one probably needs at
-                // this layer, on a background thread, while the experts below are
-                // still computing. Advisory: a wrong or missing prediction just means
-                // the forward pass below pays the page fault itself, as it always did.
-                // `ExpertId`s are layer-scoped (`layer * n_experts + expert`), so one
-                // shared predictor never mixes routing history across layers.
-                if let Some(pf) = &self.prefetch {
-                    let base = (l * ne) as ExpertId;
-                    let used: Vec<ExpertId> =
-                        ranked.iter().map(|&(e, _)| base + e as ExpertId).collect();
-                    let predicted = pf.observe_step(&kv.last_experts, &used, &kv.last_predicted);
-                    kv.last_predicted = predicted;
-                    kv.last_experts = used;
-                }
+            let mut ranked: Vec<(usize, f32)> = scores.iter().copied().enumerate().collect();
+            ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+            ranked.truncate(k);
+            let sum: f32 = ranked.iter().map(|(_, w)| w).sum();
+            let norm = if sum > 0.0 { 1.0 / sum } else { 1.0 / k as f32 };
+            for (_, w) in ranked.iter_mut() {
+                *w *= norm;
+            }
 
-                // Run only the chosen experts and blend by weight. Under mmap, this is
-                // the only place a token touches expert weights — top-k of ne per layer.
-                let mut out = vec![0.0; d];
-                for (e, w) in ranked {
-                    let y = self.expert(gate, up, down, e, h)?;
-                    simd::add_scaled(&mut out, &y, w * norm);
-                }
-                Ok(out)
+            if let Some(pf) = &self.prefetch {
+                let base = (l * ne) as ExpertId;
+                let used: Vec<ExpertId> =
+                    ranked.iter().map(|&(e, _)| base + e as ExpertId).collect();
+                let predicted = pf.observe_step(&kv.last_experts, &used, &kv.last_predicted);
+                kv.last_predicted = predicted;
+                kv.last_experts = used;
+            }
+            picks.push(ranked);
+        }
+
+        // Invert the routing: which tokens each expert owes an answer to.
+        let mut members: Vec<Vec<(usize, f32)>> = vec![Vec::new(); ne];
+        for (t, ranked) in picks.iter().enumerate() {
+            for &(e, w) in ranked {
+                members[e].push((t, w));
             }
         }
+
+        let mut out = vec![0.0; n * d];
+        let mut gathered = Vec::new();
+        let mut expert_out = Vec::new();
+        for (e, tokens) in members.iter().enumerate() {
+            if tokens.is_empty() {
+                continue;
+            }
+            gathered.clear();
+            for &(t, _) in tokens {
+                gathered.extend_from_slice(&hs[t * d..(t + 1) * d]);
+            }
+            expert_out.clear();
+            expert_out.resize(tokens.len() * d, 0.0);
+            self.expert_batch(w, e, &gathered, tokens.len(), &mut expert_out)?;
+
+            for (i, &(t, w)) in tokens.iter().enumerate() {
+                simd::add_scaled(
+                    &mut out[t * d..(t + 1) * d],
+                    &expert_out[i * d..(i + 1) * d],
+                    w,
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    /// `down_e(silu(gate_e·h) ⊙ (up_e·h))` for `n` hidden states at once, the batched
+    /// twin of [`Self::expert`]. `out` is `n * d_model`, vector-major.
+    fn expert_batch(
+        &self,
+        w: Swiglu<'_>,
+        e: usize,
+        hs: &[f32],
+        n: usize,
+        out: &mut [f32],
+    ) -> Result<(), GarudaError> {
+        let (d, f) = (self.cfg.d_model, self.cfg.d_ff);
+        let mut g = vec![0.0; n * f];
+        let mut u = vec![0.0; n * f];
+        w.gate.matmul_expert(e, f, hs, n, &mut g)?;
+        w.up.matmul_expert(e, f, hs, n, &mut u)?;
+        // SwiGLU is elementwise, so the whole batch is one pass.
+        simd::silu(&mut g);
+        simd::mul_assign(&mut g, &u);
+        debug_assert_eq!(out.len(), n * d);
+        w.down.matmul_expert(e, d, &g, n, out)
     }
 }
 
@@ -758,9 +871,7 @@ impl InferenceBackend for LlamaBackend {
             // same order. What changes is which weights are hot: see PREFILL_CHUNK.
             for l in 0..self.cfg.n_layers {
                 let kv = seq.layer(l);
-                for x in xs.iter_mut() {
-                    self.block(l, x, kv)?;
-                }
+                self.layer_batch(l, &mut xs, kv)?;
             }
             last = xs.pop();
         }
