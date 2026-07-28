@@ -2,6 +2,51 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.18.0] - 2026-07-29
+
+Chunked prefill. Continuous batching made one problem sharper: a newly admitted
+request absorbed its whole prompt before the next decode step, so one long prompt
+froze every client already streaming for as long as it took.
+
+### Added
+
+- **Prefill goes in a piece at a time, interleaved with decoding.** A request now
+  enters a pending state and absorbs `PREFILL_TOKENS_PER_STEP` (32) prompt tokens per
+  scheduler iteration while the decode batch keeps running, joining it once the
+  prompt is in. With nothing else decoding the whole prompt goes in at once — there
+  is no one to stall.
+
+  Measured with two clients streaming while a 1474-token prompt arrives (that prompt
+  alone takes 14.5 s to prefill), worst inter-token gap the streamers see, three runs:
+
+  | | worst gap |
+  |---|---|
+  | before | 14.0 s / 13.2 s / 12.9 s |
+  | after | 0.57 s / 0.52 s / 0.55 s |
+
+  So roughly **24× less**, and what remains is about one chunk's worth of work, as
+  expected. The constant trades that residual hitch against scheduling overhead and
+  against how much a layer's weights are amortised inside the backend's own prefill
+  batching; 32 keeps most of both.
+
+- `InferenceRuntime::start_incremental` / `advance_prefill` / `finish_prefill`, the
+  pieces that make a prompt interruptible. `start` is now written in terms of them,
+  so the two paths cannot drift.
+
+### Changed
+
+- Prefill uses `hidden` rather than `logits`. The prefix's logits were always thrown
+  away, so the output head was a `vocab x d_model` matmul computed for nothing.
+- Cancellation and timeouts are checked between prefill chunks too, so a client that
+  hangs up during a long prompt stops it instead of paying for the rest.
+
+### Tests
+
+- Absorbing a prompt three tokens at a time must build exactly the session absorbing
+  it in one pass builds. The test uses two runtimes deliberately: sharing one would
+  let the first run populate the prompt cache and the second hit it, testing nothing
+  — which is what an assertion in the test caught when it was first written.
+
 ## [0.17.0] - 2026-07-29
 
 Continuous batching. Concurrent requests now decode in one pass over the weights

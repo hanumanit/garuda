@@ -53,6 +53,7 @@ the streaming, the cancellation, the load shedding.
 | Paged KV cache with disk spill (multi-layer, GQA-aware) | Real, tested — pair spilling with `sliding_window`; under full attention every step reads the whole prefix, so a spilled block is reloaded the moment it is written. Garuda warns at startup when the configuration would do that |
 | Scheduler (priority, concurrency limits, cancellation, timeouts, backpressure) | Real, tested |
 | Continuous batching — concurrent requests decode in one pass over the weights | Real, tested — ~1.6–1.8× aggregate throughput and about half the median latency at 8 concurrent, measured against one task per request |
+| Chunked prefill — a long prompt does not stall the clients already streaming | Real, tested — the worst inter-token gap a streamer sees while a 1474-token prompt is absorbed drops from ~13 s to ~0.5 s |
 | OpenAI + Ollama + Anthropic + llama.cpp + TGI APIs, SSE / NDJSON / WebSocket | Real, tested |
 | Dequantisation: F32 / F16 / Q4_0 / Q8_0 / Q2_K–Q6_K | Real, tested (runs Q2_K…Q5_K_M models) |
 | Memory-mapped packed weights (`mmap = true`), incl. per-expert streaming | Real, tested (~6× less RAM, same output) |
@@ -310,10 +311,10 @@ registered in `Engine::build` — see **[PLUGIN.md](PLUGIN.md)** and
   are refused rather than run.
 - **Architectures beyond Llama.** `LlamaBackend` covers the Llama family (dense and
   MoE, GQA). Other architectures each need their own `InferenceBackend`.
-- **Prefill and decode in the same batch.** The scheduler batches decode across
-  requests, and prefill within one, but a newly admitted request still prefills on
-  its own before joining the decode batch. Interleaving the two (chunked prefill)
-  would smooth the latency spike a long prompt causes for everyone already decoding.
+- **Prefill chunks sized against the decode batch.** Prefill is interleaved with
+  decoding, but at a fixed 32 tokens per step. Sizing each chunk against what the
+  current batch actually costs would keep the interleave balanced across model sizes
+  instead of relying on one constant.
 
 ---
 
