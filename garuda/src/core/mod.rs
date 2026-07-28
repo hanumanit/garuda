@@ -279,7 +279,7 @@ pub trait InferenceBackend: Send + Sync {
     fn logits_batch(
         &self,
         contexts: &[&[Token]],
-        seqs: &mut [crate::cache::SeqState],
+        seqs: &mut [&mut crate::cache::SeqState],
     ) -> Result<Vec<Tensor>, GarudaError> {
         if contexts.len() != seqs.len() {
             return Err(GarudaError::Inference(format!(

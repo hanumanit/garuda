@@ -975,7 +975,7 @@ impl InferenceBackend for LlamaBackend {
     fn logits_batch(
         &self,
         contexts: &[&[Token]],
-        seqs: &mut [SeqState],
+        seqs: &mut [&mut SeqState],
     ) -> Result<Vec<Tensor>, GarudaError> {
         if contexts.len() != seqs.len() {
             return Err(GarudaError::Inference(format!(
@@ -1478,7 +1478,9 @@ mod tests {
             .collect();
 
         let refs: Vec<&[Token]> = stepped.iter().map(|c| c.as_slice()).collect();
-        let batched = backend.logits_batch(&refs, &mut batch_seqs).unwrap();
+        let mut batch_refs: Vec<&mut SeqState> = batch_seqs.iter_mut().collect();
+        let batched = backend.logits_batch(&refs, &mut batch_refs).unwrap();
+        drop(batch_refs);
 
         assert_eq!(batched.len(), alone.len());
         for (i, (b, a)) in batched.iter().zip(&alone).enumerate() {
@@ -1503,7 +1505,8 @@ mod tests {
         ];
 
         // Both sequences start empty, so they have 3 and 5 tokens to consume: ragged.
-        let mut seqs = [seq_for(&backend), seq_for(&backend)];
+        let mut owned = [seq_for(&backend), seq_for(&backend)];
+        let mut seqs: Vec<&mut SeqState> = owned.iter_mut().collect();
         let got = backend
             .logits_batch(&[a.as_slice(), b.as_slice()], &mut seqs)
             .unwrap();
@@ -1517,7 +1520,8 @@ mod tests {
     fn logits_batch_rejects_mismatched_lengths_and_bad_tokens() {
         let backend = LlamaBackend::load(&build_moe_gguf(ExpertLayout::Merged)).unwrap();
         let c: Vec<Token> = vec![1, 2];
-        let mut seqs = [seq_for(&backend), seq_for(&backend)];
+        let mut owned = [seq_for(&backend), seq_for(&backend)];
+        let mut seqs: Vec<&mut SeqState> = owned.iter_mut().collect();
 
         assert!(
             backend.logits_batch(&[c.as_slice()], &mut seqs).is_err(),
@@ -1525,8 +1529,8 @@ mod tests {
         );
 
         // Bring both to the same length, then step with an out-of-vocabulary token.
-        backend.logits(&c, &mut seqs[0]).unwrap();
-        backend.logits(&c, &mut seqs[1]).unwrap();
+        backend.logits(&c, seqs[0]).unwrap();
+        backend.logits(&c, seqs[1]).unwrap();
         let bad: Vec<Token> = vec![1, 2, backend.config().vocab as Token + 3];
         let err = backend
             .logits_batch(&[bad.as_slice(), bad.as_slice()], &mut seqs)

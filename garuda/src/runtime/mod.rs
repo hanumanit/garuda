@@ -383,6 +383,118 @@ impl InferenceRuntime {
         }
         Ok(token)
     }
+
+    /// One decode step for several sequences at once, one result each in order.
+    ///
+    /// The sequences are independent — separate caches, separate samplers, separate
+    /// budgets — so this produces exactly what stepping each one alone produces. What
+    /// it buys is that they share a single pass over the weights, which for a large
+    /// model is most of the cost of a token.
+    ///
+    /// Sessions that are already finished, out of budget or out of context never
+    /// reach the backend; only the live ones are batched.
+    pub fn next_token_batch(
+        &self,
+        sessions: &mut [&mut Session],
+        params: &[SamplingParams],
+    ) -> Vec<Result<Token, StopReason>> {
+        let n = sessions.len();
+        debug_assert_eq!(n, params.len());
+
+        // Decide who is still running, and retire the rest, before any work.
+        let mut stopped: Vec<Option<StopReason>> = Vec::with_capacity(n);
+        for (s, p) in sessions.iter_mut().zip(params) {
+            stopped.push(if s.finished {
+                Some(StopReason::Length)
+            } else if s.generated() >= p.max_tokens {
+                s.finished = true;
+                Some(StopReason::Length)
+            } else if s.context.len() >= self.max_context {
+                s.finished = true;
+                Some(StopReason::ContextFull)
+            } else {
+                None
+            });
+        }
+
+        let mut contexts: Vec<&[Token]> = Vec::new();
+        let mut seqs: Vec<&mut crate::cache::SeqState> = Vec::new();
+        let mut live: Vec<usize> = Vec::new();
+        for (i, s) in sessions.iter_mut().enumerate() {
+            if stopped[i].is_some() {
+                continue;
+            }
+            // Disjoint fields of the same session: the context is read while the
+            // cache is written, which is the whole shape of a decode step.
+            let Session { context, seq, .. } = &mut **s;
+            contexts.push(context.as_slice());
+            seqs.push(seq);
+            live.push(i);
+        }
+
+        if live.is_empty() {
+            return stopped
+                .into_iter()
+                .map(|r| Err(r.expect("all stopped")))
+                .collect();
+        }
+
+        let batched = self.backend.logits_batch(&contexts, &mut seqs);
+        drop(contexts);
+        drop(seqs);
+
+        let logits = match batched {
+            Ok(l) => l,
+            Err(e) => {
+                // One bad sequence must not be reported as everyone's failure, and a
+                // batch is only ever an optimisation — so fall back to stepping each
+                // live sequence alone, which attributes the error where it belongs.
+                tracing::warn!(error = %e, "batched forward failed; stepping individually");
+                let mut out: Vec<Option<Result<Token, StopReason>>> = vec![None; n];
+                for (i, r) in stopped.iter().enumerate() {
+                    if let Some(reason) = r {
+                        out[i] = Some(Err(*reason));
+                    }
+                }
+                for &i in &live {
+                    out[i] = Some(self.next_token(sessions[i], &params[i]));
+                }
+                return out
+                    .into_iter()
+                    .map(|r| r.expect("every slot filled"))
+                    .collect();
+            }
+        };
+
+        let mut out: Vec<Option<Result<Token, StopReason>>> = vec![None; n];
+        for (i, r) in stopped.iter().enumerate() {
+            if let Some(reason) = r {
+                out[i] = Some(Err(*reason));
+            }
+        }
+        for (k, &i) in live.iter().enumerate() {
+            let s = &mut *sessions[i];
+            out[i] = Some(match sample(&logits[k], &params[i], &mut s.rng) {
+                Ok(token) => {
+                    s.context.push(token);
+                    if token == self.tokenizer.eos() {
+                        s.finished = true;
+                        Err(StopReason::Eos)
+                    } else {
+                        Ok(token)
+                    }
+                }
+                Err(e) => {
+                    s.finished = true;
+                    tracing::warn!(error = %e, "sampling failed");
+                    Err(StopReason::ContextFull)
+                }
+            });
+        }
+        out.into_iter()
+            .map(|r| r.expect("every slot filled"))
+            .collect()
+    }
 }
 
 #[cfg(test)]

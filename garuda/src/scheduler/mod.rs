@@ -296,18 +296,35 @@ impl Scheduler {
     }
 }
 
-/// Pull requests into a priority heap and dispatch them as decode slots free up.
+/// A request that has been admitted and is now decoding.
+struct Active {
+    request: Request,
+    session: crate::runtime::Session,
+    deadline: Instant,
+}
+
+/// Pull requests into a priority heap, admit up to `max_concurrent` of them, and
+/// step every admitted sequence together.
+///
+/// The sequences share one pass over the weights per step, which for a large model
+/// is most of what a token costs — so `max_concurrent` concurrent requests cost far
+/// less than `max_concurrent` times one. With `max_concurrent = 1` the batch is
+/// always a single sequence and this is exactly what it replaced.
 async fn run_loop(
     mut rx: mpsc::Receiver<Queued>,
     runtime: Arc<InferenceRuntime>,
     scheduler: Arc<Scheduler>,
     config: SchedulerConfig,
 ) {
-    let slots = Arc::new(Semaphore::new(config.max_concurrent.max(1)));
+    let max_active = config.max_concurrent.max(1);
     let mut heap: BinaryHeap<Queued> = BinaryHeap::new();
+    let mut active: Vec<Active> = Vec::new();
 
     loop {
-        if heap.is_empty() {
+        // Only ever block when there is genuinely nothing to do. Waiting here rather
+        // than admitting eagerly is what gives priority its meaning: the heap keeps
+        // filling while the current batch decodes.
+        if active.is_empty() && heap.is_empty() {
             match rx.recv().await {
                 Some(q) => heap.push(q),
                 None => break, // All senders dropped: the scheduler is gone.
@@ -317,92 +334,154 @@ async fn run_loop(
             heap.push(q);
         }
 
-        // Waiting here — rather than spawning immediately — is what gives priority
-        // its meaning: the heap keeps filling while we wait for a slot.
-        let Ok(slot) = slots.clone().acquire_owned().await else {
-            break;
-        };
-
-        // Drain again: a high-priority request that arrived while we waited should
-        // be considered before we commit to the head of the heap.
-        while let Ok(q) = rx.try_recv() {
-            heap.push(q);
+        // Drop queued requests whose client has already gone, rather than waiting for
+        // a decode slot to free up first. Their user's concurrency permit lives
+        // inside the entry, so holding a dead request holds a live caller's slot —
+        // which is how a burst of disconnects used to lock a user out. Re-collecting
+        // restores the heap order.
+        if heap
+            .iter()
+            .any(|q| q.request.cancel.is_cancelled() || q.request.events.is_closed())
+        {
+            let counters = &scheduler.counters;
+            heap = heap
+                .drain()
+                .filter(|q| {
+                    let gone = q.request.cancel.is_cancelled() || q.request.events.is_closed();
+                    if gone {
+                        counters.cancelled.fetch_add(1, Ordering::Relaxed);
+                    }
+                    !gone
+                })
+                .collect();
         }
 
-        let Some(Queued { request, .. }) = heap.pop() else {
-            continue;
-        };
-
-        // Cancelled or abandoned while queued: skip it. Dropping `request` returns
-        // the user's permit.
-        if request.cancel.is_cancelled() || request.events.is_closed() {
-            scheduler.counters.cancelled.fetch_add(1, Ordering::Relaxed);
-            continue;
+        let mut admit = Vec::new();
+        while active.len() + admit.len() < max_active {
+            let Some(Queued { request, .. }) = heap.pop() else {
+                break;
+            };
+            // Cancelled or abandoned while queued: skip it. Dropping `request`
+            // returns the user's permit.
+            if request.cancel.is_cancelled() || request.events.is_closed() {
+                scheduler.counters.cancelled.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            admit.push(request);
         }
 
-        let runtime = runtime.clone();
-        let scheduler = scheduler.clone();
-        tokio::task::spawn_blocking(move || {
-            let _slot = slot; // released when this task ends
-            generate(runtime, scheduler, request);
-        });
+        // Admission prefills and the step is a forward pass: both are CPU-bound and
+        // must not run on an async executor thread.
+        let rt = runtime.clone();
+        let sch = scheduler.clone();
+        let joined = tokio::task::spawn_blocking(move || {
+            let mut active = active;
+            for request in admit {
+                admit_one(&rt, &sch, &mut active, request);
+            }
+            step_batch(&rt, &sch, &mut active);
+            active
+        })
+        .await;
+
+        active = match joined {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!(error = %e, "decode worker died; dropping its batch");
+                Vec::new()
+            }
+        };
     }
 }
 
-/// Drive one request to completion. Runs on a blocking worker: the forward pass is
-/// CPU-bound and must not sit on an async executor thread.
-fn generate(runtime: Arc<InferenceRuntime>, scheduler: Arc<Scheduler>, request: Request) {
-    let Request {
-        id,
-        spec,
-        events,
-        cancel,
-        submitted,
-        _user_permit,
-    } = request;
+/// Start one admitted request's sequence, or report why it could not start.
+fn admit_one(
+    runtime: &InferenceRuntime,
+    scheduler: &Scheduler,
+    active: &mut Vec<Active>,
+    request: Request,
+) {
+    match runtime.start(&request.spec.prompt, &request.spec.params) {
+        Ok(session) => {
+            let deadline = request.submitted + request.spec.timeout;
+            active.push(Active {
+                request,
+                session,
+                deadline,
+            });
+        }
+        Err(e) => {
+            scheduler.counters.failed.fetch_add(1, Ordering::Relaxed);
+            let _ = request.events.send(StreamEvent::Error(e));
+        }
+    }
+}
 
-    let deadline = submitted + spec.timeout;
+/// Advance every active sequence by one token, retiring those that are done.
+fn step_batch(runtime: &InferenceRuntime, scheduler: &Scheduler, active: &mut Vec<Active>) {
     let counters = &scheduler.counters;
 
-    let mut session = match runtime.start(&spec.prompt, &spec.params) {
-        Ok(s) => s,
-        Err(e) => {
-            counters.failed.fetch_add(1, Ordering::Relaxed);
-            let _ = events.send(StreamEvent::Error(e));
-            return;
-        }
-    };
-
-    loop {
-        if cancel.is_cancelled() {
+    // Cancellation and timeouts are checked between tokens, so a dropped client stops
+    // the work rather than paying for it to finish.
+    let now = Instant::now();
+    active.retain(|a| {
+        if a.request.cancel.is_cancelled() {
             counters.cancelled.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(request = %id, "cancelled");
-            let _ = events.send(StreamEvent::Error(GarudaError::Cancelled));
-            return;
+            tracing::debug!(request = %a.request.id, "cancelled");
+            let _ = a
+                .request
+                .events
+                .send(StreamEvent::Error(GarudaError::Cancelled));
+            return false;
         }
-        if Instant::now() >= deadline {
+        // A closed receiver means the client is gone. Stop; do not spend the rest of
+        // the budget generating tokens nobody will read.
+        if a.request.events.is_closed() {
+            counters.cancelled.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        if now >= a.deadline {
             counters.timed_out.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(request = %id, "timed out");
-            let _ = events.send(StreamEvent::Error(GarudaError::Timeout));
-            return;
+            tracing::debug!(request = %a.request.id, "timed out");
+            let _ = a
+                .request
+                .events
+                .send(StreamEvent::Error(GarudaError::Timeout));
+            return false;
         }
+        true
+    });
+    if active.is_empty() {
+        return;
+    }
 
-        match runtime.next_token(&mut session, &spec.params) {
+    let params: Vec<SamplingParams> = active.iter().map(|a| a.request.spec.params).collect();
+    let mut sessions: Vec<&mut crate::runtime::Session> =
+        active.iter_mut().map(|a| &mut a.session).collect();
+    let outcomes = runtime.next_token_batch(&mut sessions, &params);
+    drop(sessions);
+
+    let mut done = Vec::with_capacity(outcomes.len());
+    for (a, outcome) in active.iter().zip(outcomes) {
+        done.push(match outcome {
             Ok(token) => {
-                // A closed receiver means the client is gone. Stop; do not spend the
-                // rest of the budget generating tokens nobody will read.
-                if events.send(StreamEvent::Token(token)).is_err() {
+                if a.request.events.send(StreamEvent::Token(token)).is_err() {
                     counters.cancelled.fetch_add(1, Ordering::Relaxed);
-                    return;
+                    true
+                } else {
+                    false
                 }
             }
             Err(reason) => {
                 counters.completed.fetch_add(1, Ordering::Relaxed);
-                let _ = events.send(StreamEvent::Done(reason));
-                return;
+                let _ = a.request.events.send(StreamEvent::Done(reason));
+                true
             }
-        }
+        });
     }
+
+    let mut keep = done.into_iter().map(|d| !d);
+    active.retain(|_| keep.next().expect("one flag per active request"));
 }
 
 #[cfg(test)]
@@ -518,14 +597,23 @@ mod tests {
             },
         );
 
-        for _ in 0..20 {
-            let h = s
-                .submit(spec("victim", "a long prompt to generate from", 64))
-                .unwrap();
-            // Read one event, then walk away — exactly what a disconnecting client does.
-            drop(h);
+        // Disconnect as fast as the limiter allows. A `RateLimit` in here is the
+        // documented answer while the user already has `max_concurrent_per_user` in
+        // flight, and how quickly a permit comes back is a timing detail — the bug
+        // being pinned is not that, it is never recovering at all.
+        let mut disconnects = 0;
+        for _ in 0..2000 {
+            if let Ok(h) = s.submit(spec("victim", "a long prompt to generate from", 64)) {
+                // Take the response and walk away, exactly as a disconnecting client does.
+                drop(h);
+                disconnects += 1;
+                if disconnects == 20 {
+                    break;
+                }
+            }
             tokio::task::yield_now().await;
         }
+        assert_eq!(disconnects, 20, "never got 20 requests in to disconnect");
 
         // Give the workers a moment to notice and release.
         for _ in 0..200 {
@@ -631,6 +719,56 @@ mod tests {
             assert!(extra < 500, "cancellation was ignored");
         }
         assert!(s.stats().cancelled >= 1);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn concurrent_requests_decode_together_and_each_gets_its_own_answer() {
+        // The batching loop steps every admitted sequence in one pass. Sharing that
+        // pass must not let sequences bleed into one another: each has its own cache,
+        // sampler and budget, so a pinned seed must still reproduce what it produces
+        // alone.
+        let (rt, dir) = runtime("batched");
+        let s = Scheduler::new(
+            rt,
+            SchedulerConfig {
+                max_concurrent: 4,
+                ..Default::default()
+            },
+        );
+
+        // Run one alone first to get the reference answer.
+        let solo = collect(s.submit(spec("u0", "alpha", 8)).unwrap()).await.0;
+
+        // Now the same request alongside three different ones, so it is decoded as
+        // part of a batch rather than by itself.
+        let mut handles = vec![("alpha", s.submit(spec("u0", "alpha", 8)).unwrap())];
+        for (i, prompt) in ["beta", "gamma", "delta"].iter().enumerate() {
+            handles.push((
+                *prompt,
+                s.submit(spec(&format!("u{}", i + 1), prompt, 8)).unwrap(),
+            ));
+        }
+
+        let mut outputs = Vec::new();
+        for (name, h) in handles {
+            let (tokens, last) = collect(h).await;
+            assert!(
+                matches!(last, Some(StreamEvent::Done(_))),
+                "{name}: {last:?}"
+            );
+            outputs.push((name, tokens));
+        }
+
+        let batched_alpha = &outputs.iter().find(|(n, _)| *n == "alpha").unwrap().1;
+        assert_eq!(
+            *batched_alpha, solo,
+            "a sequence decoded in a batch differs from the same one decoded alone"
+        );
+        // And the different prompts did not all collapse to the same answer.
+        let beta = &outputs.iter().find(|(n, _)| *n == "beta").unwrap().1;
+        assert_ne!(beta, batched_alpha, "two prompts produced identical output");
 
         let _ = std::fs::remove_dir_all(dir);
     }
