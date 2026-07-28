@@ -102,10 +102,16 @@ pub fn softmax(x: &mut [f32]) {
         *v = (*v - max).exp();
         sum += *v;
     }
-    if sum > 0.0 {
+    if sum.is_finite() && sum > 0.0 {
         let inv = 1.0 / sum;
         x.iter_mut().for_each(|v| *v *= inv);
+        return;
     }
+    // A finite maximum alongside a NaN elsewhere poisons the sum without tripping
+    // the check above, which would leave NaNs in the distribution for the sampler
+    // to rank. Uniform is the same answer the fully-masked case gets.
+    let uniform = 1.0 / x.len() as f32;
+    x.iter_mut().for_each(|v| *v = uniform);
 }
 
 /// SiLU / swish: `x * sigmoid(x)`, in place.
@@ -216,6 +222,17 @@ mod tests {
         softmax(&mut masked);
         assert!(masked.iter().all(|v| v.is_finite()));
         assert!((masked.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_nan_beside_a_finite_maximum_does_not_survive() {
+        // The `!max.is_finite()` guard misses this: `max` is 2.0, so the fast path
+        // runs, the NaN propagates into `sum`, and the old `sum > 0.0` check just
+        // skipped normalising and left the NaN in place for the sampler to rank.
+        let mut x = vec![1.0, f32::NAN, 2.0];
+        softmax(&mut x);
+        assert!(x.iter().all(|v| v.is_finite()), "got {x:?}");
+        assert!((x.iter().sum::<f32>() - 1.0).abs() < 1e-5);
     }
 
     #[test]

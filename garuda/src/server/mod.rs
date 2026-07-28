@@ -48,6 +48,27 @@ impl Engine {
         }
     }
 
+    /// Warn when the KV cache is configured to spill under full attention.
+    ///
+    /// Attention over the whole context has to read every earlier position, so each
+    /// decode step calls `ensure_resident(0, len)` and pulls the entire spilled
+    /// prefix back into RAM — which the next `append` then spills out again. The
+    /// spill is undone and redone once per token, turning disk I/O quadratic in
+    /// sequence length. A sliding window bounds what has to be resident and makes
+    /// spilling behave; without one, `kv_resident_blocks` has to cover the context.
+    fn warn_if_kv_spill_thrashes(kv: &KvConfig) {
+        let blocks = kv.max_positions.div_ceil(kv.dims.block_size.max(1));
+        if kv.storage.is_some() && kv.sliding_window.is_none() && kv.max_resident_blocks < blocks {
+            tracing::warn!(
+                kv_resident_blocks = kv.max_resident_blocks,
+                blocks_for_full_context = blocks,
+                "a full-context sequence will spill and immediately reload its KV cache every \
+                 token; set model.sliding_window, or raise memory.kv_resident_blocks to at \
+                 least {blocks}, or set memory.kv_spill = false"
+            );
+        }
+    }
+
     /// Somewhere for the KV cache to spill. Without it a sequence is still bounded by
     /// the context window; it just holds all of it in RAM.
     fn kv_storage(config: &AppConfig) -> anyhow::Result<Option<Arc<dyn StorageBackend>>> {
@@ -127,6 +148,7 @@ impl Engine {
             sliding_window: config.sliding_window(),
             storage: Self::kv_storage(config)?,
         };
+        Self::warn_if_kv_spill_thrashes(&kv);
 
         let runtime = Arc::new(InferenceRuntime::new(
             tokenizer,
@@ -198,6 +220,7 @@ impl Engine {
             config.sliding_window(),
             Self::kv_storage(config)?,
         );
+        Self::warn_if_kv_spill_thrashes(&kv);
 
         let runtime = Arc::new(InferenceRuntime::new(
             Arc::new(Tokenizer::new()),

@@ -274,9 +274,13 @@ struct Layer {
 
 pub struct LlamaBackend {
     cfg: LlamaConfig,
-    token_embd: Weight,
+    /// `Arc` because a checkpoint with tied embeddings uses this same matrix as its
+    /// output head. Without the sharing, the non-mmap path dequantised
+    /// `token_embd.weight` twice into two independent `f32` buffers — over a
+    /// gigabyte of duplication on a tied model with a large vocabulary.
+    token_embd: Arc<Weight>,
     output_norm: Vec<f32>,
-    output: Weight,
+    output: Arc<Weight>,
     layers: Vec<Layer>,
     prefetch: Option<Arc<crate::prefetch::PrefetchEngine>>,
 }
@@ -345,13 +349,16 @@ impl LlamaBackend {
             }
         };
 
-        let token_embd = weight("token_embd.weight", v, d)?;
+        let token_embd = Arc::new(weight("token_embd.weight", v, d)?);
         let output_norm = norm("output_norm.weight", d)?;
         // Some checkpoints tie the output head to the embeddings and omit `output`.
+        // Share the one already loaded rather than decoding the same tensor again:
+        // under mmap both would merely point into the same map, but on the f32 path a
+        // second `Weight::Full` is a second full copy of a `vocab x d_model` matrix.
         let output = if g.tensor("output.weight").is_some() {
-            weight("output.weight", v, d)?
+            Arc::new(weight("output.weight", v, d)?)
         } else {
-            weight("token_embd.weight", v, d)?
+            token_embd.clone()
         };
 
         let ne = cfg.n_experts;
@@ -418,15 +425,20 @@ impl LlamaBackend {
 
     /// True when weights are kept packed in a memory-mapped file.
     pub fn is_mmapped(&self) -> bool {
-        matches!(self.token_embd, Weight::Packed { .. })
+        matches!(*self.token_embd, Weight::Packed { .. })
     }
 
     /// The backing memory map, if this checkpoint was loaded with `mmap`.
     pub fn mmap(&self) -> Option<Arc<Mmap>> {
-        match &self.token_embd {
+        match &*self.token_embd {
             Weight::Packed { src, .. } => Some(src.clone()),
             Weight::Full { .. } => None,
         }
+    }
+
+    /// True when the output head is the embedding matrix rather than its own tensor.
+    pub fn has_tied_embeddings(&self) -> bool {
+        Arc::ptr_eq(&self.token_embd, &self.output)
     }
 
     /// Byte ranges in the backing mmap for every `(layer, expert)` pair's gate/up/
@@ -753,11 +765,24 @@ mod tests {
         Split,
     }
 
+    /// Whether the checkpoint ships its own `output.weight` or ties the output head
+    /// to `token_embd.weight` (which many real checkpoints do, and which is the case
+    /// that used to load the embedding matrix twice).
+    #[derive(Clone, Copy, PartialEq)]
+    enum Head {
+        Separate,
+        Tied,
+    }
+
+    fn build_moe_gguf(layout: ExpertLayout) -> Vec<u8> {
+        build_gguf(layout, Head::Separate)
+    }
+
     /// Build a tiny MoE llama GGUF (F32 weights) entirely in memory, in either
     /// expert tensor layout. Both layouts get identical numbers (each gate/up/down
     /// is generated once as a flat array and either kept whole or sliced per
     /// expert), so outputs from the two layouts can be compared directly.
-    fn build_moe_gguf(layout: ExpertLayout) -> Vec<u8> {
+    fn build_gguf(layout: ExpertLayout, head: Head) -> Vec<u8> {
         let (d, kv_dim, ff, nl, vocab, ne) = (32usize, 16usize, 32usize, 2usize, 64usize, 4usize);
 
         // (name, ne-order dims, data)
@@ -784,12 +809,14 @@ mod tests {
         s += 1;
         add("output_norm.weight".into(), vec![d as u64], s, &mut tensors);
         s += 1;
-        add(
-            "output.weight".into(),
-            vec![d as u64, vocab as u64],
-            s,
-            &mut tensors,
-        );
+        if head == Head::Separate {
+            add(
+                "output.weight".into(),
+                vec![d as u64, vocab as u64],
+                s,
+                &mut tensors,
+            );
+        }
         s += 1;
         for l in 0..nl {
             let p = |n: &str| format!("blk.{l}.{n}.weight");
@@ -1022,6 +1049,39 @@ mod tests {
         let a = merged.logits(&[3, 7, 1], &mut s1).unwrap();
         let b = split.logits(&[3, 7, 1], &mut s2).unwrap();
         assert_eq!(a.data(), b.data());
+    }
+
+    /// A checkpoint that omits `output.weight` uses the embedding matrix as its
+    /// output head. That must hold it exactly once: the loader used to call the
+    /// tensor reader a second time, producing an independent `f32` copy of a
+    /// `vocab x d_model` matrix — on a real tied model with a 128k vocabulary, a
+    /// gigabyte of duplicate weights.
+    #[test]
+    fn tied_embeddings_share_one_allocation_and_still_produce_the_same_logits() {
+        let tied = LlamaBackend::load(&build_gguf(ExpertLayout::Merged, Head::Tied)).unwrap();
+        assert!(tied.has_tied_embeddings(), "head should be tied");
+        assert!(
+            Arc::ptr_eq(&tied.token_embd, &tied.output),
+            "the tied head must be the same allocation, not a copy"
+        );
+
+        let separate =
+            LlamaBackend::load(&build_gguf(ExpertLayout::Merged, Head::Separate)).unwrap();
+        assert!(!separate.has_tied_embeddings());
+        assert!(!Arc::ptr_eq(&separate.token_embd, &separate.output));
+
+        // Sharing must not change the arithmetic: a tied head is still a real matvec
+        // against the embedding matrix.
+        let mut seq = seq_for(&tied);
+        let logits = tied.logits(&[3, 7, 1], &mut seq).unwrap();
+        assert_eq!(logits.shape(), &[tied.config().vocab]);
+        assert!(logits.data().iter().all(|v| v.is_finite()));
+
+        let mut naive = vec![0.0f32; tied.config().vocab];
+        let mut hidden_seq = seq_for(&tied);
+        let hidden = tied.hidden(&[3, 7, 1], &mut hidden_seq).unwrap();
+        tied.token_embd.matvec(hidden.data(), &mut naive).unwrap();
+        assert_eq!(logits.data(), &naive[..]);
     }
 
     /// A fresh, uniquely-named temp directory per call — tests run in parallel, and

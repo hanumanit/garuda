@@ -1,10 +1,11 @@
 //! GGUF reader: header, metadata key/values, and tensor descriptors.
 //!
 //! This parses the container faithfully — every length is bounds-checked against
-//! the buffer, so a malformed or hostile file produces an error rather than a
-//! panic. Tensor data is turned into `f32` by [`Gguf::tensor_f32`], which delegates
-//! the block formats to [`crate::quant`] (F32/F16/Q4_0/Q8_0 today; the k-quants
-//! `Q4_K`/`Q6_K`/… are still rejected).
+//! the buffer, and every count is bounded by what the remaining bytes could
+//! actually describe, so a malformed or hostile file produces an error rather than
+//! a panic or an outsized allocation. Tensor data is turned into `f32` by
+//! [`Gguf::tensor_f32`], which delegates the block formats to [`crate::quant`]
+//! (F32/F16, the linear quants Q4_0/Q8_0, and the k-quants Q2_K–Q6_K).
 //!
 //! Format reference: <https://github.com/ggml-org/ggml/blob/master/docs/gguf.md>
 
@@ -66,6 +67,15 @@ impl Value {
         match self {
             Value::Array(a) => Some(a),
             _ => None,
+        }
+    }
+
+    /// The value as a boolean. GGUF writers disagree on whether a flag is a `BOOL`
+    /// or an integer `0`/`1`, so both are accepted.
+    pub fn as_bool(&self) -> Option<bool> {
+        match *self {
+            Value::Bool(b) => Some(b),
+            _ => self.as_u64().map(|v| v != 0),
         }
     }
 }
@@ -176,14 +186,17 @@ impl<'a> Cursor<'a> {
                 let n = self.u64()?;
                 let n =
                     usize::try_from(n).map_err(|_| bad("array length does not fit in memory"))?;
-                // An array cannot have more elements than the file has bytes left.
-                if n > self.buf.len().saturating_sub(self.pos) {
+                // An array cannot hold more elements than the remaining bytes could
+                // encode, at this element type's minimum size.
+                let remaining = self.buf.len().saturating_sub(self.pos);
+                let min_bytes = min_value_bytes(elem_type);
+                if n > remaining / min_bytes.max(1) {
                     return Err(bad(format!(
                         "array of {n} elements overruns the {}-byte file",
                         self.buf.len()
                     )));
                 }
-                let mut items = Vec::with_capacity(n);
+                let mut items = Vec::with_capacity(reserve_for(n, remaining, min_bytes));
                 for _ in 0..n {
                     items.push(self.value(elem_type, depth + 1)?);
                 }
@@ -199,6 +212,34 @@ impl<'a> Cursor<'a> {
 
 fn bad(msg: impl Into<String>) -> GarudaError {
     GarudaError::Model(format!("gguf: {}", msg.into()))
+}
+
+/// Smallest number of file bytes one value of `type_id` can occupy. A nested array
+/// still costs its own 4-byte element type plus an 8-byte length, and a string its
+/// 8-byte length, so every type has a non-zero floor.
+fn min_value_bytes(type_id: u32) -> usize {
+    match type_id {
+        0 | 1 | 7 => 1, // u8 / i8 / bool
+        2 | 3 => 2,     // u16 / i16
+        4..=6 => 4,     // u32 / i32 / f32
+        8 => 8,         // string: u64 length, possibly empty
+        9 => 12,        // array: u32 element type + u64 length
+        10..=12 => 8,   // u64 / i64 / f64
+        _ => 1,         // unknown: `value` rejects it, so any floor will do
+    }
+}
+
+/// How much to reserve for `n` entries that each occupy at least `min_bytes` in the
+/// file, given `remaining` bytes left to read.
+///
+/// A count is attacker-controlled metadata: bounds-checking each *read* is not
+/// enough on its own, because `Vec::with_capacity` runs before any read does. An
+/// entry costing 1 byte on disk can cost 32–64 in memory, so reserving straight from
+/// a declared count lets a small file demand an allocation orders of magnitude
+/// larger than itself. Clamping to what the remaining bytes could describe keeps the
+/// reservation honest; a count that really is that large still fails, on the read.
+fn reserve_for(n: usize, remaining: usize, min_bytes: usize) -> usize {
+    n.min(remaining / min_bytes.max(1))
 }
 
 impl Gguf {
@@ -222,10 +263,18 @@ impl Gguf {
         let tensor_count = c.u64()?;
         let kv_count = c.u64()?;
 
-        // Each entry costs at least a few bytes, so a count larger than the file
-        // is a corrupt header. Reject it before allocating anything.
-        if tensor_count > data.len() as u64 || kv_count > data.len() as u64 {
-            return Err(bad("header counts exceed the file size"));
+        // A tensor descriptor costs at least 24 bytes on disk (8 name length + 4
+        // n_dims + 4 type + 8 offset) and a metadata entry at least 13 (8 key length
+        // + 4 type + 1 value). Bounding the counts by that — rather than by the raw
+        // file length — rejects a corrupt header before anything is allocated.
+        const MIN_TENSOR_BYTES: u64 = 24;
+        const MIN_KV_BYTES: u64 = 13;
+        let remaining = (data.len() - c.pos) as u64;
+        if tensor_count > remaining / MIN_TENSOR_BYTES || kv_count > remaining / MIN_KV_BYTES {
+            return Err(bad(format!(
+                "header claims {tensor_count} tensors and {kv_count} metadata entries, \
+                 more than the remaining {remaining} bytes can describe"
+            )));
         }
 
         let mut metadata = BTreeMap::new();
@@ -236,7 +285,11 @@ impl Gguf {
             metadata.insert(key, value);
         }
 
-        let mut tensors = Vec::with_capacity(tensor_count as usize);
+        let mut tensors = Vec::with_capacity(reserve_for(
+            tensor_count as usize,
+            data.len().saturating_sub(c.pos),
+            MIN_TENSOR_BYTES as usize,
+        ));
         for _ in 0..tensor_count {
             let name = c.string()?;
             let n_dims = c.u32()?;
@@ -318,9 +371,9 @@ impl Gguf {
 
     /// A tensor's contents as `f32`, dequantising if needed.
     ///
-    /// Handles F32, F16, Q4_0 and Q8_0 (see [`crate::quant`]). A tensor in an
-    /// unsupported format — the k-quants `Q4_K`/`Q6_K`/… — is a clear error rather
-    /// than garbage, because no super-block decoder exists yet.
+    /// Handles F32, F16, the linear quants Q4_0/Q8_0, and the k-quants Q2_K–Q6_K
+    /// (see [`crate::quant`]). A tensor in a format with no decoder yet — the `*_1`
+    /// linear quants, the IQ imatrix quants — is a clear error rather than garbage.
     pub fn tensor_f32(&self, file: &[u8], name: &str) -> Result<Vec<f32>, GarudaError> {
         let t = self
             .tensor(name)
@@ -510,6 +563,61 @@ mod tests {
         data.extend_from_slice(&u64::MAX.to_le_bytes()); // tensor_count
         data.extend_from_slice(&0u64.to_le_bytes());
         assert!(Gguf::parse(&data).is_err());
+    }
+
+    #[test]
+    fn a_count_the_remaining_bytes_cannot_describe_is_rejected_before_allocating() {
+        // The old bound was `count <= file length`, which a small file passes while
+        // still demanding a huge reservation: a `TensorInfo` costs far more in memory
+        // than the 24 bytes its descriptor costs on disk. These counts sit under the
+        // file length and must still be refused.
+        let body = vec![0u8; 4096];
+
+        let mut tensors = Vec::new();
+        tensors.extend_from_slice(MAGIC);
+        tensors.extend_from_slice(&3u32.to_le_bytes());
+        tensors.extend_from_slice(&2000u64.to_le_bytes()); // < 4096, but needs 48000 bytes
+        tensors.extend_from_slice(&0u64.to_le_bytes());
+        tensors.extend_from_slice(&body);
+        assert!(Gguf::parse(&tensors).is_err(), "tensor count not bounded");
+
+        let mut kvs = Vec::new();
+        kvs.extend_from_slice(MAGIC);
+        kvs.extend_from_slice(&3u32.to_le_bytes());
+        kvs.extend_from_slice(&0u64.to_le_bytes());
+        kvs.extend_from_slice(&2000u64.to_le_bytes()); // < 4096, but needs 26000 bytes
+        kvs.extend_from_slice(&body);
+        assert!(Gguf::parse(&kvs).is_err(), "kv count not bounded");
+    }
+
+    #[test]
+    fn an_arrays_declared_length_is_bounded_by_its_element_size() {
+        // An array of u64 needs 8 bytes per element; a length that only fits if each
+        // element were a single byte must be refused rather than reserved for.
+        let mut data = Vec::new();
+        data.extend_from_slice(MAGIC);
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes()); // no tensors
+        data.extend_from_slice(&1u64.to_le_bytes()); // one kv
+        data.extend_from_slice(&4u64.to_le_bytes());
+        data.extend_from_slice(b"toks");
+        data.extend_from_slice(&9u32.to_le_bytes()); // ARRAY
+        data.extend_from_slice(&10u32.to_le_bytes()); // of U64
+        data.extend_from_slice(&900u64.to_le_bytes()); // 7200 bytes needed
+        data.extend_from_slice(&[0u8; 1000]); // only 1000 available
+
+        let err = Gguf::parse(&data).unwrap_err();
+        assert!(err.to_string().contains("overruns"), "got: {err}");
+    }
+
+    #[test]
+    fn as_bool_accepts_both_the_bool_and_integer_encodings() {
+        // GGUF writers disagree; `tokenizer.ggml.add_bos_token` shows up as either.
+        assert_eq!(Value::Bool(true).as_bool(), Some(true));
+        assert_eq!(Value::Bool(false).as_bool(), Some(false));
+        assert_eq!(Value::U32(1).as_bool(), Some(true));
+        assert_eq!(Value::U8(0).as_bool(), Some(false));
+        assert_eq!(Value::String("yes".into()).as_bool(), None);
     }
 
     #[test]

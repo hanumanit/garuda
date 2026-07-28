@@ -115,15 +115,23 @@ pub fn sample(
         .enumerate()
         .map(|(i, &p)| (i as Token, p))
         .collect();
-    candidates.sort_by(|a, b| {
+
+    // Most likely first; ties break on token id so the order is a strict total
+    // order (ids are unique), which is what makes the selection below deterministic.
+    let by_likelihood = |a: &(Token, f32), b: &(Token, f32)| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.0.cmp(&b.0))
-    });
+    };
 
+    // Only the top-k survive, so partition to find them in O(vocab) rather than
+    // sorting all of it: at a real model's 32k vocabulary a full sort per token is
+    // ~480k comparisons to then throw all but 40 of the results away.
     if params.top_k > 0 && params.top_k < candidates.len() {
+        candidates.select_nth_unstable_by(params.top_k - 1, by_likelihood);
         candidates.truncate(params.top_k);
     }
+    candidates.sort_by(by_likelihood);
 
     if params.top_p < 1.0 {
         let mut cumulative = 0.0;
@@ -453,6 +461,58 @@ mod tests {
         for seed in 0..20 {
             let mut rng = Rng::new(seed);
             assert_eq!(sample(&logits, &p, &mut rng).unwrap(), 1);
+        }
+    }
+
+    #[test]
+    fn top_k_selection_picks_the_same_tokens_a_full_sort_would() {
+        // `sample` partitions instead of sorting the whole vocabulary. The surviving
+        // set, and the order within it, must be exactly what the old full sort gave.
+        let vocab = 4096;
+        let logits: Vec<f32> = (0..vocab)
+            .map(|i| ((i * 7919 % 1000) as f32 / 100.0).sin() * 6.0)
+            .collect();
+
+        let mut scaled = logits.clone();
+        crate::simd::softmax(&mut scaled);
+        let mut sorted: Vec<(Token, f32)> = scaled
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| (i as Token, p))
+            .collect();
+        sorted.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+
+        // top_k = 1 is the head of that ordering, whatever the seed.
+        let tensor = Tensor::vector(logits);
+        let p = SamplingParams {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 1,
+            max_tokens: 1,
+            seed: None,
+        };
+        for seed in 0..50 {
+            let mut rng = Rng::new(seed);
+            assert_eq!(sample(&tensor, &p, &mut rng).unwrap(), sorted[0].0);
+        }
+
+        // With a wider k, every token the sampler can reach must be inside the true
+        // top-k — the partition must not leak a lower-ranked token into the set.
+        let k = 40;
+        let allowed: std::collections::HashSet<Token> =
+            sorted[..k].iter().map(|&(t, _)| t).collect();
+        let p = SamplingParams { top_k: k, ..p };
+        for seed in 0..500 {
+            let mut rng = Rng::new(seed);
+            let t = sample(&tensor, &p, &mut rng).unwrap();
+            assert!(
+                allowed.contains(&t),
+                "sampled {t}, outside the true top-{k}"
+            );
         }
     }
 

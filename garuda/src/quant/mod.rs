@@ -753,7 +753,8 @@ mod tests {
     #[test]
     fn wrong_length_and_unsupported_type_are_errors() {
         assert!(dequantize(Q8_0, &[0u8; 10], 32).is_err()); // too short
-        assert!(dequantize(12, &[0u8; 100], 32).is_err()); // Q4_K unsupported
+        assert!(dequantize(Q4_K, &[0u8; 100], 32).is_err()); // 32 is not a Q4_K super-block
+        assert!(dequantize(3, &[0u8; 100], 32).is_err()); // Q4_1 has no decoder
         assert!(byte_size(Q8_0, 33).is_err()); // not a whole block
     }
 

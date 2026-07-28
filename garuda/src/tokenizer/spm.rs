@@ -140,7 +140,14 @@ impl SpmTokenizer {
             lookup,
             byte_token,
             unk: id("tokenizer.ggml.unknown_token_id", 0),
-            add_bos: true,
+            // Most llama checkpoints prepend BOS, but not all — and a model trained
+            // without it sees a token stream that does not match its training if one
+            // is added anyway. Honour the file's own flag; default to true, which is
+            // what the checkpoints that omit the key expect.
+            add_bos: g
+                .get("tokenizer.ggml.add_bos_token")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
         })
     }
 
@@ -477,6 +484,19 @@ mod tests {
         let mut ids = tk.encode("ab");
         ids.push(tk.eos());
         assert_eq!(tk.decode(&ids).unwrap(), "ab");
+    }
+
+    #[test]
+    fn add_bos_is_taken_from_the_checkpoint_not_assumed() {
+        let mut tk = toy();
+        assert_eq!(tk.encode("ab")[0], tk.bos(), "default should prepend BOS");
+
+        // A checkpoint that sets `add_bos_token = false` must not get one anyway:
+        // the model was trained on a stream without it.
+        tk.add_bos = false;
+        let ids = tk.encode("ab");
+        assert_ne!(ids[0], tk.bos(), "BOS was prepended against the flag");
+        assert_eq!(tk.decode(&ids).unwrap(), "ab", "text must be unchanged");
     }
 
     #[test]
