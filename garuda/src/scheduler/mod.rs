@@ -296,6 +296,26 @@ impl Scheduler {
     }
 }
 
+/// Prompt tokens one admitted request absorbs per scheduler iteration, while others
+/// are decoding.
+///
+/// Prefill is unbounded in a way decode is not — its cost is whatever prompt the
+/// caller sent. Absorbing a long one in a single burst stalls every request already
+/// streaming for its whole duration, which is precisely the latency spike batching
+/// was supposed to remove. Feeding it in a piece at a time bounds that stall to one
+/// piece; the cost is a little scheduling overhead per piece.
+///
+/// It only applies when something *is* decoding. With nothing else running there is
+/// no one to stall, so the prompt goes in whole.
+const PREFILL_TOKENS_PER_STEP: usize = 32;
+
+/// A request that has been admitted and whose prompt is still going in.
+struct Prefilling {
+    request: Request,
+    pending: crate::runtime::Pending,
+    deadline: Instant,
+}
+
 /// A request that has been admitted and is now decoding.
 struct Active {
     request: Request,
@@ -319,12 +339,13 @@ async fn run_loop(
     let max_active = config.max_concurrent.max(1);
     let mut heap: BinaryHeap<Queued> = BinaryHeap::new();
     let mut active: Vec<Active> = Vec::new();
+    let mut prefilling: Vec<Prefilling> = Vec::new();
 
     loop {
         // Only ever block when there is genuinely nothing to do. Waiting here rather
         // than admitting eagerly is what gives priority its meaning: the heap keeps
         // filling while the current batch decodes.
-        if active.is_empty() && heap.is_empty() {
+        if active.is_empty() && prefilling.is_empty() && heap.is_empty() {
             match rx.recv().await {
                 Some(q) => heap.push(q),
                 None => break, // All senders dropped: the scheduler is gone.
@@ -357,7 +378,7 @@ async fn run_loop(
         }
 
         let mut admit = Vec::new();
-        while active.len() + admit.len() < max_active {
+        while active.len() + prefilling.len() + admit.len() < max_active {
             let Some(Queued { request, .. }) = heap.pop() else {
                 break;
             };
@@ -375,38 +396,47 @@ async fn run_loop(
         let rt = runtime.clone();
         let sch = scheduler.clone();
         let joined = tokio::task::spawn_blocking(move || {
-            let mut active = active;
+            let (mut active, mut prefilling) = (active, prefilling);
             for request in admit {
-                admit_one(&rt, &sch, &mut active, request);
+                admit_one(&rt, &sch, &mut prefilling, request);
             }
+            // Nothing is streaming, so there is no one to stall: take the whole
+            // prompt rather than dribbling it in over many iterations.
+            let budget = if active.is_empty() {
+                usize::MAX
+            } else {
+                PREFILL_TOKENS_PER_STEP
+            };
+            advance_prefills(&rt, &sch, &mut prefilling, &mut active, budget);
             step_batch(&rt, &sch, &mut active);
-            active
+            (active, prefilling)
         })
         .await;
 
-        active = match joined {
-            Ok(a) => a,
+        (active, prefilling) = match joined {
+            Ok(pair) => pair,
             Err(e) => {
                 tracing::error!(error = %e, "decode worker died; dropping its batch");
-                Vec::new()
+                (Vec::new(), Vec::new())
             }
         };
     }
 }
 
-/// Start one admitted request's sequence, or report why it could not start.
+/// Accept one request, or report why it could not start. No forward pass happens
+/// here — the prompt goes in through [`advance_prefills`].
 fn admit_one(
     runtime: &InferenceRuntime,
     scheduler: &Scheduler,
-    active: &mut Vec<Active>,
+    prefilling: &mut Vec<Prefilling>,
     request: Request,
 ) {
-    match runtime.start(&request.spec.prompt, &request.spec.params) {
-        Ok(session) => {
+    match runtime.start_incremental(&request.spec.prompt, &request.spec.params) {
+        Ok(pending) => {
             let deadline = request.submitted + request.spec.timeout;
-            active.push(Active {
+            prefilling.push(Prefilling {
                 request,
-                session,
+                pending,
                 deadline,
             });
         }
@@ -415,6 +445,62 @@ fn admit_one(
             let _ = request.events.send(StreamEvent::Error(e));
         }
     }
+}
+
+/// Feed each pending prompt a little further, promoting the ones that finish.
+///
+/// Cancellation and timeouts are checked here too, so a client that hangs up during
+/// a long prefill stops it rather than paying for the rest of the prompt.
+fn advance_prefills(
+    runtime: &InferenceRuntime,
+    scheduler: &Scheduler,
+    prefilling: &mut Vec<Prefilling>,
+    active: &mut Vec<Active>,
+    budget: usize,
+) {
+    if prefilling.is_empty() {
+        return;
+    }
+    let counters = &scheduler.counters;
+    let now = Instant::now();
+    let mut still = Vec::with_capacity(prefilling.len());
+
+    for mut p in std::mem::take(prefilling) {
+        if p.request.cancel.is_cancelled() {
+            counters.cancelled.fetch_add(1, Ordering::Relaxed);
+            let _ = p
+                .request
+                .events
+                .send(StreamEvent::Error(GarudaError::Cancelled));
+            continue;
+        }
+        if p.request.events.is_closed() {
+            counters.cancelled.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        if now >= p.deadline {
+            counters.timed_out.fetch_add(1, Ordering::Relaxed);
+            let _ = p
+                .request
+                .events
+                .send(StreamEvent::Error(GarudaError::Timeout));
+            continue;
+        }
+
+        match runtime.advance_prefill(&mut p.pending, budget) {
+            Ok(true) => active.push(Active {
+                session: runtime.finish_prefill(p.pending),
+                request: p.request,
+                deadline: p.deadline,
+            }),
+            Ok(false) => still.push(p),
+            Err(e) => {
+                counters.failed.fetch_add(1, Ordering::Relaxed);
+                let _ = p.request.events.send(StreamEvent::Error(e));
+            }
+        }
+    }
+    *prefilling = still;
 }
 
 /// Advance every active sequence by one token, retiring those that are done.

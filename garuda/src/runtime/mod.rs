@@ -163,6 +163,31 @@ pub fn sample(
     Ok(candidates.last().expect("non-empty").0)
 }
 
+/// A sequence whose prompt is still going in.
+///
+/// Held between [`InferenceRuntime::start_incremental`] and
+/// [`InferenceRuntime::finish_prefill`], so a scheduler can absorb a long prompt in
+/// pieces rather than in one unbounded burst.
+#[derive(Debug)]
+pub struct Pending {
+    seq: SeqState,
+    /// The full prompt. Everything but its last token is prefilled.
+    context: Vec<Token>,
+    /// Prompt positions already in `seq`.
+    consumed: usize,
+    seed: u64,
+    /// Whether the finished prefix is worth caching — false for one that came *from*
+    /// the cache.
+    cache_on_finish: bool,
+}
+
+impl Pending {
+    /// Prompt tokens still to absorb before this can start decoding.
+    pub fn remaining(&self) -> usize {
+        (self.context.len() - 1).saturating_sub(self.consumed)
+    }
+}
+
 /// One in-flight sequence.
 #[derive(Debug)]
 pub struct Session {
@@ -260,7 +285,28 @@ impl InferenceRuntime {
     ///
     /// The prefix is what gets cached: the last token is always run fresh, because
     /// that is the step that produces the logits for the first sampled token.
+    ///
+    /// This absorbs the whole prompt before returning. A scheduler with other
+    /// requests already streaming wants [`Self::start_incremental`] instead, so a
+    /// long prompt does not stall them.
     pub fn start(&self, prompt: &[Token], params: &SamplingParams) -> Result<Session, GarudaError> {
+        let mut pending = self.start_incremental(prompt, params)?;
+        while !self.advance_prefill(&mut pending, usize::MAX)? {}
+        Ok(self.finish_prefill(pending))
+    }
+
+    /// Begin a sequence without absorbing the prompt yet.
+    ///
+    /// Prefill is the one part of serving a request whose cost is set by the caller:
+    /// a long prompt is many forward passes, and running them all before the next
+    /// decode step stalls every request already streaming. Returning the half-built
+    /// state lets a scheduler feed the prompt in a piece at a time and keep decoding
+    /// in between — see [`Self::advance_prefill`].
+    pub fn start_incremental(
+        &self,
+        prompt: &[Token],
+        params: &SamplingParams,
+    ) -> Result<Pending, GarudaError> {
         params.validate()?;
 
         if prompt.is_empty() {
@@ -277,34 +323,70 @@ impl InferenceRuntime {
         let seq_id = self.fresh_seq_id();
         let prefix = &prompt[..prompt.len() - 1];
 
-        let seq = if prefix.is_empty() {
-            SeqState::new(self.kv_template.clone(), seq_id)
+        // A `match` rather than an `else if let` chain: under the 2024 edition the
+        // latter would drop the `get` temporary at a different point, and the
+        // explicit form keeps the prompt-cache lookup scope unambiguous.
+        let (seq, consumed, cache_on_finish) = if prefix.is_empty() {
+            (SeqState::new(self.kv_template.clone(), seq_id), 0, false)
         } else {
-            // A `match` rather than an `else if let` chain: under the 2024 edition the
-            // latter would drop the `get` temporary at a different point, and the
-            // explicit form keeps the prompt-cache lookup scope unambiguous.
             match self.prompt_cache.get(prefix, seq_id) {
-                Some(cached) => cached,
-                None => {
-                    let mut fresh = SeqState::new(self.kv_template.clone(), seq_id);
-                    // Prefill. The logits from the prefix are not needed; the KV state is.
-                    self.backend.logits(prefix, &mut fresh)?;
-                    if !fresh.has_spill() {
-                        self.prompt_cache.insert(prefix, fresh.clone());
-                    }
-                    fresh
-                }
+                // A hit arrives with the whole prefix already in it, and re-inserting
+                // what was just read would be pure churn.
+                Some(cached) => (cached, prefix.len(), false),
+                None => (SeqState::new(self.kv_template.clone(), seq_id), 0, true),
             }
         };
 
-        let seed = params.seed.unwrap_or(seq_id);
-        Ok(Session {
+        Ok(Pending {
             seq,
             context: prompt.to_vec(),
-            prompt_len: prompt.len(),
-            rng: Rng::new(seed),
-            finished: false,
+            consumed,
+            seed: params.seed.unwrap_or(seq_id),
+            cache_on_finish,
         })
+    }
+
+    /// Absorb up to `max_tokens` more of a pending prompt. `Ok(true)` once it is all
+    /// in and the sequence is ready for [`Self::finish_prefill`].
+    ///
+    /// `usize::MAX` absorbs the rest in one call, which is what a scheduler with
+    /// nothing else running should do — there is no one to stall.
+    pub fn advance_prefill(
+        &self,
+        pending: &mut Pending,
+        max_tokens: usize,
+    ) -> Result<bool, GarudaError> {
+        let prefix_len = pending.context.len() - 1;
+        if pending.consumed >= prefix_len {
+            return Ok(true);
+        }
+
+        let target = prefix_len.min(pending.consumed.saturating_add(max_tokens.max(1)));
+        // `hidden` rather than `logits`: the prefix's logits are thrown away, so the
+        // output head would be a `vocab x d_model` matmul done for nothing. The
+        // backend consumes only the positions it has not seen, so feeding a growing
+        // prefix is how a prompt goes in a piece at a time.
+        self.backend
+            .hidden(&pending.context[..target], &mut pending.seq)?;
+        pending.consumed = target;
+
+        let done = pending.consumed >= prefix_len;
+        if done && pending.cache_on_finish && !pending.seq.has_spill() {
+            self.prompt_cache
+                .insert(&pending.context[..prefix_len], pending.seq.clone());
+        }
+        Ok(done)
+    }
+
+    /// Turn a fully-absorbed prompt into the session that decodes from it.
+    pub fn finish_prefill(&self, pending: Pending) -> Session {
+        Session {
+            seq: pending.seq,
+            prompt_len: pending.context.len(),
+            context: pending.context,
+            rng: Rng::new(pending.seed),
+            finished: false,
+        }
     }
 
     /// The model's pooled representation of `tokens`, L2-normalised.
@@ -776,6 +858,58 @@ mod tests {
         ] {
             assert!(rt.start(&prompt, &bad).is_err(), "accepted {bad:?}");
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Absorbing a prompt a few tokens at a time must build exactly the sequence
+    /// absorbing it in one go builds. The scheduler relies on this to interleave a
+    /// long prefill with other requests' decoding.
+    #[test]
+    fn a_chunked_prefill_produces_the_same_session_as_a_single_pass() {
+        // Separate runtimes, so each prefills cold: sharing one would let the first
+        // run populate the prompt cache and the second hit it, testing nothing. The
+        // weights are deterministic and the seed is pinned, so the two agree.
+        let (rt, dir) = runtime("chunked_whole");
+        let (rt2, dir2) = runtime("chunked_pieces");
+        let p = greedy(6);
+        let prompt = rt
+            .tokenizer
+            .encode("a prompt long enough to need several prefill chunks to absorb");
+
+        let mut whole = rt.start(&prompt, &p).unwrap();
+
+        let mut pending = rt2.start_incremental(&prompt, &p).unwrap();
+        let mut rounds = 0;
+        while !rt2.advance_prefill(&mut pending, 3).unwrap() {
+            rounds += 1;
+            assert!(rounds < prompt.len(), "prefill made no progress");
+        }
+        assert!(rounds > 1, "fixture too short to exercise chunking");
+        let mut piecewise = rt2.finish_prefill(pending);
+
+        assert_eq!(piecewise.prompt_len(), whole.prompt_len());
+        assert_eq!(
+            drain(&rt, &mut whole, &p).0,
+            drain(&rt2, &mut piecewise, &p).0
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir2);
+    }
+
+    #[test]
+    fn a_partly_absorbed_prompt_reports_what_is_left() {
+        let (rt, dir) = runtime("remaining");
+        let prompt = rt.tokenizer.encode("count me down");
+        let prefix = prompt.len() - 1;
+
+        let mut pending = rt.start_incremental(&prompt, &greedy(2)).unwrap();
+        assert_eq!(pending.remaining(), prefix);
+        rt.advance_prefill(&mut pending, 2).unwrap();
+        assert_eq!(pending.remaining(), prefix - 2);
+        while !rt.advance_prefill(&mut pending, 4).unwrap() {}
+        assert_eq!(pending.remaining(), 0);
+
         let _ = std::fs::remove_dir_all(dir);
     }
 
