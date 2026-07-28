@@ -4,35 +4,40 @@ All notable changes to this project will be documented in this file.
 
 ## [0.14.0] - 2026-07-28
 
-Making a checkpoint larger than RAM respond, rather than crawl. Both changes here are
-about *page-cache* behaviour; neither touches the arithmetic.
+Prefill was structured so that every prompt token paid for the whole model. It now
+batches, and within a layer groups tokens by the expert they routed to — **~2x faster
+prefill even on a checkpoint that fits entirely in RAM**, and it cuts the working set
+from the whole model per token to a single layer, which is what a checkpoint larger
+than RAM actually needs.
 
 ### Added
 
-- **Layer-major prefill (`model.prefill_batch`).** Prefill ran each prompt token
-  through all N layers before starting the next, so every layer's weights were
-  re-read once per token — the working set is the *whole model, per token*. For
-  Mixtral-8x7B Q4_K_M that is 7.1 GB, against 816 MB for a single layer with all
-  eight experts. Above what the page cache holds, that is the difference between
-  streaming the model off disk once per token and once per chunk. Prefill can now
-  drive a batch of tokens through one layer before moving on.
+- **Batched, expert-grouped prefill (`model.prefill_batch`).** Prefill drove each
+  token through all N layers before starting the next, so every layer's weights were
+  re-read once per token. Two things changed: a chunk of tokens now goes through one
+  layer before moving on, and within that layer the tokens are grouped by expert, so
+  an expert's packed rows are decoded once for every token that chose it instead of
+  once per token.
 
-  It is **off unless the checkpoint warrants it**, because the two cases point
-  opposite ways: when the model *does* fit, layer-major is ~8% slower (measured on a
-  620 MB mmapped MoE model, 512-token prefill: 9.49 s token-major vs 10.25 s
-  layer-major). Neither order gets reuse out of the CPU caches — one layer's weights
-  already exceed L3 — so batching only pays at the page-cache level, and otherwise
-  just costs locality. `Engine` picks from the file size against physical RAM and
-  logs which it chose; `model.prefill_batch` overrides it either way.
+  Measured on a 620 MB MoE checkpoint resident in RAM, 128-token prefill, warm cache,
+  best of three — the case with *nothing* to gain from the page cache, so this is the
+  decode saving alone: mmapped 2.68 s → 1.34 s (2.0×), expanded to `f32` 2.12 s →
+  1.28 s (1.7×). At 512 tokens, 10.6 s → 5.8 s.
 
-  Honest limit: the crossover was not measured directly. Demonstrating it needs a
-  checkpoint larger than the host's RAM, which this machine could not do safely. The
-  8% cost is measured; the win above the crossover is reasoned from the working-set
-  sizes, which is why it is gated and overridable rather than simply switched on.
+  On top of that the prefill working set drops from the whole model per token —
+  7.1 GB for Mixtral-8x7B Q4_K_M — to one layer with all eight experts, 816 MB. Above
+  what the page cache holds, that is the difference between streaming the model off
+  disk once per token and once per chunk. That second effect is reasoned from the
+  working-set sizes rather than measured: demonstrating it needs a checkpoint larger
+  than the host's RAM, which this machine could not do safely.
 
-  Output is unchanged and is tested that way — a batched prefill must equal feeding
-  the same tokens one at a time, across a chunk boundary too. The two orders produced
-  identical checksums in the benchmark above.
+  Output is unchanged and tested that way — a batched prefill must equal feeding the
+  same tokens one at a time, including across a chunk boundary. Every benchmark
+  configuration above produced identical checksums.
+
+- **`quant::matmul` and `simd::matmul`**, which decode a row once and dot it against
+  `n` activation vectors. Tested to agree exactly with `n` separate `matvec` calls
+  for all nine supported types.
 
 ### Changed
 
@@ -42,10 +47,15 @@ about *page-cache* behaviour; neither touches the arithmetic.
   dragged every page through the CPU, evicting cache lines the forward pass was still
   using. Measured cold over 400 MB, twice with the order reversed: 217 ms / 232 ms for
   the advice against 1.12 s / 1.43 s for the byte loop, so **5-6× faster**. It is not
-  asynchronous on macOS, which the comment now says rather than assumes; the point of
-  the prefetcher is to spend a background thread on that wait regardless.
+  asynchronous on macOS, which the comment now says rather than assumes.
+- Attention is unchanged and still strictly token-by-token: it is causal, so a token's
+  keys and values must be in the cache before the next one attends to them. Only the
+  feed-forward is batched.
 - An over-long prefill is refused before any layer runs, instead of failing partway
   and leaving the layers at different lengths.
+- The single-token `block`/`feed_forward`/`expert` paths are gone rather than kept
+  beside the batched ones: a batch of one is the same code, and two paths that are
+  supposed to agree are two paths that can drift.
 
 ## [0.13.0] - 2026-07-28
 

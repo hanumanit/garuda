@@ -9,9 +9,9 @@ gguf = "/path/to/mixtral-8x7b-instruct-v0.1.Q4_K_M.gguf"
 # Essential here: keep the 26 GB packed on disk and dequantise per row, instead of
 # expanding to f32 in RAM (which would need hundreds of GB).
 mmap = true
-# 26 GB against 16 GB of RAM: prefill must go layer-major or every prompt token
-# re-streams the whole model from disk. `0` would pick this anyway; pinned here
-# because this config exists to exercise exactly that path.
+# 26 GB against 16 GB of RAM: without batching, every prompt token re-streams the
+# whole model from disk. `0` gives the same value; pinned here because this config
+# exists to exercise exactly that path.
 prefill_batch = 256
 # Cap the KV cache. Mixtral was trained for 32k, but a small window keeps the cache
 # tiny on a memory-constrained box; it only limits sequence length, not correctness.
