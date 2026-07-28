@@ -1,10 +1,11 @@
 //! Byte-level tokenizer.
 //!
 //! Every UTF-8 byte maps to exactly one id, so `decode(encode(s)) == s` for all
-//! inputs and the vocabulary can never grow at runtime. This is *not* the BPE a
-//! real checkpoint ships with — loading a model's own merge table is the job of
-//! a GGUF-backed tokenizer, which does not exist here. What this does give us is
-//! a lossless, bounded stand-in with no out-of-vocabulary case to get wrong.
+//! inputs and the vocabulary can never grow at runtime. This is *not* the vocabulary
+//! a real checkpoint ships with — reading a model's own is [`spm::SpmTokenizer`]'s
+//! job, and that is what runs whenever a GGUF file is loaded. What this gives the
+//! synthetic engine is a lossless, bounded stand-in with no out-of-vocabulary case
+//! to get wrong.
 //!
 //! Layout: ids `0..4` are special, ids `4..260` are the 256 byte values.
 

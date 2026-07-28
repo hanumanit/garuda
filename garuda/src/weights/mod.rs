@@ -1,14 +1,15 @@
 //! Model weights: deterministic synthesis, and the on-disk expert format.
 //!
-//! Garuda has no trained checkpoint. Rather than fake the *math* — which is what
-//! a "simulated" forward pass does — it runs the real arithmetic over weights
-//! that are pseudo-random but fully deterministic in the seed. Every run of a
-//! given `(seed, dims)` produces bit-identical tensors, so benchmarks and tests
-//! are reproducible, and the output is meaningless text (untrained weights) by
-//! construction rather than by accident.
+//! These are the weights the **synthetic** engine runs on, used when no checkpoint
+//! is configured. Rather than fake the *math* — which is what a "simulated" forward
+//! pass does — it runs the real arithmetic over weights that are pseudo-random but
+//! fully deterministic in the seed. Every run of a given `(seed, dims)` produces
+//! bit-identical tensors, so benchmarks and tests are reproducible, and the output
+//! is meaningless text (untrained weights) by construction rather than by accident.
 //!
-//! Swapping in a real checkpoint means replacing [`ModelWeights::synthesize`]
-//! and [`expert_from_bytes`] with a GGUF tensor reader. Nothing else moves.
+//! A real checkpoint does not come through here at all: [`crate::llama::LlamaBackend`]
+//! reads its tensors straight from GGUF and implements the same
+//! [`crate::core::InferenceBackend`], so nothing in this module is on that path.
 
 use crate::core::{Expert, ExpertId, GarudaError, ModelDims};
 

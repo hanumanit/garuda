@@ -2,6 +2,86 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.12.0] - 2026-07-28
+
+A full re-read of the codebase against its own documentation. Most of what it turned
+up was the same shape: a guarantee the README describes, upheld on the OpenAI routes
+and quietly missing everywhere else.
+
+### Fixed
+
+- **`X-Garuda-User` now works on every protocol.** Each adapter hardcoded its own
+  protocol name as the caller id — `"ollama"`, `"anthropic"`, `"llamacpp"`, `"tgi"`,
+  `"ws"` — so every Ollama client on the machine shared a single
+  `max_concurrent_per_user` bucket, and the ninth concurrent one got a `429` while
+  the decode slots and the queue sat empty. Worse, it was silent: the README
+  documented the header as a general fairness knob. All six front ends now resolve
+  their caller through one `api::user_id`, falling back to the documented
+  `anonymous` bucket.
+- **Streamed token counts are the engine's, not a frame tally.** `eval_count`,
+  `tokens_predicted`, `generated_tokens` and Anthropic's `output_tokens` were each
+  incremented once per emitted frame. The streaming decoder holds back bytes that do
+  not yet form a whole character, so frames and tokens do not correspond — on the
+  test fixture, 26 frames for 32 tokens, a 19% undercount that grows with every
+  multi-byte character in the reply. `session::Piece::Done` now carries the real
+  count and every adapter reports it.
+- **A tied output head no longer loads the embedding matrix twice.** A checkpoint
+  that omits `output.weight` uses `token_embd.weight` as its head; the loader called
+  the tensor reader again for it, so the non-mmap path held two independent `f32`
+  copies of a `vocab × d_model` matrix — about 1 GB of pure duplication on a tied
+  model with a 128k vocabulary. The two now share one `Arc`.
+- **`tokenizer.ggml.add_bos_token` is honoured.** BOS was prepended unconditionally,
+  so a checkpoint trained without one saw a token stream that did not match its
+  training.
+- **A NaN beside a finite maximum no longer survives `softmax`.** The existing guard
+  caught an all-`-inf` distribution but not a single NaN among finite logits: the
+  sum went NaN, the `sum > 0.0` check simply skipped normalising, and the NaNs
+  reached the sampler's comparator. It now falls back to uniform, as the masked case
+  already did.
+
+### Added
+
+- **WebSockets can authenticate from a browser.** The `WebSocket` constructor cannot
+  set request headers, so once `server.api_keys` was set no page could reach
+  `/v1/ws` at all. A key may now arrive as the `garuda.api-key.<key>` subprotocol,
+  the convention the Kubernetes API server uses, and the handshake echoes it back so
+  the browser accepts the connection. Deliberately not a query parameter: URLs end up
+  in access logs, and this server logs every request URI.
+- **A startup warning when the KV cache would thrash.** Spilling only pays off with
+  `model.sliding_window` set. Under full attention every step reads the whole prefix,
+  so `ensure_resident` pulls back everything the previous `append` spilled — the
+  spill is undone and redone once per token, making disk I/O quadratic in sequence
+  length. The default configuration never reaches it; a hand-lowered
+  `kv_resident_blocks` does, and now says so.
+
+### Changed
+
+- **`/v1/embeddings` is bounded.** The endpoint does not go through the scheduler —
+  there is no decode loop to drive — so it inherited none of the scheduler's
+  protections: no input cap, no deadline, no cancellation, one blocking task running
+  an arbitrarily long array serially while holding one of four slots. Requests are
+  now capped at 256 inputs and give up their slot within one forward pass of
+  `request_timeout`.
+- **Sampling selects the top-k instead of sorting the vocabulary.** Every sampled
+  token sorted all 32k candidates to keep 40 of them; it now partitions in one pass.
+  The comparator breaks ties on token id, which is unique, so the ordering stays a
+  strict total order and seeded output is bit-identical to before.
+- **GGUF counts are bounded by what the remaining bytes could describe**, not by the
+  raw file length. A descriptor costing 24 bytes on disk costs far more in memory, so
+  a count that passed the old check could still drive an allocation orders of
+  magnitude larger than the file — reserved before any bounds-checked read ran.
+
+### Documentation
+
+- Corrected claims that had gone stale as the code moved past them: `InferenceBackend`
+  described `MoeEngine` as its only implementation two paragraphs above naming both;
+  the GGUF reader said the k-quants were "still rejected"; the byte tokenizer said a
+  GGUF-backed tokenizer "does not exist here", eight lines above `pub mod spm`;
+  `weights` claimed a real checkpoint would replace it, when `LlamaBackend` bypasses
+  it entirely; `api::user_id` said "there is no auth". README and this file said the
+  chat page keeps its API key in `localStorage` — it uses `sessionStorage`, on
+  purpose, so a credential does not outlive the tab the way saved conversations do.
+
 ## [0.11.0] - 2026-07-16
 
 Multiple conversations in the built-in chat page — a sidebar to hold more than one
@@ -47,7 +127,7 @@ API key authentication — off by default, one config key away from on.
   even a misconfigured empty-string key — `AppConfig::validate` rejects those
   outright.
 - The built-in chat page gained an API key field under Settings, stored in
-  `localStorage`. A 401 opens Settings automatically and shows a clear error
+  `sessionStorage`. A 401 opens Settings automatically and shows a clear error
   instead of hanging; the model badge shows "needs API key" until one is set.
 - `auth::require_key`, an axum middleware wrapping the whole merged router (every
   protocol front end, not just the OpenAI-shaped one), so no adapter needed its own

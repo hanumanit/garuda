@@ -198,6 +198,16 @@ impl KvConfig {
 ///
 /// Length is hard-capped at `max_positions` (the context window), so the cache
 /// cannot grow without bound no matter what a client sends.
+///
+/// # Spilling pairs with a sliding window
+///
+/// Spilling only pays off when something bounds how far back attention reads.
+/// Full attention reads every earlier position, so each step calls
+/// [`Self::ensure_resident`] over the whole prefix, reloading everything that was
+/// spilled — which the next [`Self::append`] spills straight back out. The result
+/// is correct but quadratic in disk I/O. With `sliding_window` set, only the window
+/// has to be resident and the spilled tail stays on disk where it belongs.
+/// [`crate::server::Engine`] warns at startup when a configuration would thrash.
 pub struct KVCacheState {
     kv_dim: usize,
     block_size: usize,

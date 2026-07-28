@@ -209,9 +209,13 @@ pub trait ExpertLoader: Send + Sync {
     fn is_resident(&self, id: ExpertId) -> bool;
 }
 
-/// Produces next-token logits for a context. This is the intended extension point
-/// for other compute backends; [`crate::moe::MoeEngine`] is the only implementation
-/// that exists — there is no GPU backend, and this trait is where one would go.
+/// Produces next-token logits for a context.
+///
+/// This is the extension point for compute backends. Two implementations ship:
+/// [`crate::moe::MoeEngine`] (synthetic weights) and [`crate::llama::LlamaBackend`]
+/// (a real GGUF checkpoint). There is no GPU backend, and this trait is where one
+/// would go.
+///
 /// # Plugin contract
 ///
 /// This trait is the extension point for compute backends. Implementations get to
@@ -236,9 +240,6 @@ pub trait ExpertLoader: Send + Sync {
 /// 5. **Determinism.** For the same `context` and internal weights, `logits` must be
 ///    reproducible. All randomness lives in the sampler, not here — the prompt cache
 ///    assumes a cache hit reproduces the same continuation.
-///
-/// See [`crate::moe::MoeEngine`] (synthetic) and [`crate::llama::LlamaBackend`]
-/// (real GGUF model) for two implementations.
 pub trait InferenceBackend: Send + Sync {
     /// The model's shape. Must satisfy [`ModelDims::validate`] and agree with the
     /// tokenizer's vocabulary size.

@@ -50,7 +50,7 @@ the streaming, the cancellation, the load shedding.
 | SentencePiece tokenizer from GGUF | Real, tested |
 | Transformer forward pass — dense **and** mixture-of-experts (top-k routing) | Real, tested |
 | Tiered expert storage (L1 RAM → L2 disk → L3 archive) | Real, tested |
-| Paged KV cache with disk spill (multi-layer, GQA-aware) | Real, tested |
+| Paged KV cache with disk spill (multi-layer, GQA-aware) | Real, tested — pair spilling with `sliding_window`; under full attention every step reads the whole prefix, so a spilled block is reloaded the moment it is written. Garuda warns at startup when the configuration would do that |
 | Scheduler (priority, concurrency limits, cancellation, timeouts, backpressure) | Real, tested |
 | OpenAI + Ollama + Anthropic + llama.cpp + TGI APIs, SSE / NDJSON / WebSocket | Real, tested |
 | Dequantisation: F32 / F16 / Q4_0 / Q8_0 / Q2_K–Q6_K | Real, tested (runs Q2_K…Q5_K_M models) |
@@ -58,8 +58,8 @@ the streaming, the cancellation, the load shedding.
 | Integer (NEON `i8`) matmul kernel for Q8_0 and Q4_K | Real, tested (2.6× / ~10× faster respectively than dequantise-then-dot, same output within quantisation tolerance) |
 | A real MoE checkpoint at scale (Mixtral-8x7B, Q4_K_M, 26 GB) | Real, tested — loads and generates on a 16 GB machine via `mmap`; both GGUF expert-tensor layouts (merged `..._exps` and the older per-expert tensors some conversions use) load correctly |
 | Speculative expert prefetch against a real checkpoint | Real, tested — a per-layer Markov predictor warms the likely next experts' mmap pages on a background thread while the current step still computes |
-| Built-in chat page (`GET /`) | Real — talks to `/v1/chat/completions`, same origin, no separate frontend; multiple conversations (sidebar, switch, delete), saved in the browser's `localStorage` |
-| API key authentication (`Authorization: Bearer` or `x-api-key`) | Real, tested — off by default; set `server.api_keys` to require one |
+| Built-in chat page (`GET /`) | Real — talks to `/v1/chat/completions`, same origin, no separate frontend; multiple conversations (sidebar, switch, delete), saved in the browser's `localStorage` (the API key is not: that lives in `sessionStorage`) |
+| API key authentication (`Authorization: Bearer` or `x-api-key`) | Real, tested — off by default; set `server.api_keys` to require one. WebSockets may present it as a subprotocol, since browsers cannot set handshake headers |
 | **GPU backend** | **Not implemented** (`gpu = true` is a startup error) |
 
 The real model runs as a **plugin**: `llama::LlamaBackend` implements the same
@@ -183,7 +183,7 @@ OpenAI's envelope with the status code clients act on (`429` rate limit, `503` b
 |---|---|
 | `POST /v1/chat/completions` | `stream: true` for SSE |
 | `POST /v1/completions` | |
-| `POST /v1/embeddings` | Real pooled hidden states. Untrained, so they carry no meaning — see below |
+| `POST /v1/embeddings` | Real pooled hidden states, up to 256 inputs per request. Untrained, so they carry no meaning — see below |
 | `GET /v1/models` · `GET /v1/stats` · `GET /health` | Models list, measured counters, health |
 | `WS /v1/ws` | Bidirectional streaming with `{"cancel": true}` |
 
@@ -227,19 +227,26 @@ curl -s localhost:8080/v1/chat/completions \
 
 Two extensions beyond the OpenAI shape:
 
-- `X-Garuda-User` identifies the caller for per-user concurrency limits. Absent, everyone
-  shares the `anonymous` bucket. **This is not authentication** — anyone can claim any
-  name. It is a fairness knob, not a security control. Real authentication is
-  `server.api_keys` (below), a separate, independent mechanism.
-- `"priority": "low" | "normal" | "high"` on any request.
+- `X-Garuda-User` identifies the caller for per-user concurrency limits, on **every**
+  protocol above — OpenAI, Ollama, Anthropic, llama.cpp, TGI and the WebSocket.
+  Absent, everyone shares the `anonymous` bucket. **This is not authentication** —
+  anyone can claim any name. It is a fairness knob, not a security control. Real
+  authentication is `server.api_keys` (below), a separate, independent mechanism.
+- `"priority": "low" | "normal" | "high"` on any request (OpenAI routes).
 
 **Authentication** — off by default. Set `server.api_keys` to one or more shared
 secrets and every request except `GET /health` and `GET /` needs one, sent as
 `Authorization: Bearer <key>` (OpenAI, llama.cpp, Ollama clients) or `x-api-key: <key>`
 (Anthropic clients) — whichever a client sends is checked, so nothing downstream needs
 to know or care which scheme was used. Keys are compared in constant time. The
-built-in chat page has an API key field under Settings, stored in the browser's
-`localStorage`.
+built-in chat page has an API key field under Settings, held in the browser's
+`sessionStorage` — the tab, not the disk, so a credential does not outlive the session
+the way the saved conversations do.
+
+The browser `WebSocket` constructor cannot set request headers, so `/v1/ws` also
+accepts the key as a subprotocol — `new WebSocket(url, ['garuda.api-key.' + key])`,
+the same convention the Kubernetes API server uses. A query parameter would be
+simpler and worse: URLs land in access logs, and this server logs every request URI.
 
 **About `/v1/embeddings`:** the vectors are the model's real pooled hidden state,
 L2-normalised. With a trained checkpoint loaded they mean something; on the

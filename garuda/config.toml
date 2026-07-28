@@ -34,7 +34,11 @@ gpu = false
 # L1 budget for expert weights. With the current dimensions an expert is ~384 KiB,
 # so this holds all eight several times over.
 expert_cache = "512MB"
-# KV blocks held in RAM per sequence before older ones spill to disk.
+# KV blocks held in RAM per sequence before older ones spill to disk. Spilling only
+# pays off alongside model.sliding_window: full attention re-reads the whole prefix
+# every token, so anything spilled is pulled straight back in. Set this high enough to
+# cover the context (context / 32, rounded up) or set a window; Garuda warns at startup
+# if the combination would spill and reload once per token.
 kv_resident_blocks = 512
 # Prompt prefixes to remember, so a repeated prompt skips prefill.
 prompt_cache_entries = 64
@@ -55,7 +59,9 @@ port = 8080
 max_concurrent = 4
 # Requests allowed to wait for a slot before the server sheds load with a 503.
 queue_capacity = 256
-# Concurrent requests one caller may have in flight (identified by X-Garuda-User).
+# Concurrent requests one caller may have in flight. The caller is whoever the
+# X-Garuda-User header names, on every protocol; callers who send nothing share one
+# "anonymous" bucket, so raise this if your clients do not identify themselves.
 max_concurrent_per_user = 8
 request_timeout_secs = 120
 # Permissive CORS. Off by default: unless api_keys is set below, this server has
@@ -63,9 +69,10 @@ request_timeout_secs = 120
 cors = false
 # Keys accepted on every request except GET /health and GET /. Checked against
 # `Authorization: Bearer <key>` (OpenAI/llama.cpp/Ollama clients) or
-# `x-api-key: <key>` (Anthropic clients), whichever a caller sends. Empty (the
-# default) means no authentication at all — do not expose this port to a network
-# you do not control unless this is set, e.g.:
+# `x-api-key: <key>` (Anthropic clients), whichever a caller sends. A WebSocket may
+# also present one as the `garuda.api-key.<key>` subprotocol, since browsers cannot
+# set headers on a handshake. Empty (the default) means no authentication at all — do
+# not expose this port to a network you do not control unless this is set, e.g.:
 #   api_keys = ["sk-change-me"]
 api_keys = []
 
