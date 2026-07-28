@@ -2,6 +2,43 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.20.0] - 2026-07-29
+
+The larger-than-RAM claim is measured. It had been the one number in this project
+quoted from arithmetic rather than a stopwatch, since demonstrating it needs a
+checkpoint bigger than the host's memory — which turned out to be sitting on this
+machine all along.
+
+**Mixtral-8x7B Q4_K_M, 25 GB, on 16 GB of RAM**, `mmap`, prefetch off so this
+isolates prefill order, alternating runs so neither side gets a systematically
+warmer page cache. Time to first token:
+
+| prompt | `prefill_batch = 1` (token-major) | `prefill_batch = 256` (batched) | |
+|---|---|---|---|
+| 20 tokens | 195.8 s | 48.6 s | 4.0× |
+| 38 tokens | 386.4 s | 48.3 s / 51.8 s | 7.5–8.0× |
+
+The ratio is the least interesting part. **Batched prefill is flat in prompt
+length** — 48.6 s at 20 tokens, 48.3 s at 38 — because it reads the model once
+either way. **Token-major doubles when the prompt does**, 195.8 s to 386.4 s,
+because it re-reads every layer once per token. That is the working set argued for
+in 0.14.0 (7.1 GB per token against 816 MB per layer), now visible in the shape of
+the curve rather than inferred from it.
+
+Nothing changed in the code for this release; what changed is that the
+documentation no longer hedges. Every performance claim in the README has now been
+measured on this machine.
+
+### Documentation
+
+- README, ABOUT and `LlamaBackend::with_prefill_chunk` carry the measurement instead
+  of the argument.
+- The remaining-work list is honest about what is left: prefill on a larger-than-RAM
+  checkpoint is fast now, but a *single* sequence decoding still touches every layer
+  per token, so a 25 GB model decodes at well under a token a second on this machine.
+  Batching across concurrent requests amortises that; one lonely request cannot be
+  helped without speculative decoding or keeping more of the model resident.
+
 ## [0.19.0] - 2026-07-29
 
 ### Changed

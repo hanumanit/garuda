@@ -57,7 +57,7 @@ the streaming, the cancellation, the load shedding.
 | OpenAI + Ollama + Anthropic + llama.cpp + TGI APIs, SSE / NDJSON / WebSocket | Real, tested |
 | Dequantisation: F32 / F16 / Q4_0 / Q8_0 / Q2_K–Q6_K | Real, tested (runs Q2_K…Q5_K_M models) |
 | Memory-mapped packed weights (`mmap = true`), incl. per-expert streaming | Real, tested (~6× less RAM, same output) |
-| Batched, expert-grouped prefill | Real, tested — ~2× faster prefill even on a model that fits in RAM (an expert's rows are decoded once per batch, not once per token), and cuts the working set from the whole model per token to one layer (7.1 GB → 816 MB for Mixtral Q4_K_M). `model.prefill_batch` tunes or disables it |
+| Batched, expert-grouped prefill | Real, tested — **8× faster prefill on Mixtral-8x7B Q4_K_M (25 GB) on a 16 GB machine**: 386 s → 48 s to first token for a 38-token prompt, because the working set drops from the whole model per token to one layer (7.1 GB → 816 MB). ~2× even on a model that fits in RAM, where the win is decoding each expert's rows once per batch instead of once per token. `model.prefill_batch` tunes or disables it |
 | Integer (NEON `i8`) matmul kernel for **every** quantised type | Real, tested — `Q8_0` and all five k-quants dot straight against an int8-quantised activation. Roughly 4–15× faster than dequantise-then-dot depending on type (see below), within quantisation tolerance of it |
 | A real MoE checkpoint at scale (Mixtral-8x7B, Q4_K_M, 26 GB) | Real, tested — loads and generates on a 16 GB machine via `mmap`; both GGUF expert-tensor layouts (merged `..._exps` and the older per-expert tensors some conversions use) load correctly |
 | Speculative expert prefetch against a real checkpoint | Real, tested — a per-layer Markov predictor warms the likely next experts' mmap pages via `madvise(WILLNEED)` on a background thread while the current step still computes (5–6× faster than faulting them in by hand) |
@@ -311,10 +311,11 @@ registered in `Engine::build` — see **[PLUGIN.md](PLUGIN.md)** and
   are refused rather than run.
 - **Architectures beyond Llama.** `LlamaBackend` covers the Llama family (dense and
   MoE, GQA). Other architectures each need their own `InferenceBackend`.
-- **A larger-than-RAM checkpoint measured, not reasoned about.** The working-set
-  argument for batched prefill (7.1 GB per token down to 816 MB per chunk for
-  Mixtral-8x7B Q4_K_M) is arithmetic, not a measurement — demonstrating it needs a
-  checkpoint bigger than the host's RAM. Everything else quoted here was measured.
+- **Decode on a larger-than-RAM checkpoint.** Prefill there is now measured and
+  fast, but decoding a single sequence still touches every layer for one token, so a
+  25 GB model decodes at well under a token a second on a 16 GB machine. Batching
+  across concurrent requests amortises it; one lonely request cannot be helped
+  without either speculative decoding or keeping more of the model resident.
 
 ---
 

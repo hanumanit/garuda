@@ -54,7 +54,8 @@ the runtime already depended on. See [PLUGIN.md](PLUGIN.md).
 - **Language:** Rust (edition 2024, 1.85+)
 - **Tests:** 176 (160 unit + 16 end-to-end HTTP)
 - **Verified:** loads and runs both the TinyStories 260K checkpoint and a real
-  Mixtral-8x7B (Q4_K_M, 26 GB) end to end, the latter on a 16 GB machine via `mmap`
+  Mixtral-8x7B (Q4_K_M, 25 GB) end to end, the latter on a 16 GB machine via `mmap`,
+  where batching prefill cuts time-to-first-token from 386 s to 48 s
 - **API:** OpenAI-compatible REST + SSE + WebSocket, plus a built-in chat page at `/`
 - **Licence:** MIT OR Apache-2.0
 
