@@ -2,6 +2,40 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.19.0] - 2026-07-29
+
+### Changed
+
+- **The prefill chunk is measured, not a constant.** 0.18.0 fed prompts in at a fixed
+  32 tokens per scheduler iteration, which is imperceptible on a small model and
+  seconds on a large one — the wrong shape for a knob that exists to bound a latency
+  spike. The scheduler now tracks what a decode step costs and what a prefill token
+  costs, both as exponential moving averages, and sizes each chunk so its work
+  matches one decode step. A newly admitted request then gets roughly half the
+  machine while the requests already streaming keep the other half, whatever the
+  model.
+
+  Same experiment as 0.18.0 — two clients streaming while a 1474-token prompt
+  arrives, three runs:
+
+  | | streamer worst gap | long-prompt request |
+  |---|---|---|
+  | fixed 32 | 641 / 456 / 636 ms | 14.32 / 14.78 / 15.20 s |
+  | measured | 252 / 149 / 225 ms | 13.96 / 14.59 / 15.23 s |
+
+  So ~2.6× less stall for the clients already streaming, and **no measurable cost**
+  to the arriving request — the chunk lands around two or three tokens on this model,
+  and the extra scheduling overhead is nothing next to a forward pass. On a model
+  where those two costs are comparable the trade would show up; the bounds (1 to 512
+  tokens) are what keep it from going anywhere silly.
+
+### Tests
+
+- The pacing arithmetic is pinned directly: a 30 ms step against 10 ms prefill tokens
+  asks for three, a model ten times faster per token asks for thirty, and absurd
+  ratios in either direction are clamped rather than believed. Also that one outlier
+  sample moves the average part of the way rather than all of it.
+
 ## [0.18.0] - 2026-07-29
 
 Chunked prefill. Continuous batching made one problem sharper: a newly admitted
