@@ -2,6 +2,58 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.17.0] - 2026-07-29
+
+Continuous batching. Concurrent requests now decode in one pass over the weights
+instead of one pass each, which is what `logits_batch` was built for in 0.16.0.
+
+### Changed
+
+- **The scheduler drives one batch, not one task per request.** It admits up to
+  `max_concurrent` sequences and steps them together, so N concurrent requests cost
+  roughly one forward pass per token rather than N. Measured end to end through the
+  HTTP API on a 620 MB MoE checkpoint, 24 tokens each, three runs:
+
+  | concurrent | before | after |
+  |---|---|---|
+  | 1 | 22.3 tok/s | 23.8 tok/s |
+  | 2 | 72.7 tok/s | 73.6 tok/s |
+  | 4 | 23–83 tok/s | 65–113 tok/s |
+  | 8 | 67–76 tok/s | 111–137 tok/s |
+
+  So ~1.6–1.8× aggregate throughput at 8 concurrent, and median latency roughly
+  halved (2.5 s → 1.6 s). The old path's numbers swing widely because N independent
+  forward passes each fan out across rayon and then fight each other for the same
+  cores; the batched loop fans out once. Note it *degraded* from 4 to 8 concurrent
+  for that reason, where the batched loop keeps improving.
+
+  With `max_concurrent = 1` the batch is always one sequence, i.e. exactly the old
+  behaviour.
+
+- **A queued request whose client has already gone is dropped immediately**, instead
+  of waiting for a decode slot to free up first. Its user's concurrency permit lives
+  inside the entry, so holding a dead request was holding a live caller's slot.
+
+- `InferenceRuntime::next_token_batch` steps several sessions at once. They are
+  independent — separate caches, samplers and budgets — so it produces exactly what
+  stepping each alone produces. If the batched forward fails it retries the live
+  sequences one at a time, so one bad sequence is not reported as everyone's failure.
+
+- `InferenceBackend::logits_batch` takes `&mut [&mut SeqState]` rather than
+  `&mut [SeqState]`. The runtime holds whole `Session`s, so borrowed caches are what
+  it can actually hand over; the previous shape could not be called from the one
+  place that needed it.
+
+### Tests
+
+- Concurrent requests decoding together must each get their own answer: a sequence
+  decoded inside a batch has to match the same request decoded alone, and different
+  prompts must not collapse to one output.
+- The disconnect test no longer assumes a permit returns within a single yield. A
+  `RateLimit` while the user already has `max_concurrent_per_user` in flight is the
+  documented answer, and how fast a permit comes back is a timing detail — the bug it
+  pins is never recovering, which it still asserts.
+
 ## [0.16.0] - 2026-07-29
 
 Groundwork for batching the *decode* step across concurrent requests. A single
