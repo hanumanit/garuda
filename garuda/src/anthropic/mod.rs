@@ -103,7 +103,11 @@ fn stop_reason(r: StopReason) -> &'static str {
     }
 }
 
-async fn messages(State(state): State<SharedState>, Json(req): Json<MessagesRequest>) -> Response {
+async fn messages(
+    State(state): State<SharedState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<MessagesRequest>,
+) -> Response {
     if req.messages.is_empty() {
         return error(
             StatusCode::BAD_REQUEST,
@@ -145,7 +149,8 @@ async fn messages(State(state): State<SharedState>, Json(req): Json<MessagesRequ
     let model = req.model.unwrap_or_else(|| MODEL_ID.to_owned());
     let id = format!("msg_{}", Uuid::new_v4().simple());
 
-    let handle = match session::submit(&state, "anthropic", tokens, params, Priority::Normal) {
+    let user = crate::api::user_id(&headers);
+    let handle = match session::submit(&state, &user, tokens, params, Priority::Normal) {
         Ok(h) => h,
         Err(e) => return map_error(&e),
     };
@@ -190,6 +195,8 @@ fn stream_messages(
     input_tokens: usize,
 ) -> Sse<impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>>> {
     let stream = async_stream::stream! {
+        // Reported on `message_delta` at the end; the engine supplies the real count
+        // rather than it being inferred from how many text deltas went out.
         let mut output_tokens = 0usize;
 
         // message_start
@@ -214,13 +221,15 @@ fn stream_messages(
         while let Some(p) = pieces.next().await {
             match p {
                 Piece::Text(text) => {
-                    output_tokens += 1;
                     yield Ok(Event::default().event("content_block_delta").data(json!({
                         "type": "content_block_delta", "index": 0,
                         "delta": { "type": "text_delta", "text": text }
                     }).to_string()));
                 }
-                Piece::Done(r) => { reason = r; }
+                Piece::Done { reason: r, tokens } => {
+                    reason = r;
+                    output_tokens = tokens;
+                }
                 Piece::Error(e) => {
                     yield Ok(Event::default().event("error").data(json!({
                         "type": "error",

@@ -9,6 +9,14 @@
 //! Both header styles are accepted so every wire protocol garuda speaks works with
 //! its ecosystem's own convention: OpenAI/llama.cpp/Ollama clients send
 //! `Authorization: Bearer <key>`, Anthropic clients send `x-api-key: <key>`.
+//!
+//! A third form exists for WebSockets only. The browser `WebSocket` constructor
+//! cannot set request headers, so a page could never authenticate to `/v1/ws` at
+//! all; the one thing it *can* control is the subprotocol list. A key may therefore
+//! also arrive as `Sec-WebSocket-Protocol: garuda.api-key.<key>`, the same trick the
+//! Kubernetes API server uses for its own browser clients. A query parameter would
+//! have been simpler and worse: URLs end up in access logs, proxy logs and browser
+//! history, and this server logs every request URI.
 
 use crate::api::{ErrorBody, ErrorEnvelope};
 use axum::Json;
@@ -49,6 +57,20 @@ impl ApiKeys {
 
 const EXEMPT_PATHS: [&str; 2] = ["/health", "/"];
 
+/// Subprotocol prefix carrying a key on a WebSocket handshake. See the module docs.
+pub const WS_KEY_PROTOCOL_PREFIX: &str = "garuda.api-key.";
+
+/// The key offered on a WebSocket handshake, if the client named one as a
+/// subprotocol. `Sec-WebSocket-Protocol` is a comma-separated list, and a client may
+/// legitimately offer other entries alongside this one.
+pub fn ws_protocol_key(protocols: &str) -> Option<&str> {
+    protocols
+        .split(',')
+        .map(str::trim)
+        .find_map(|p| p.strip_prefix(WS_KEY_PROTOCOL_PREFIX))
+        .filter(|k| !k.is_empty())
+}
+
 fn presented_key(request: &Request) -> Option<&str> {
     let headers = request.headers();
     headers
@@ -56,6 +78,12 @@ fn presented_key(request: &Request) -> Option<&str> {
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
+        .or_else(|| {
+            headers
+                .get(header::SEC_WEBSOCKET_PROTOCOL)
+                .and_then(|v| v.to_str().ok())
+                .and_then(ws_protocol_key)
+        })
         .filter(|k| !k.is_empty())
 }
 
@@ -160,6 +188,58 @@ mod tests {
             status(&app, "/v1/models", Some(("x-api-key", "two"))).await,
             StatusCode::OK
         );
+    }
+
+    #[tokio::test]
+    async fn a_websocket_subprotocol_can_carry_the_key() {
+        // A browser cannot set headers on a WebSocket handshake, so without this a
+        // page could never reach /v1/ws once keys are configured.
+        let app = app(vec!["secret"]);
+        assert_eq!(
+            status(
+                &app,
+                "/v1/models",
+                Some(("sec-websocket-protocol", "garuda.api-key.secret"))
+            )
+            .await,
+            StatusCode::OK
+        );
+        // Offered alongside other subprotocols, as a real client may do.
+        assert_eq!(
+            status(
+                &app,
+                "/v1/models",
+                Some((
+                    "sec-websocket-protocol",
+                    "some.other.protocol, garuda.api-key.secret"
+                ))
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(
+                &app,
+                "/v1/models",
+                Some(("sec-websocket-protocol", "garuda.api-key.wrong"))
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+        // A subprotocol list that names no key at all must not authenticate.
+        assert_eq!(
+            status(&app, "/v1/models", Some(("sec-websocket-protocol", "chat"))).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[test]
+    fn ws_protocol_key_extracts_only_the_prefixed_entry() {
+        assert_eq!(ws_protocol_key("garuda.api-key.abc"), Some("abc"));
+        assert_eq!(ws_protocol_key(" x , garuda.api-key.abc , y"), Some("abc"));
+        assert_eq!(ws_protocol_key("garuda.api-key."), None, "empty key");
+        assert_eq!(ws_protocol_key("chat, superchat"), None);
+        assert_eq!(ws_protocol_key(""), None);
     }
 
     #[tokio::test]

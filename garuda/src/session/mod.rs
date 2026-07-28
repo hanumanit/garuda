@@ -17,8 +17,15 @@ use futures_util::Stream;
 pub enum Piece {
     /// A run of decoded text (never empty).
     Text(String),
-    /// The reply finished, with the reason it stopped.
-    Done(StopReason),
+    /// The reply finished: why it stopped, and how many tokens it generated.
+    ///
+    /// The count belongs here rather than being inferred from [`Piece::Text`]
+    /// events, because the two do not correspond. The streaming decoder holds back
+    /// bytes that do not yet form a whole character, so one token can yield no text
+    /// piece and a later one can yield several characters' worth. Counting pieces —
+    /// which every wire adapter used to do — undercounts every multi-byte character
+    /// a reply contains.
+    Done { reason: StopReason, tokens: usize },
     /// The request failed mid-stream.
     Error(GarudaError),
 }
@@ -93,9 +100,11 @@ pub fn pieces(state: SharedState, mut handle: Handle) -> impl Stream<Item = Piec
         // `handle` moves in; if the client disconnects and the response is dropped, so is
         // the handle, which cancels the request.
         let mut decoder = state.runtime.tokenizer.stream_decoder();
+        let mut tokens = 0usize;
         while let Some(ev) = handle.events.recv().await {
             match ev {
                 StreamEvent::Token(t) => {
+                    tokens += 1;
                     let s = decoder.push(t);
                     if !s.is_empty() {
                         yield Piece::Text(s);
@@ -106,7 +115,7 @@ pub fn pieces(state: SharedState, mut handle: Handle) -> impl Stream<Item = Piec
                     if !tail.is_empty() {
                         yield Piece::Text(tail);
                     }
-                    yield Piece::Done(reason);
+                    yield Piece::Done { reason, tokens };
                     return;
                 }
                 StreamEvent::Error(e) => {

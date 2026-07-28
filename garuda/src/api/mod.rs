@@ -330,9 +330,19 @@ async fn stats(State(state): State<SharedState>) -> impl IntoResponse {
     }))
 }
 
-/// Caller identity. There is no auth, so everyone shares one bucket unless they
-/// name themselves — which is a scaffold's honest answer, not a security control.
-fn user_id(headers: &axum::http::HeaderMap) -> String {
+/// Caller identity for the scheduler's per-user concurrency limit.
+///
+/// **Not authentication.** Anyone can claim any name; it is a fairness knob, so that
+/// one caller's traffic cannot consume everyone's budget. Real authentication is
+/// [`crate::auth`], a separate and independent mechanism. Callers who send nothing
+/// share the `anonymous` bucket.
+///
+/// Every protocol front end resolves its caller through this one function, so the
+/// limit means the same thing whichever wire format asked. (Each adapter used to
+/// hardcode its own protocol name, which put every Ollama client — or every
+/// Anthropic client — into a single shared bucket, and made `X-Garuda-User` a
+/// no-op outside the OpenAI routes.)
+pub(crate) fn user_id(headers: &axum::http::HeaderMap) -> String {
     headers
         .get("x-garuda-user")
         .and_then(|v| v.to_str().ok())
@@ -450,7 +460,7 @@ fn stream_chat(
                         yield Ok(e);
                     }
                 }
-                Piece::Done(reason) => {
+                Piece::Done { reason, .. } => {
                     if let Ok(e) = chunk(Delta::default(), Some(reason.as_openai().to_owned())) {
                         yield Ok(e);
                     }
@@ -535,12 +545,26 @@ async fn completions(
     .into_response()
 }
 
+/// Inputs one embeddings request may carry.
+///
+/// The request is one blocking task that runs its inputs *serially*, so the array
+/// length is a multiplier on how long a single caller occupies one of the (few)
+/// embedding slots. The semaphore below bounds how many such requests run at once;
+/// it says nothing about how big any one of them is. Without this cap the body-size
+/// limit is the only bound, and that admits thousands of forward passes per request.
+const MAX_EMBEDDING_INPUTS: usize = 256;
+
 /// Embeddings from the model's real pooled hidden state.
 ///
 /// These are genuine forward passes, not the constant vector the previous version
 /// returned. They are still not *useful*: the weights are untrained, so the vectors
 /// carry no semantic structure. The endpoint is here because the shape and the cost
 /// are real; treat the values as noise until a trained checkpoint is loaded.
+///
+/// This path deliberately does not go through the scheduler — there is no decode
+/// loop to drive, so there is nothing to stream or cancel between. That also means
+/// it inherits none of the scheduler's protections, so the bounds it needs (input
+/// count, concurrent requests, a deadline) are applied here explicitly.
 async fn embeddings(
     State(state): State<SharedState>,
     Json(req): Json<EmbeddingRequest>,
@@ -563,6 +587,12 @@ async fn embeddings(
     if inputs.is_empty() || inputs.iter().all(|s| s.is_empty()) {
         return bad_request("input must not be empty");
     }
+    if inputs.len() > MAX_EMBEDDING_INPUTS {
+        return bad_request(format!(
+            "input holds {} items; at most {MAX_EMBEDDING_INPUTS} may be embedded per request",
+            inputs.len()
+        ));
+    }
 
     // Embeddings are CPU-bound and do not use the generation scheduler. Refuse
     // excess work rather than allowing an unbounded number of blocking tasks to
@@ -574,12 +604,19 @@ async fn embeddings(
 
     let runtime = state.runtime.clone();
     let model = req.model.unwrap_or_else(|| MODEL_ID.to_owned());
+    // A blocking task cannot be aborted from outside, so the deadline is checked
+    // between inputs instead: the request gives up its slot within one forward pass
+    // of the timeout rather than holding it for as long as the work happens to take.
+    let deadline = std::time::Instant::now() + state.request_timeout;
 
     // Forward passes are CPU-bound; keep them off the async executor.
     let computed = tokio::task::spawn_blocking(move || {
         let mut out = Vec::with_capacity(inputs.len());
         let mut total = 0usize;
         for text in &inputs {
+            if std::time::Instant::now() >= deadline {
+                return Err(GarudaError::Timeout);
+            }
             let tokens = runtime.tokenizer.encode(text);
             total += tokens.len();
             out.push(runtime.embed(&tokens)?);

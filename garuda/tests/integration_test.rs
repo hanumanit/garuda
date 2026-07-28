@@ -8,10 +8,14 @@
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use garuda::anthropic::create_anthropic_router;
 use garuda::api::{ApiState, create_router};
 use garuda::config::AppConfig;
+use garuda::llamacpp::create_llamacpp_router;
+use garuda::ollama::create_ollama_router;
 use garuda::scheduler::Scheduler;
 use garuda::server::Engine;
+use garuda::tgi::create_tgi_router;
 use http_body_util::BodyExt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,8 +62,16 @@ fn harness(tag: &str, tune: impl FnOnce(&mut AppConfig)) -> Harness {
         started: std::time::Instant::now(),
     });
 
+    // Every protocol front end, not just the OpenAI-shaped one: the scheduler
+    // policies they share are only meaningfully tested through all of them.
+    let app = create_router(state.clone())
+        .merge(create_ollama_router(state.clone()))
+        .merge(create_anthropic_router(state.clone()))
+        .merge(create_llamacpp_router(state.clone()))
+        .merge(create_tgi_router(state.clone()));
+
     Harness {
-        app: create_router(state.clone()),
+        app,
         state,
         _dir: TempDir(dir),
     }
@@ -302,6 +314,134 @@ async fn one_users_load_does_not_rate_limit_another() {
 
     assert_eq!(a, StatusCode::OK);
     assert_eq!(b, StatusCode::OK, "bob was rate-limited by alice's traffic");
+}
+
+#[tokio::test]
+async fn every_protocol_honours_the_caller_identity_header() {
+    // Each adapter used to hardcode its own protocol name as the user id, so every
+    // Ollama caller shared one bucket, every Anthropic caller another, and
+    // `X-Garuda-User` did nothing outside the OpenAI routes. With a per-user limit
+    // of 1, two *different* users must both be served on every protocol.
+    let h = harness("protocol_users", |c| {
+        c.server.max_concurrent_per_user = 1;
+        c.server.max_concurrent = 4;
+    });
+
+    let cases: [(&str, serde_json::Value); 4] = [
+        (
+            "/api/generate",
+            serde_json::json!({ "prompt": "hello", "stream": false, "options": { "num_predict": 4 } }),
+        ),
+        (
+            "/v1/messages",
+            serde_json::json!({ "messages": [{ "role": "user", "content": "hello" }], "max_tokens": 4 }),
+        ),
+        (
+            "/completion",
+            serde_json::json!({ "prompt": "hello", "n_predict": 4 }),
+        ),
+        (
+            "/generate",
+            serde_json::json!({ "inputs": "hello", "parameters": { "max_new_tokens": 4 } }),
+        ),
+    ];
+
+    for (path, body) in cases {
+        let (a, ba) = h.post_as(path, body.clone(), Some("alice")).await;
+        let (b, bb) = h.post_as(path, body, Some("bob")).await;
+        assert_eq!(a, StatusCode::OK, "{path} rejected alice: {ba}");
+        assert_eq!(
+            b,
+            StatusCode::OK,
+            "{path} rate-limited bob behind alice: {bb}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_streamed_reply_reports_the_token_count_the_engine_measured() {
+    // Adapters used to count SSE/NDJSON frames. The streaming decoder holds back
+    // partial UTF-8, so frames and tokens do not correspond and the count came out
+    // low. Compare against the non-streaming path, which reports the real number.
+    // Sampled rather than greedy, so the byte-level output actually contains
+    // multi-byte lead bytes and special ids — the tokens that produce no text frame
+    // of their own, and which frame-counting therefore lost.
+    let h = harness("stream_counts", |_| {});
+    let body = serde_json::json!({
+        "prompt": "count the tokens honestly",
+        "n_predict": 32,
+        "temperature": 1.2,
+        "top_k": 0,
+        "seed": 0,
+    });
+
+    let (status, plain) = h.post("/completion", body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{plain}");
+    let expected = Harness::json(&plain)["tokens_predicted"].as_u64().unwrap();
+    assert!(expected > 0, "nothing was generated");
+
+    let mut streamed = body;
+    streamed["stream"] = serde_json::json!(true);
+    let (status, sse) = h.post("/completion", streamed).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let frames: Vec<serde_json::Value> = sse
+        .lines()
+        .filter(|l| l.starts_with("data: "))
+        .map(|l| Harness::json(l.trim_start_matches("data: ")))
+        .collect();
+    let last = frames
+        .iter()
+        .find(|v| v["stop"] == serde_json::json!(true))
+        .expect("no terminal frame");
+    let text_frames = frames
+        .iter()
+        .filter(|v| v["stop"] == serde_json::json!(false))
+        .count() as u64;
+
+    assert_eq!(
+        last["tokens_predicted"].as_u64().unwrap(),
+        expected,
+        "the streamed count disagrees with the engine's own"
+    );
+    // Guards the test itself: if frames and tokens happened to agree here, the
+    // assertion above would hold even with the old frame-counting code, and this
+    // would be pinning nothing.
+    assert_ne!(
+        text_frames, expected,
+        "fixture no longer exercises the frame/token mismatch; pick another prompt"
+    );
+}
+
+#[tokio::test]
+async fn an_oversized_embeddings_batch_is_refused_rather_than_run() {
+    // One request is one blocking task running its inputs serially, and nothing
+    // downstream bounds how many there are. Without a cap, the body-size limit is
+    // the only thing standing between a caller and thousands of forward passes.
+    let h = harness("embed_cap", |_| {});
+
+    let many: Vec<String> = (0..1024).map(|i| format!("input {i}")).collect();
+    let (status, body) = h
+        .post("/v1/embeddings", serde_json::json!({ "input": many }))
+        .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let message = Harness::json(&body)["error"]["message"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        message.contains("1024") && message.contains("per request"),
+        "unhelpful error: {message}"
+    );
+
+    // A batch inside the cap still works.
+    let few: Vec<String> = (0..4).map(|i| format!("input {i}")).collect();
+    let (status, body) = h
+        .post("/v1/embeddings", serde_json::json!({ "input": few }))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(Harness::json(&body)["data"].as_array().unwrap().len(), 4);
 }
 
 #[tokio::test]

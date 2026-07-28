@@ -95,7 +95,11 @@ fn map_error(e: &GarudaError) -> Response {
     error(status, e.to_string())
 }
 
-async fn generate(State(state): State<SharedState>, Json(req): Json<GenerateRequest>) -> Response {
+async fn generate(
+    State(state): State<SharedState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<GenerateRequest>,
+) -> Response {
     if req.inputs.is_empty() {
         return error(StatusCode::UNPROCESSABLE_ENTITY, "inputs must not be empty");
     }
@@ -106,7 +110,8 @@ async fn generate(State(state): State<SharedState>, Json(req): Json<GenerateRequ
     let want_details = req.parameters.details;
 
     let tokens = state.runtime.tokenizer.encode(&req.inputs);
-    let handle = match session::submit(&state, "tgi", tokens, params, Priority::Normal) {
+    let user = crate::api::user_id(&headers);
+    let handle = match session::submit(&state, &user, tokens, params, Priority::Normal) {
         Ok(h) => h,
         Err(e) => return map_error(&e),
     };
@@ -129,6 +134,7 @@ async fn generate(State(state): State<SharedState>, Json(req): Json<GenerateRequ
 
 async fn generate_stream(
     State(state): State<SharedState>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<GenerateRequest>,
 ) -> Response {
     if req.inputs.is_empty() {
@@ -140,7 +146,8 @@ async fn generate_stream(
     };
 
     let tokens = state.runtime.tokenizer.encode(&req.inputs);
-    let handle = match session::submit(&state, "tgi", tokens, params, Priority::Normal) {
+    let user = crate::api::user_id(&headers);
+    let handle = match session::submit(&state, &user, tokens, params, Priority::Normal) {
         Ok(h) => h,
         Err(e) => return map_error(&e),
     };
@@ -148,21 +155,19 @@ async fn generate_stream(
     let stream = async_stream::stream! {
         // TGI reports the full text only on the terminal event, so accumulate it.
         let mut full = String::new();
-        let mut generated = 0usize;
         let pieces = session::pieces(state, handle);
         futures_util::pin_mut!(pieces);
         while let Some(p) = pieces.next().await {
             match p {
                 Piece::Text(text) => {
                     full.push_str(&text);
-                    generated += 1;
                     yield Ok::<_, std::convert::Infallible>(Event::default().data(json!({
                         "token": { "id": 0, "text": text, "logprob": 0.0, "special": false },
                         "generated_text": null,
                         "details": null,
                     }).to_string()));
                 }
-                Piece::Done(reason) => {
+                Piece::Done { reason, tokens: generated } => {
                     yield Ok(Event::default().data(json!({
                         "token": { "id": 0, "text": "", "logprob": 0.0, "special": true },
                         "generated_text": full,

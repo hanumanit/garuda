@@ -92,6 +92,7 @@ fn map_error(e: &GarudaError) -> Response {
 
 async fn completion(
     State(state): State<SharedState>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<CompletionRequest>,
 ) -> Response {
     if req.prompt.is_empty() {
@@ -105,25 +106,24 @@ async fn completion(
     let tokens = state.runtime.tokenizer.encode(&req.prompt);
     let prompt_tokens = tokens.len();
 
-    let handle = match session::submit(&state, "llamacpp", tokens, params, Priority::Normal) {
+    let user = crate::api::user_id(&headers);
+    let handle = match session::submit(&state, &user, tokens, params, Priority::Normal) {
         Ok(h) => h,
         Err(e) => return map_error(&e),
     };
 
     if req.stream {
         let stream = async_stream::stream! {
-            let mut predicted = 0usize;
             let pieces = session::pieces(state, handle);
             futures_util::pin_mut!(pieces);
             while let Some(p) = pieces.next().await {
                 match p {
                     Piece::Text(text) => {
-                        predicted += 1;
                         yield Ok::<_, std::convert::Infallible>(
                             Event::default().data(json!({ "content": text, "stop": false }).to_string())
                         );
                     }
-                    Piece::Done(reason) => {
+                    Piece::Done { reason, tokens: predicted } => {
                         let eos = matches!(reason, StopReason::Eos);
                         yield Ok(Event::default().data(json!({
                             "content": "",

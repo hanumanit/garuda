@@ -3,6 +3,11 @@
 //! One request at a time per socket. Cancellation is real: a `{"cancel": true}`
 //! message, or the socket closing, drops the scheduler handle, and generation stops
 //! at the next token boundary.
+//!
+//! A browser cannot set headers on a handshake, so when API keys are configured it
+//! authenticates by naming the key as a subprotocol (see [`crate::auth`]). A server
+//! that accepts a subprotocol must echo the one it selected, or the browser fails
+//! the connection — so the handshake below reflects that entry back.
 
 use crate::api::SharedState;
 use crate::scheduler::{Priority, RequestSpec, StreamEvent};
@@ -12,6 +17,7 @@ use axum::{
         State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
+    http::HeaderMap,
     response::IntoResponse,
     routing::get,
 };
@@ -81,8 +87,26 @@ impl WsResponse {
     }
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, State(state): State<SharedState>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    // The auth middleware has already accepted (or rejected) the key by this point;
+    // echoing the subprotocol is purely the handshake obligation, so the browser
+    // does not close a connection the server was happy to serve.
+    let offered = headers
+        .get(axum::http::header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|v| v.to_str().ok())
+        .and_then(crate::auth::ws_protocol_key)
+        .map(|key| format!("{}{key}", crate::auth::WS_KEY_PROTOCOL_PREFIX));
+
+    let user = crate::api::user_id(&headers);
+    let ws = match offered {
+        Some(p) => ws.protocols([p]),
+        None => ws,
+    };
+    ws.on_upgrade(move |socket| handle_socket(socket, state, user))
 }
 
 /// Send `resp`; `false` means the socket is gone.
@@ -93,7 +117,7 @@ async fn send(socket: &mut WebSocket, resp: &WsResponse) -> bool {
     socket.send(Message::Text(text)).await.is_ok()
 }
 
-async fn handle_socket(mut socket: WebSocket, state: SharedState) {
+async fn handle_socket(mut socket: WebSocket, state: SharedState, user: String) {
     while let Some(Ok(msg)) = socket.recv().await {
         let text = match msg {
             Message::Text(t) => t,
@@ -122,14 +146,14 @@ async fn handle_socket(mut socket: WebSocket, state: SharedState) {
             continue;
         }
 
-        if !run_one(&mut socket, &state, req).await {
+        if !run_one(&mut socket, &state, &user, req).await {
             return;
         }
     }
 }
 
 /// Run a single request to completion. Returns `false` if the socket died.
-async fn run_one(socket: &mut WebSocket, state: &SharedState, req: WsRequest) -> bool {
+async fn run_one(socket: &mut WebSocket, state: &SharedState, user: &str, req: WsRequest) -> bool {
     let mut params = state.defaults;
     if let Some(v) = req.temperature {
         params.temperature = v;
@@ -165,7 +189,7 @@ async fn run_one(socket: &mut WebSocket, state: &SharedState, req: WsRequest) ->
     }
 
     let handle = state.scheduler.submit(RequestSpec {
-        user_id: "ws".to_owned(),
+        user_id: user.to_owned(),
         prompt: state.runtime.tokenizer.encode(&req.prompt),
         params,
         priority,

@@ -190,11 +190,12 @@ async fn run(
     state: SharedState,
     kind: Kind,
     model: String,
+    user: &str,
     tokens: Vec<crate::core::Token>,
     params: SamplingParams,
     stream: bool,
 ) -> Response {
-    let handle = match session::submit(&state, "ollama", tokens, params, Priority::Normal) {
+    let handle = match session::submit(&state, user, tokens, params, Priority::Normal) {
         Ok(h) => h,
         Err(e) => return map_error(&e),
     };
@@ -204,15 +205,13 @@ async fn run(
         let body = async_stream::stream! {
             let pieces = session::pieces(state, handle);
             futures_util::pin_mut!(pieces);
-            let mut count = 0usize;
             while let Some(p) = pieces.next().await {
                 match p {
                     Piece::Text(text) => {
-                        count += 1;
                         yield Ok::<_, Infallible>(chunk(kind, &model, &text));
                     }
-                    Piece::Done(reason) => {
-                        yield Ok(done_line(kind, &model, count, started.elapsed(), stop_reason(reason)));
+                    Piece::Done { reason, tokens } => {
+                        yield Ok(done_line(kind, &model, tokens, started.elapsed(), stop_reason(reason)));
                     }
                     Piece::Error(e) => {
                         yield Ok(format!("{}\n", json!({ "error": e.to_string() })));
@@ -246,7 +245,11 @@ async fn run(
     Json(v).into_response()
 }
 
-async fn generate(State(state): State<SharedState>, Json(req): Json<GenerateRequest>) -> Response {
+async fn generate(
+    State(state): State<SharedState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<GenerateRequest>,
+) -> Response {
     if req.prompt.is_empty() {
         return error(StatusCode::BAD_REQUEST, "prompt must not be empty");
     }
@@ -262,10 +265,24 @@ async fn generate(State(state): State<SharedState>, Json(req): Json<GenerateRequ
     text.push_str(&req.prompt);
     let tokens = state.runtime.tokenizer.encode(&text);
     let model = req.model.unwrap_or_else(|| MODEL_ID.to_owned());
-    run(state, Kind::Generate, model, tokens, params, req.stream).await
+    let user = crate::api::user_id(&headers);
+    run(
+        state,
+        Kind::Generate,
+        model,
+        &user,
+        tokens,
+        params,
+        req.stream,
+    )
+    .await
 }
 
-async fn chat(State(state): State<SharedState>, Json(req): Json<ChatRequest>) -> Response {
+async fn chat(
+    State(state): State<SharedState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<ChatRequest>,
+) -> Response {
     if req.messages.is_empty() {
         return error(StatusCode::BAD_REQUEST, "messages must not be empty");
     }
@@ -280,7 +297,8 @@ async fn chat(State(state): State<SharedState>, Json(req): Json<ChatRequest>) ->
     );
     let tokens = state.runtime.tokenizer.encode(&prompt);
     let model = req.model.unwrap_or_else(|| MODEL_ID.to_owned());
-    run(state, Kind::Chat, model, tokens, params, req.stream).await
+    let user = crate::api::user_id(&headers);
+    run(state, Kind::Chat, model, &user, tokens, params, req.stream).await
 }
 
 async fn tags() -> Response {
