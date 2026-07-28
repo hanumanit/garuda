@@ -261,4 +261,37 @@ pub trait InferenceBackend: Send + Sync {
         context: &[Token],
         seq: &mut crate::cache::SeqState,
     ) -> Result<Tensor, GarudaError>;
+
+    /// [`Self::logits`] for several independent sequences at once.
+    ///
+    /// `contexts[i]` pairs with `seqs[i]`, and the results come back in the same
+    /// order. Every invariant above applies to each element separately — the
+    /// sequences share nothing, which is exactly what makes them batchable.
+    ///
+    /// The default runs them one at a time, so this is only worth overriding for a
+    /// backend that can share work across the batch. That share is the whole point
+    /// for a large model: one pass over the weights can answer for every sequence in
+    /// the batch instead of one, which is the difference between reading the model
+    /// once per token and once per batch of tokens.
+    ///
+    /// An implementation that overrides this **must** return exactly what the default
+    /// would have. Batching is an optimisation, never a change of answer.
+    fn logits_batch(
+        &self,
+        contexts: &[&[Token]],
+        seqs: &mut [crate::cache::SeqState],
+    ) -> Result<Vec<Tensor>, GarudaError> {
+        if contexts.len() != seqs.len() {
+            return Err(GarudaError::Inference(format!(
+                "logits_batch got {} contexts for {} sequences",
+                contexts.len(),
+                seqs.len()
+            )));
+        }
+        contexts
+            .iter()
+            .zip(seqs.iter_mut())
+            .map(|(c, s)| self.logits(c, s))
+            .collect()
+    }
 }

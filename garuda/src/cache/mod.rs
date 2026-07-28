@@ -559,6 +559,13 @@ impl SeqState {
         self.kvs[0].len()
     }
 
+    /// The context window every layer of this sequence is capped at. Immutable, so a
+    /// caller can check whether work will fit without taking a mutable borrow of the
+    /// cache it is about to check on behalf of.
+    pub fn max_positions(&self) -> usize {
+        self.kvs[0].max_positions()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.kvs[0].is_empty()
     }

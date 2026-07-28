@@ -192,6 +192,28 @@ impl ExpertWeight {
     }
 }
 
+/// Where each token in a batch appends its keys and values.
+///
+/// Prefill is a batch of prompt tokens sharing one sequence's cache, appended in
+/// order; a batched decode step is one token from each of several sequences, each
+/// with its own. The layer code is identical either way, so it takes this instead of
+/// a cache.
+enum KvTargets<'a, 'b> {
+    Shared(&'a mut KVCacheState),
+    // Two lifetimes: `&mut` is invariant, so tying the slice and its contents to one
+    // would force every caller's borrows to have identical extent.
+    PerToken(&'a mut [&'b mut KVCacheState]),
+}
+
+impl KvTargets<'_, '_> {
+    fn get(&mut self, token: usize) -> &mut KVCacheState {
+        match self {
+            KvTargets::Shared(kv) => kv,
+            KvTargets::PerToken(kvs) => kvs[token],
+        }
+    }
+}
+
 /// The three matrices a SwiGLU expert is made of. They are always used together, and
 /// always for the same expert index, so they travel as one.
 #[derive(Clone, Copy)]
@@ -584,30 +606,48 @@ impl LlamaBackend {
         h
     }
 
-    /// Grouped-query causal attention with rotary embeddings for one token.
-    fn attention(
+    /// Q, K and V for a whole batch — three batched matmuls instead of `3n` matvecs,
+    /// so each projection's rows are read and decoded once for every token.
+    #[allow(clippy::type_complexity)]
+    fn project_qkv(
         &self,
         layer: &Layer,
-        h: &[f32],
+        hs: &[f32],
+        n: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), GarudaError> {
+        let (d, kv_dim) = (self.cfg.d_model, self.cfg.kv_dim());
+        let mut q = vec![0.0; n * d];
+        let mut k = vec![0.0; n * kv_dim];
+        let mut v = vec![0.0; n * kv_dim];
+        layer.wq.matmul_rows(0, hs, n, &mut q)?;
+        layer.wk.matmul_rows(0, hs, n, &mut k)?;
+        layer.wv.matmul_rows(0, hs, n, &mut v)?;
+        Ok((q, k, v))
+    }
+
+    /// One token's grouped-query causal attention, given its already-projected
+    /// `q`/`k`/`v`: rotate by position, append to `kv`, and read out the context.
+    ///
+    /// This is the part that cannot be batched away. Attention is causal, so a
+    /// token's keys and values must be in the cache before anything attends to them,
+    /// and `pos` is read from the cache itself — which is what keeps a batch of
+    /// prompt tokens sharing one cache in the right order.
+    fn attend_one(
+        &self,
+        q: &mut [f32],
+        k: &mut [f32],
+        v: &[f32],
         kv: &mut KVCacheState,
-    ) -> Result<Vec<f32>, GarudaError> {
+        context: &mut [f32],
+    ) -> Result<(), GarudaError> {
         let LlamaConfig {
-            d_model: d,
             n_heads,
             n_kv_heads,
             head_dim: hd,
             rope_theta,
             ..
         } = self.cfg;
-        let kv_dim = self.cfg.kv_dim();
         let group = n_heads / n_kv_heads;
-
-        let mut q = vec![0.0; d];
-        let mut k = vec![0.0; kv_dim];
-        let mut v = vec![0.0; kv_dim];
-        layer.wq.matvec(h, &mut q)?;
-        layer.wk.matvec(h, &mut k)?;
-        layer.wv.matvec(h, &mut v)?;
 
         let pos = kv.len();
         for hh in 0..n_heads {
@@ -617,15 +657,13 @@ impl LlamaBackend {
             simd::rope(&mut k[hh * hd..(hh + 1) * hd], pos, rope_theta);
         }
 
-        kv.append(&k, &v)?;
+        kv.append(k, v)?;
 
         let start = kv.attention_start();
         let end = pos + 1;
         kv.ensure_resident(start, end)?;
 
         let scale = 1.0 / (hd as f32).sqrt();
-        let mut context = vec![0.0; d];
-
         for hh in 0..n_heads {
             let q_h = &q[hh * hd..(hh + 1) * hd];
             let kv_head = hh / group; // GQA: several query heads share a kv head
@@ -648,10 +686,7 @@ impl LlamaBackend {
                 simd::add_scaled(out_h, &val[kr.clone()], p);
             }
         }
-
-        let mut out = vec![0.0; d];
-        layer.wo.matvec(&context, &mut out)?;
-        Ok(out)
+        Ok(())
     }
 
     /// One layer over a whole batch of tokens.
@@ -667,18 +702,59 @@ impl LlamaBackend {
         xs: &mut [Vec<f32>],
         kv: &mut KVCacheState,
     ) -> Result<(), GarudaError> {
-        let layer = &self.layers[l];
+        self.layer_batch_over(l, xs, KvTargets::Shared(kv))
+    }
 
-        let mut hs: Vec<f32> = Vec::with_capacity(xs.len() * self.cfg.d_model);
-        for x in xs.iter_mut() {
-            let h = self.norm(x, &layer.attn_norm);
-            let attn = self.attention(layer, &h, kv)?;
-            simd::add_assign(x, &attn);
-            hs.extend_from_slice(&self.norm(x, &layer.ffn_norm));
+    /// The same layer over a batch whose tokens each belong to a *different*
+    /// sequence — one decode step across concurrent requests. Everything except the
+    /// attention read is shared, so N sequences cost one pass over the weights.
+    fn layer_batch_multi(
+        &self,
+        l: usize,
+        xs: &mut [Vec<f32>],
+        kvs: &mut [&mut KVCacheState],
+    ) -> Result<(), GarudaError> {
+        self.layer_batch_over(l, xs, KvTargets::PerToken(kvs))
+    }
+
+    fn layer_batch_over(
+        &self,
+        l: usize,
+        xs: &mut [Vec<f32>],
+        mut kvs: KvTargets<'_, '_>,
+    ) -> Result<(), GarudaError> {
+        let layer = &self.layers[l];
+        let (d, kv_dim, n) = (self.cfg.d_model, self.cfg.kv_dim(), xs.len());
+
+        // Every token's attention input depends only on its own layer input, so the
+        // whole batch can be normed and projected before any of it attends.
+        let mut hs = Vec::with_capacity(n * d);
+        for x in xs.iter() {
+            hs.extend_from_slice(&self.norm(x, &layer.attn_norm));
+        }
+        let (mut q, mut k, v) = self.project_qkv(layer, &hs, n)?;
+
+        let mut context = vec![0.0; n * d];
+        for i in 0..n {
+            self.attend_one(
+                &mut q[i * d..(i + 1) * d],
+                &mut k[i * kv_dim..(i + 1) * kv_dim],
+                &v[i * kv_dim..(i + 1) * kv_dim],
+                kvs.get(i),
+                &mut context[i * d..(i + 1) * d],
+            )?;
         }
 
-        let ffn = self.feed_forward_batch(l, layer, &hs, xs.len(), kv)?;
-        let d = self.cfg.d_model;
+        let mut attn_out = vec![0.0; n * d];
+        layer.wo.matmul_rows(0, &context, n, &mut attn_out)?;
+
+        let mut hs_ffn = Vec::with_capacity(n * d);
+        for (i, x) in xs.iter_mut().enumerate() {
+            simd::add_assign(x, &attn_out[i * d..(i + 1) * d]);
+            hs_ffn.extend_from_slice(&self.norm(x, &layer.ffn_norm));
+        }
+
+        let ffn = self.feed_forward_batch(l, layer, &hs_ffn, n, &mut kvs)?;
         for (i, x) in xs.iter_mut().enumerate() {
             simd::add_assign(x, &ffn[i * d..(i + 1) * d]);
         }
@@ -699,7 +775,7 @@ impl LlamaBackend {
         layer: &Layer,
         hs: &[f32],
         n: usize,
-        kv: &mut KVCacheState,
+        kvs: &mut KvTargets<'_, '_>,
     ) -> Result<Vec<f32>, GarudaError> {
         let d = self.cfg.d_model;
 
@@ -742,6 +818,10 @@ impl LlamaBackend {
             }
 
             if let Some(pf) = &self.prefetch {
+                // Routing history is per sequence *and* per layer: the predictor's
+                // model is a token-to-token transition, so a batch drawn from
+                // different sequences must not be chained together.
+                let kv = kvs.get(t);
                 let base = (l * ne) as ExpertId;
                 let used: Vec<ExpertId> =
                     ranked.iter().map(|&(e, _)| base + e as ExpertId).collect();
@@ -843,7 +923,7 @@ impl InferenceBackend for LlamaBackend {
         // Refuse an over-long prefill before touching anything. Discovering it
         // partway through would leave the layers at different lengths, and
         // layer-major makes that gap a whole chunk wide rather than one position.
-        let capacity = seq.layer(0).max_positions();
+        let capacity = seq.max_positions();
         if already + new.len() > capacity {
             return Err(GarudaError::Cache(format!(
                 "{} tokens do not fit the {capacity}-position context window ({already} used)",
@@ -880,6 +960,86 @@ impl InferenceBackend for LlamaBackend {
         simd::rmsnorm(&mut x, self.cfg.rms_eps);
         simd::mul_assign(&mut x, &self.output_norm);
         Tensor::new(vec![d], x)
+    }
+
+    /// One decode step across several sequences, sharing one pass over the weights.
+    ///
+    /// Only the attention read is per sequence; the projections, the router and the
+    /// experts all see the batch at once. For a checkpoint larger than RAM that is
+    /// the difference between streaming the model once per token and once per batch
+    /// of tokens — a single sequence decoding alone has no way to amortise it.
+    ///
+    /// Falls back to one call each unless every sequence contributes exactly one new
+    /// token. That is the decode case, and it is the only one where the sequences do
+    /// equal work; a mixed batch would leave most of them idle behind the longest.
+    fn logits_batch(
+        &self,
+        contexts: &[&[Token]],
+        seqs: &mut [SeqState],
+    ) -> Result<Vec<Tensor>, GarudaError> {
+        if contexts.len() != seqs.len() {
+            return Err(GarudaError::Inference(format!(
+                "logits_batch got {} contexts for {} sequences",
+                contexts.len(),
+                seqs.len()
+            )));
+        }
+        let n = contexts.len();
+        let one_step_each = n > 1
+            && contexts
+                .iter()
+                .zip(seqs.iter())
+                .all(|(c, s)| c.len() == s.len() + 1 && s.n_layers() == self.cfg.n_layers);
+        if !one_step_each {
+            return contexts
+                .iter()
+                .zip(seqs.iter_mut())
+                .map(|(c, s)| self.logits(c, s))
+                .collect();
+        }
+
+        // Reject before touching any cache, so a batch cannot be left half-advanced.
+        for (c, s) in contexts.iter().zip(seqs.iter()) {
+            let token = *c.last().expect("checked non-empty by the length test");
+            if token as usize >= self.cfg.vocab {
+                return Err(GarudaError::InvalidToken(token));
+            }
+            if s.len() + 1 > s.max_positions() {
+                return Err(GarudaError::Cache(format!(
+                    "context window of {} positions is exhausted",
+                    s.max_positions()
+                )));
+            }
+        }
+
+        let (d, vocab) = (self.cfg.d_model, self.cfg.vocab);
+        let mut xs: Vec<Vec<f32>> = Vec::with_capacity(n);
+        for c in contexts {
+            xs.push(
+                self.token_embd
+                    .row(*c.last().expect("non-empty") as usize)?,
+            );
+        }
+
+        for l in 0..self.cfg.n_layers {
+            // Each sequence's own cache for this layer; distinct elements, so the
+            // borrows do not overlap.
+            let mut kvs: Vec<&mut KVCacheState> = seqs.iter_mut().map(|s| s.layer(l)).collect();
+            self.layer_batch_multi(l, &mut xs, &mut kvs)?;
+        }
+
+        let mut hidden = Vec::with_capacity(n * d);
+        for x in xs.iter_mut() {
+            simd::rmsnorm(x, self.cfg.rms_eps);
+            simd::mul_assign(x, &self.output_norm);
+            hidden.extend_from_slice(x);
+        }
+
+        let mut all = vec![0.0; n * vocab];
+        self.output.matmul_rows(0, &hidden, n, &mut all)?;
+        (0..n)
+            .map(|i| Tensor::new(vec![vocab], all[i * vocab..(i + 1) * vocab].to_vec()))
+            .collect()
     }
 
     fn logits(&self, context: &[Token], seq: &mut SeqState) -> Result<Tensor, GarudaError> {
@@ -1273,6 +1433,111 @@ mod tests {
         for l in 0..backend.config().n_layers {
             assert_eq!(seq.layer(l).len(), 0, "layer {l} was advanced anyway");
         }
+    }
+
+    /// A batched decode step must produce exactly what decoding each sequence on its
+    /// own produces. The sequences share nothing but the weights, so batching them is
+    /// only ever an optimisation — this is the test that says so.
+    #[test]
+    fn a_batched_decode_step_matches_decoding_each_sequence_alone() {
+        let backend = LlamaBackend::load(&build_moe_gguf(ExpertLayout::Merged)).unwrap();
+        let vocab = backend.config().vocab as Token;
+
+        // Deliberately different lengths and contents, so the batch is not secretly
+        // uniform and a mixed-up index would show.
+        let convos: Vec<Vec<Token>> = vec![
+            vec![3, 7, 1, 9],
+            vec![11, 2],
+            vec![5, 5, 5, 5, 5, 5],
+            vec![vocab - 1, 0, 42],
+        ];
+
+        // Bring each sequence up to date one at a time, then take one more step —
+        // once alone, once as part of a batch.
+        let mut alone_seqs: Vec<SeqState> = convos.iter().map(|_| seq_for(&backend)).collect();
+        let mut batch_seqs: Vec<SeqState> = convos.iter().map(|_| seq_for(&backend)).collect();
+        for (i, c) in convos.iter().enumerate() {
+            backend.logits(c, &mut alone_seqs[i]).unwrap();
+            backend.logits(c, &mut batch_seqs[i]).unwrap();
+        }
+
+        let stepped: Vec<Vec<Token>> = convos
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let mut c = c.clone();
+                c.push((i as Token * 13 + 4) % vocab);
+                c
+            })
+            .collect();
+
+        let alone: Vec<Tensor> = stepped
+            .iter()
+            .enumerate()
+            .map(|(i, c)| backend.logits(c, &mut alone_seqs[i]).unwrap())
+            .collect();
+
+        let refs: Vec<&[Token]> = stepped.iter().map(|c| c.as_slice()).collect();
+        let batched = backend.logits_batch(&refs, &mut batch_seqs).unwrap();
+
+        assert_eq!(batched.len(), alone.len());
+        for (i, (b, a)) in batched.iter().zip(&alone).enumerate() {
+            assert_eq!(b.data(), a.data(), "sequence {i} differs when batched");
+            assert_eq!(batch_seqs[i].len(), alone_seqs[i].len(), "kv length {i}");
+        }
+    }
+
+    /// The batched path is for equal work per sequence. A batch where the sequences
+    /// have different amounts to catch up on must still be answered correctly, by
+    /// falling back rather than by producing something wrong.
+    #[test]
+    fn a_ragged_batch_falls_back_and_still_answers_correctly() {
+        let backend = LlamaBackend::load(&build_moe_gguf(ExpertLayout::Merged)).unwrap();
+        let a: Vec<Token> = vec![3, 7, 1];
+        let b: Vec<Token> = vec![9, 2, 5, 4, 8];
+
+        let mut alone = [seq_for(&backend), seq_for(&backend)];
+        let want = [
+            backend.logits(&a, &mut alone[0]).unwrap(),
+            backend.logits(&b, &mut alone[1]).unwrap(),
+        ];
+
+        // Both sequences start empty, so they have 3 and 5 tokens to consume: ragged.
+        let mut seqs = [seq_for(&backend), seq_for(&backend)];
+        let got = backend
+            .logits_batch(&[a.as_slice(), b.as_slice()], &mut seqs)
+            .unwrap();
+
+        for i in 0..2 {
+            assert_eq!(got[i].data(), want[i].data(), "sequence {i}");
+        }
+    }
+
+    #[test]
+    fn logits_batch_rejects_mismatched_lengths_and_bad_tokens() {
+        let backend = LlamaBackend::load(&build_moe_gguf(ExpertLayout::Merged)).unwrap();
+        let c: Vec<Token> = vec![1, 2];
+        let mut seqs = [seq_for(&backend), seq_for(&backend)];
+
+        assert!(
+            backend.logits_batch(&[c.as_slice()], &mut seqs).is_err(),
+            "one context for two sequences must not be accepted"
+        );
+
+        // Bring both to the same length, then step with an out-of-vocabulary token.
+        backend.logits(&c, &mut seqs[0]).unwrap();
+        backend.logits(&c, &mut seqs[1]).unwrap();
+        let bad: Vec<Token> = vec![1, 2, backend.config().vocab as Token + 3];
+        let err = backend
+            .logits_batch(&[bad.as_slice(), bad.as_slice()], &mut seqs)
+            .unwrap_err();
+        assert!(matches!(err, GarudaError::InvalidToken(_)), "got {err:?}");
+        assert_eq!(
+            seqs[0].len(),
+            2,
+            "a refused batch must not advance any cache"
+        );
+        assert_eq!(seqs[1].len(), 2);
     }
 
     /// The same row-range plumbing as above, but over a k-quant. F32 rows are 4 bytes
