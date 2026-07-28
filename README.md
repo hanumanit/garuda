@@ -56,7 +56,7 @@ the streaming, the cancellation, the load shedding.
 | Dequantisation: F32 / F16 / Q4_0 / Q8_0 / Q2_K–Q6_K | Real, tested (runs Q2_K…Q5_K_M models) |
 | Memory-mapped packed weights (`mmap = true`), incl. per-expert streaming | Real, tested (~6× less RAM, same output) |
 | Batched, expert-grouped prefill | Real, tested — ~2× faster prefill even on a model that fits in RAM (an expert's rows are decoded once per batch, not once per token), and cuts the working set from the whole model per token to one layer (7.1 GB → 816 MB for Mixtral Q4_K_M). `model.prefill_batch` tunes or disables it |
-| Integer (NEON `i8`) matmul kernel for Q8_0, Q4_K and Q6_K | Real, tested (2.6× / ~9–10× / ~9–10× faster respectively than dequantise-then-dot, same output within quantisation tolerance). Q4_K and Q6_K are almost all of a `Q4_K_M` file's bytes |
+| Integer (NEON `i8`) matmul kernel for **every** quantised type | Real, tested — `Q8_0` and all five k-quants dot straight against an int8-quantised activation. Roughly 4–15× faster than dequantise-then-dot depending on type (see below), within quantisation tolerance of it |
 | A real MoE checkpoint at scale (Mixtral-8x7B, Q4_K_M, 26 GB) | Real, tested — loads and generates on a 16 GB machine via `mmap`; both GGUF expert-tensor layouts (merged `..._exps` and the older per-expert tensors some conversions use) load correctly |
 | Speculative expert prefetch against a real checkpoint | Real, tested — a per-layer Markov predictor warms the likely next experts' mmap pages via `madvise(WILLNEED)` on a background thread while the current step still computes (5–6× faster than faulting them in by hand) |
 | Built-in chat page (`GET /`) | Real — talks to `/v1/chat/completions`, same origin, no separate frontend; multiple conversations (sidebar, switch, delete), saved in the browser's `localStorage` (the API key is not: that lives in `sessionStorage`) |
@@ -300,18 +300,16 @@ registered in `Engine::build` — see **[PLUGIN.md](PLUGIN.md)** and
 
 ### What is still missing
 
-- **Integer kernels for the rest of the k-quants.** `Q8_0`, `Q4_K` and `Q6_K` dot
-  directly against an int8-quantised activation now, without ever expanding a row to
-  `f32` — 2.6×, ~9–10× and ~9–10× faster respectively than dequantise-then-dot, measured
-  at Mixtral's own row width. The k-quants turned out to be worth it despite the
-  unpack cost that made the smaller-block `Q4_0` not worth it: their 256-element
-  super-blocks amortise that cost across enough dot-product work to win big. Between
-  them `Q4_K` and `Q6_K` cover almost every byte of a `Q4_K_M` checkpoint.
-  `Q2_K`/`Q3_K`/`Q5_K` still take the slower dequantise-to-`f32` path — the same trick
-  should apply, just not done yet. The `*_1` linear quants and IQ imatrix quants still
-  need decoders entirely.
+- **Architectures beyond Llama, and the remaining quant formats.** Every type that
+  decodes today has an integer kernel. What is missing is decoders: the `*_1` linear
+  quants (`Q4_1`, `Q5_1`) and the IQ imatrix quants have none, so those checkpoints
+  are refused rather than run.
 - **Architectures beyond Llama.** `LlamaBackend` covers the Llama family (dense and
   MoE, GQA). Other architectures each need their own `InferenceBackend`.
+- **Continuous batching across requests.** Prefill batches within one request, but
+  each sequence decodes on its own, so a decode step reads the whole model to produce
+  one token. Batching the decode step across concurrent sequences would amortise that
+  the way prefill now does.
 
 ---
 

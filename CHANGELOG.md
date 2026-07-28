@@ -2,6 +2,55 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.15.0] - 2026-07-29
+
+Every quantised type now has an integer kernel. Under `mmap`, no quantised checkpoint
+takes the dequantise-to-`f32` path any more.
+
+### Added
+
+- **Integer kernels for `Q2_K`, `Q3_K` and `Q5_K`**, completing the set. Each dots the
+  packed row straight against an int8-quantised activation without expanding it, the
+  way `Q8_0`/`Q4_K`/`Q6_K` already did. Measured at Mixtral's own FFN row width
+  (14336×4096), three runs, against dequantise-then-dot:
+
+  | | speedup (3 runs) |
+  |---|---|
+  | `Q8_0` | 3.9× / 6.2× / 7.4× |
+  | `Q2_K` | 5.6× / 5.5× / 4.5× |
+  | `Q3_K` | 8.0× / 4.9× / 6.0× |
+  | `Q4_K` | 7.7× / 9.8× / 8.0× |
+  | `Q5_K` | 6.0× / 5.9× / 6.8× |
+  | `Q6_K` | 15.5× / 10.2× / 12.3× |
+
+  The spread is run-to-run noise on a laptop, not a property of the types; the honest
+  claim is "several times faster each", not any single figure. p90 relative error
+  against the `f32` reference stays under 0.034 for all six.
+
+  `Q2_K` needed one thing the others did not: its scale-and-min pair covers 16 weights
+  rather than 32, so its affine min-term sums the activation over runs of 16.
+  `Q3_K`'s 6-bit signed scale unpacking is now shared with the dequantiser instead of
+  duplicated — get that word-juggling wrong and every weight in the tensor is scaled
+  by the wrong number.
+
+### Changed
+
+- The per-type `matvec_q8_0`/`matvec_q4_k`/`matvec_q6_k` wrappers are replaced by one
+  `matvec_int8` plus an `int8_dot` dispatcher, so adding a format means writing its
+  row kernel and nothing else. Both `matvec` and `matmul` route through it, so the
+  new kernels benefit batched prefill as well.
+
+### Tests
+
+- **A unit-activation test.** With an all-ones activation the int8 quantisation is
+  exact, so kernel and reference must agree to `f32` rounding — which pins the format
+  unpacking on its own, separately from quantisation noise. This is what identified a
+  3.5% gap on `Q5_K` as noise rather than a bug.
+- **The quantised-activation tolerance is now derived, not chosen.** Each activation
+  element is off by at most half its block's quantisation step, so the dot is off by
+  at most `sum|w| * step/2`. Asserting that bound keeps the test tight enough to catch
+  a misread format, instead of a percentage picked until it passed.
+
 ## [0.14.0] - 2026-07-28
 
 Prefill was structured so that every prompt token paid for the whole model. It now
