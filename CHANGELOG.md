@@ -2,6 +2,46 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.21.0] - 2026-07-29
+
+Expert prefetch, measured on the case it was built for. It turns out to help
+somewhere other than where it was described as helping.
+
+The feature has been in since 0.9.0 and marked "Real, tested", but the tests only
+ever asserted that it *predicts* something and does not change the output. Nothing
+established that it made anything faster — and the workload it exists for, a
+checkpoint larger than RAM, was not measurable here until now.
+
+**Mixtral-8x7B Q4_K_M, 25 GB, on 16 GB of RAM**, `mmap`, batched prefill, three
+paired runs with the order varied between them:
+
+| | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| time to first token, prefetch on | 32.7 s | 40.2 s | 51.1 s |
+| time to first token, prefetch off | 61.0 s | 62.4 s | 83.0 s |
+| decode, prefetch on | 11.01 s/token | 12.12 s/token | 16.64 s/token |
+| decode, prefetch off | 14.45 s/token | 12.18 s/token | 10.85 s/token |
+
+So it is worth **~1.6× on time to first token**, consistently and in every ordering.
+On decode it made **no measurable difference**: the two sets overlap completely and
+the sign flips between runs. The first pair alone looked like a 1.3× decode win,
+which is exactly why the runs are paired and the order varied — one pair would have
+supported the wrong conclusion.
+
+The asymmetry has a plausible cause, though this measurement does not prove it. The
+predictor is per layer: it warms what layer `l` will want *next token*. During
+prefill many tokens pass through layer `l` back to back, so that guess is needed
+almost immediately. During decode the next visit to layer `l` is a whole pass
+through the other thirty-one layers away — by which time, on a model this much
+larger than RAM, the pages it warmed can already have been evicted.
+
+### Documentation
+
+- The README row says what was measured rather than describing the mechanism. The
+  "5–6×" it used to quote was `madvise` against hand-faulting *inside* the
+  prefetcher, which is a fact about the implementation and reads like an end-to-end
+  speedup.
+
 ## [0.20.0] - 2026-07-29
 
 The larger-than-RAM claim is measured. It had been the one number in this project
