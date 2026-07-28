@@ -11,9 +11,10 @@
 //! returns `None` for them so the loader errors clearly rather than producing garbage.
 //!
 //! [`matvec`] can also multiply a packed row directly against an int8-quantised
-//! activation — never expanding the row to `f32` — for `Q8_0` and `Q4_K`. This is
-//! the fast path `Weight::Packed` uses under `mmap`; the other formats still
-//! dequantise to `f32` per row before dotting.
+//! activation — never expanding the row to `f32` — for `Q8_0`, `Q4_K` and `Q6_K`.
+//! This is the fast path `Weight::Packed` uses under `mmap`; the other formats still
+//! dequantise to `f32` per row before dotting. `Q4_K` and `Q6_K` together are the
+//! overwhelming majority of a `Q4_K_M` checkpoint's bytes.
 
 use crate::core::GarudaError;
 
@@ -182,18 +183,26 @@ pub fn matvec(
     }
 
     // Q8_0 weights are already int8, so the integer kernel dots them with an int8-quantised
-    // input directly, never expanding to f32 — a clear win. Q4_K's super-blocks are large
-    // enough (256 elements, 8 sub-blocks sharing the unpack cost) that the same trick pays
-    // off there too, despite the extra nibble-unpack; tried for the small-block Q4_0 as
-    // well, but there the unpack dominates and it came out slower than dequantise-to-f32,
-    // so that one keeps the f32 path.
-    if qtype == Q8_0 {
-        matvec_q8_0(weight, cols, x, out);
-        return Ok(());
-    }
-    if qtype == Q4_K {
-        matvec_q4_k(weight, cols, x, out);
-        return Ok(());
+    // input directly, never expanding to f32 — a clear win. The k-quants' 256-element
+    // super-blocks are large enough to amortise their unpack across enough dot-product
+    // work that the same trick pays off there too: Q4_K ~10x, Q6_K ~9x, both measured at
+    // Mixtral's own row width. Tried for the small-block Q4_0 as well, but there the
+    // unpack dominates and it came out slower than dequantise-to-f32, so that one keeps
+    // the f32 path.
+    match qtype {
+        Q8_0 => {
+            matvec_q8_0(weight, cols, x, out);
+            return Ok(());
+        }
+        Q4_K => {
+            matvec_q4_k(weight, cols, x, out);
+            return Ok(());
+        }
+        Q6_K => {
+            matvec_q6_k(weight, cols, x, out);
+            return Ok(());
+        }
+        _ => {}
     }
 
     out.par_iter_mut()
@@ -270,6 +279,57 @@ fn matvec_q4_k(weight: &[u8], cols: usize, x: &[f32], out: &mut [f32]) {
     out.par_iter_mut()
         .zip(weight.par_chunks_exact(row_bytes))
         .for_each(|(o, row)| *o = q4_k_dot(row, &xq, &xs, &sums));
+}
+
+/// Q6_K integer-kernel matvec. Q6_K is symmetric (`w = d·scale·q`, no min term), so
+/// unlike [`matvec_q4_k`] there is no per-block activation sum to carry — just the
+/// dot products.
+fn matvec_q6_k(weight: &[u8], cols: usize, x: &[f32], out: &mut [f32]) {
+    use rayon::prelude::*;
+    let (xq, xs) = quantize_activation(x);
+    let row_bytes = 210 * (cols / QK_K);
+
+    out.par_iter_mut()
+        .zip(weight.par_chunks_exact(row_bytes))
+        .for_each(|(o, row)| *o = q6_k_dot(row, &xq, &xs));
+}
+
+/// One Q6_K-quantised row dotted against an int8-quantised activation.
+///
+/// The 6-bit quants are assembled into `i8` exactly as [`dequant_q6_k`] indexes them
+/// — a centred quant lands in `-32..=31`, well inside `i8` — but the scales are never
+/// applied to the weights. They factor out of the dot product instead: each of the
+/// sixteen 16-element sub-blocks contributes `d · sub_scale · activation_scale · dot`,
+/// so the row never becomes `f32`. Two sub-blocks share one 32-wide activation scale,
+/// which is why `off / QK` indexes `xs`.
+fn q6_k_dot(row: &[u8], xq: &[i8], xs: &[f32]) -> f32 {
+    let mut acc = 0.0f32;
+    let mut q = [0i8; QK_K];
+
+    for (bi, block) in row.chunks_exact(210).enumerate() {
+        let d = f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
+        let sc = &block[192..208];
+
+        for half in 0..2 {
+            let ql = &block[half * 64..half * 64 + 64];
+            let qh = &block[128 + half * 32..128 + half * 32 + 32];
+            let y = half * 128;
+            for l in 0..32 {
+                q[y + l] = ((ql[l] & 0x0F) | ((qh[l] & 3) << 4)) as i8 - 32;
+                q[y + l + 32] = ((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) as i8 - 32;
+                q[y + l + 64] = ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) as i8 - 32;
+                q[y + l + 96] = ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) as i8 - 32;
+            }
+        }
+
+        let base = bi * QK_K;
+        for (s, &scale) in sc.iter().enumerate() {
+            let off = base + s * 16;
+            let dot = crate::simd::dot_i8(&q[s * 16..s * 16 + 16], &xq[off..off + 16]) as f32;
+            acc += xs[off / QK] * d * (scale as i8) as f32 * dot;
+        }
+    }
+    acc
 }
 
 /// One Q4_K-quantised row dotted against an int8-quantised activation. Mirrors
@@ -862,6 +922,138 @@ mod tests {
                 want
             );
         }
+    }
+
+    /// A random-but-valid `block_q6_K` super-block: plausible `d`, random int8
+    /// sub-scales, random 6-bit quants across `ql`/`qh`.
+    fn random_q6_k_block(seed: &mut u64) -> [u8; 210] {
+        let mut b = [0u8; 210];
+        for byte in b[0..192].iter_mut() {
+            *byte = (splitmix64(seed) % 256) as u8;
+        }
+        for s in b[192..208].iter_mut() {
+            // Sub-scales are signed; keep them in a range a real quantiser produces.
+            *s = ((splitmix64(seed) % 127) as i32 - 63) as i8 as u8;
+        }
+        let d = half_bits(0.002 + (splitmix64(seed) % 100) as f32 * 0.0001);
+        b[208..210].copy_from_slice(&d.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn q6_k_matvec_matches_the_dequantise_then_dot_reference() {
+        let mut seed = 99u64;
+        let (rows, blocks_per_row) = (5, 3);
+        let cols = blocks_per_row * QK_K;
+
+        let mut weight = Vec::new();
+        for _ in 0..rows * blocks_per_row {
+            weight.extend_from_slice(&random_q6_k_block(&mut seed));
+        }
+        let x: Vec<f32> = (0..cols)
+            .map(|i| ((splitmix64(&mut seed) % 2000) as f32 / 1000.0 - 1.0) * (1 + i % 5) as f32)
+            .collect();
+
+        // The kernel directly, not through `matvec`: if the dispatch were ever
+        // dropped this would otherwise compare the reference against itself.
+        let mut got = vec![0.0f32; rows];
+        matvec_q6_k(&weight, cols, &x, &mut got);
+        let mut dispatched = vec![0.0f32; rows];
+        matvec(Q6_K, &weight, rows, cols, &x, &mut dispatched).unwrap();
+        assert_eq!(got, dispatched, "matvec did not take the Q6_K integer path");
+
+        for r in 0..rows {
+            let row = &weight[r * blocks_per_row * 210..(r + 1) * blocks_per_row * 210];
+            let deq = dequantize(Q6_K, row, cols).unwrap();
+            let want: f32 = deq.iter().zip(&x).map(|(a, b)| a * b).sum();
+            // Same activation-quantisation tradeoff as the Q4_K and Q8_0 paths: close,
+            // not bit-identical.
+            let tol = want.abs() * 0.02 + 1.0;
+            assert!(
+                (got[r] - want).abs() < tol,
+                "row {r}: got {}, want {} (tol {tol})",
+                got[r],
+                want
+            );
+        }
+    }
+
+    #[test]
+    fn q6_k_matvec_handles_an_all_zero_row_without_nan_or_panic() {
+        // All-zero bytes mean every quant is 0 -> -32 after centring, but the scales
+        // are zero too, so the row contributes nothing and must not produce a NaN.
+        let weight = vec![0u8; 210 * 2];
+        let x = vec![0.5f32; QK_K * 2];
+        let mut out = vec![0.0f32; 1];
+        matvec(Q6_K, &weight, 1, QK_K * 2, &x, &mut out).unwrap();
+        assert_eq!(out[0], 0.0);
+    }
+
+    /// Timing comparison for the Q6_K kernel against the dequantise-then-`f32`-dot
+    /// path, at Mixtral's own FFN row width. Run with:
+    ///   cargo test --release quant::tests::q6_k_kernel_timing -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn q6_k_kernel_timing() {
+        use rayon::prelude::*;
+        use std::time::Instant;
+
+        let (rows, cols) = (14_336usize, 4096usize);
+        let blocks_per_row = cols / QK_K;
+
+        let mut seed = 11u64;
+        let mut weight = Vec::with_capacity(rows * blocks_per_row * 210);
+        for _ in 0..rows * blocks_per_row {
+            weight.extend_from_slice(&random_q6_k_block(&mut seed));
+        }
+        let x: Vec<f32> = (0..cols)
+            .map(|i| ((splitmix64(&mut seed) % 2000) as f32 / 1000.0 - 1.0) * (1 + i % 5) as f32)
+            .collect();
+
+        let row_bytes = 210 * blocks_per_row;
+        let mut out_old = vec![0.0f32; rows];
+        let mut out_new = vec![0.0f32; rows];
+
+        matvec_q6_k(&weight, cols, &x, &mut out_new); // warm up
+
+        let t = Instant::now();
+        out_old
+            .par_iter_mut()
+            .zip(weight.par_chunks_exact(row_bytes))
+            .for_each_init(
+                || vec![0.0f32; cols],
+                |buf, (o, row)| {
+                    dequant_into(Q6_K, row, buf).unwrap();
+                    *o = crate::simd::dot(buf, &x);
+                },
+            );
+        let old_elapsed = t.elapsed();
+
+        let t = Instant::now();
+        matvec_q6_k(&weight, cols, &x, &mut out_new);
+        let new_elapsed = t.elapsed();
+
+        eprintln!(
+            "Q6_K matvec, {rows} rows x {cols} cols: old(dequant+f32 dot) = {old_elapsed:?}, \
+             new(int8 fused) = {new_elapsed:?}, speedup = {:.2}x",
+            old_elapsed.as_secs_f64() / new_elapsed.as_secs_f64()
+        );
+
+        let mut rel_errs: Vec<f32> = out_old
+            .iter()
+            .zip(&out_new)
+            .map(|(a, b)| (a - b).abs() / a.abs().max(1e-6))
+            .collect();
+        rel_errs.sort_by(|a, b| a.total_cmp(b));
+        let n = rel_errs.len();
+        eprintln!(
+            "relative error: min={:.4} p50={:.4} p90={:.4} max={:.4}",
+            rel_errs[0],
+            rel_errs[n / 2],
+            rel_errs[n * 9 / 10],
+            rel_errs[n - 1]
+        );
+        assert!(rel_errs[n * 9 / 10] < 0.10, "p90 relative error regressed");
     }
 
     #[test]

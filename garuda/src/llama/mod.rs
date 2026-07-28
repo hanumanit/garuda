@@ -986,6 +986,97 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The same row-range plumbing as above, but over a k-quant. F32 rows are 4 bytes
+    /// an element; a Q6_K row is 210 bytes per 256 elements, so `row_start * row_bytes`
+    /// is doing genuinely different arithmetic — and a stacked MoE expert tensor is
+    /// addressed entirely through it. An off-by-one here silently reads a neighbouring
+    /// expert's weights.
+    #[test]
+    fn packed_k_quant_rows_are_addressed_correctly() {
+        use crate::quant;
+
+        let (rows, cols) = (6usize, 512usize); // 2 Q6_K super-blocks per row
+        let blocks_per_row = cols / 256;
+        let row_bytes = 210 * blocks_per_row;
+
+        // Valid-but-arbitrary Q6_K bytes, deterministic.
+        let mut state = 4242u64;
+        let mut rnd = || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        let mut packed = Vec::with_capacity(rows * row_bytes);
+        for _ in 0..rows * blocks_per_row {
+            let mut b = [0u8; 210];
+            for byte in b[0..192].iter_mut() {
+                *byte = (rnd() % 256) as u8;
+            }
+            for s in b[192..208].iter_mut() {
+                *s = ((rnd() % 127) as i32 - 63) as i8 as u8;
+            }
+            b[208..210].copy_from_slice(&0x1400u16.to_le_bytes()); // f16 d, ~0.0039
+            packed.extend_from_slice(&b);
+        }
+
+        let dir = std::env::temp_dir().join("garuda_packed_q6k");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("q6k.bin");
+        std::fs::write(&path, &packed).unwrap();
+        let mmap = Arc::new(unsafe { Mmap::map(&std::fs::File::open(&path).unwrap()).unwrap() });
+
+        let full = Weight::Full {
+            data: quant::dequantize(quant::Q6_K, &packed, rows * cols).unwrap(),
+            cols,
+        };
+        let packed_w = Weight::Packed {
+            qtype: quant::Q6_K,
+            cols,
+            src: mmap,
+            start: 0,
+        };
+
+        let x: Vec<f32> = (0..cols).map(|i| ((i as f32) * 0.017).sin()).collect();
+
+        // A sub-range of rows [2, 5), the way one expert's slice of a stacked tensor
+        // is read.
+        let mut of = vec![0.0; 3];
+        let mut op = vec![0.0; 3];
+        full.matvec_rows(2, &x, &mut of).unwrap();
+        packed_w.matvec_rows(2, &x, &mut op).unwrap();
+
+        for r in 0..3 {
+            // The packed path quantises the activation to int8, so this is close
+            // rather than exact — but it must be the *same row*, which a wrong offset
+            // would not be.
+            let tol = of[r].abs() * 0.05 + 1e-3;
+            assert!(
+                (of[r] - op[r]).abs() < tol,
+                "row {r}: full {} vs packed {} (tol {tol})",
+                of[r],
+                op[r]
+            );
+        }
+
+        // And a wrong offset must be detectable: neighbouring rows differ.
+        let mut other = vec![0.0; 3];
+        full.matvec_rows(3, &x, &mut other).unwrap();
+        assert!(
+            (of[0] - other[0]).abs() > 1e-6,
+            "fixture is degenerate: adjacent rows produce the same dot product"
+        );
+
+        // Single-row reads go through a different branch; check that one too.
+        let row2 = packed_w.row(2).unwrap();
+        assert_eq!(row2.len(), cols);
+        let naive: f32 = row2.iter().zip(&x).map(|(a, b)| a * b).sum();
+        assert!((naive - of[0]).abs() < of[0].abs() * 0.01 + 1e-4);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn synthetic_moe_model_loads_routes_and_runs() {
         let bytes = build_moe_gguf(ExpertLayout::Merged);
