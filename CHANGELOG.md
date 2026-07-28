@@ -2,6 +2,60 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.16.0] - 2026-07-29
+
+Groundwork for batching the *decode* step across concurrent requests. A single
+sequence decoding alone reads the whole model to produce one token and has no way to
+amortise that; several sequences stepping together can share the pass.
+
+### Added
+
+- **`InferenceBackend::logits_batch`**, running several independent sequences in one
+  call. It is defaulted — the default calls `logits` per sequence — so existing
+  backends keep working and only one that can share work across the batch needs to
+  override it. `LlamaBackend` does: only the attention read stays per sequence, while
+  the projections, the router and the experts all see the batch at once.
+
+  Measured on a 620 MB MoE checkpoint, 8 decode steps per sequence, best of three:
+
+  | sequences | throughput | per token |
+  |---|---|---|
+  | 1 | 65.8 tok/s | 15.20 ms |
+  | 2 | 65.7 tok/s | 15.22 ms |
+  | 4 | 75.7 tok/s | 13.22 ms |
+  | 8 | 103.8 tok/s | 9.64 ms |
+  | 16 | 128.8 tok/s | 7.76 ms |
+
+  The gain starts around four sequences and reaches ~2× at sixteen, which is what the
+  routing predicts: with top-2 of 8 experts, a batch has to reach `n_experts/top_k`
+  before an expert serves more than one token per pass. Below that there is nothing
+  to share and the numbers say so.
+
+- **Batched attention projections.** `wq`/`wk`/`wv`/`wo` now go through one matmul per
+  layer instead of one matvec per token, which also speeds up the prefill path added
+  in 0.14.0. Attention itself is unchanged and still strictly per token: it is causal,
+  and each sequence reads its own cache.
+
+- `SeqState::max_positions`, so a caller can check whether work fits without taking a
+  mutable borrow of the cache it is asking about.
+
+### Not yet wired
+
+The scheduler still drives each request independently, so nothing calls `logits_batch`
+outside its tests yet. Turning it on means restructuring the scheduler from one task
+per request into a loop that collects ready sequences and steps them together, while
+keeping the cancellation, timeout, priority and per-user guarantees that its tests
+pin. That is deliberately a separate change: this one is verifiable on its own.
+
+### Tests
+
+- A batched decode step must equal decoding each sequence alone — different lengths
+  and contents in the batch, so a crossed index would show.
+- A ragged batch (sequences with different amounts to catch up on) falls back rather
+  than producing something wrong.
+- A refused batch — mismatched lengths, an out-of-vocabulary token — leaves every
+  cache untouched instead of half-advanced.
+
 ## [0.15.0] - 2026-07-29
 
 Every quantised type now has an integer kernel. Under `mmap`, no quantised checkpoint

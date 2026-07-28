@@ -34,7 +34,8 @@ Most plugins are backends or tokenizers, so this guide centres on those.
 
 ## Walkthrough: a custom `InferenceBackend`
 
-A backend turns a token context into next-token logits. The trait is three methods,
+A backend turns a token context into next-token logits. The trait is three required
+methods (plus `logits_batch`, which defaults to calling `logits` per sequence),
 but the work is in honouring five invariants the runtime relies on and does not
 re-check. We build a toy backend that satisfies all of them. Like the built-in
 synthetic MoE, it runs real arithmetic over made-up weights, so its output is

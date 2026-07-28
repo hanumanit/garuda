@@ -272,7 +272,10 @@ matter; read the doc comments in the source for the authoritative contract.
 
 ### The `InferenceBackend` contract
 
-The trait is three methods (`dims`, `hidden`, `logits`), but the load-bearing part
+The trait is three required methods (`dims`, `hidden`, `logits`) plus one defaulted
+(`logits_batch`, which runs several independent sequences and by default just calls
+`logits` for each — override it only if your backend can share work across them). The
+load-bearing part
 is the invariants an implementation must uphold — the runtime relies on them and
 does not re-check:
 
