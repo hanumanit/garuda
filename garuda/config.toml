@@ -27,6 +27,16 @@ experts = 8
 top_k = 2
 # Attention window. 0 attends to the whole context.
 sliding_window = 0
+# Prompt tokens that share one pass over a layer's weights during prefill.
+# 0 decides automatically from the checkpoint's size against physical RAM; 1 turns the
+# batching off (a token traverses every layer before the next one starts).
+#
+# It only matters under mmap, and the two cases point opposite ways. When the checkpoint
+# fits in the page cache, token-major is ~8% faster (measured on a 620 MB MoE model).
+# When it does not, token-major re-reads every layer once per prompt token — the working
+# set becomes the whole model per token (7.1 GB for Mixtral-8x7B Q4_K_M) instead of one
+# layer (816 MB), which is the difference between streaming from disk and not.
+prefill_batch = 0
 # There is no GPU backend. Setting this to true is a startup error, not a fallback.
 gpu = false
 

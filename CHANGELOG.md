@@ -2,6 +2,51 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.14.0] - 2026-07-28
+
+Making a checkpoint larger than RAM respond, rather than crawl. Both changes here are
+about *page-cache* behaviour; neither touches the arithmetic.
+
+### Added
+
+- **Layer-major prefill (`model.prefill_batch`).** Prefill ran each prompt token
+  through all N layers before starting the next, so every layer's weights were
+  re-read once per token — the working set is the *whole model, per token*. For
+  Mixtral-8x7B Q4_K_M that is 7.1 GB, against 816 MB for a single layer with all
+  eight experts. Above what the page cache holds, that is the difference between
+  streaming the model off disk once per token and once per chunk. Prefill can now
+  drive a batch of tokens through one layer before moving on.
+
+  It is **off unless the checkpoint warrants it**, because the two cases point
+  opposite ways: when the model *does* fit, layer-major is ~8% slower (measured on a
+  620 MB mmapped MoE model, 512-token prefill: 9.49 s token-major vs 10.25 s
+  layer-major). Neither order gets reuse out of the CPU caches — one layer's weights
+  already exceed L3 — so batching only pays at the page-cache level, and otherwise
+  just costs locality. `Engine` picks from the file size against physical RAM and
+  logs which it chose; `model.prefill_batch` overrides it either way.
+
+  Honest limit: the crossover was not measured directly. Demonstrating it needs a
+  checkpoint larger than the host's RAM, which this machine could not do safely. The
+  8% cost is measured; the win above the crossover is reasoned from the working-set
+  sizes, which is why it is gated and overridable rather than simply switched on.
+
+  Output is unchanged and is tested that way — a batched prefill must equal feeding
+  the same tokens one at a time, across a chunk boundary too. The two orders produced
+  identical checksums in the benchmark above.
+
+### Changed
+
+- **The expert prefetcher uses `madvise(MADV_WILLNEED)`** instead of reading one byte
+  per page. Touching pages by hand faulted them in one at a time — a Mixtral-sized
+  expert is ~99 MB, over six thousand separate faults at a 16 KB page size — and
+  dragged every page through the CPU, evicting cache lines the forward pass was still
+  using. Measured cold over 400 MB, twice with the order reversed: 217 ms / 232 ms for
+  the advice against 1.12 s / 1.43 s for the byte loop, so **5-6× faster**. It is not
+  asynchronous on macOS, which the comment now says rather than assumes; the point of
+  the prefetcher is to spend a background thread on that wait regardless.
+- An over-long prefill is refused before any layer runs, instead of failing partway
+  and leaving the layers at different lengths.
+
 ## [0.13.0] - 2026-07-28
 
 ### Added

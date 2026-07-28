@@ -55,9 +55,10 @@ the streaming, the cancellation, the load shedding.
 | OpenAI + Ollama + Anthropic + llama.cpp + TGI APIs, SSE / NDJSON / WebSocket | Real, tested |
 | Dequantisation: F32 / F16 / Q4_0 / Q8_0 / Q2_K–Q6_K | Real, tested (runs Q2_K…Q5_K_M models) |
 | Memory-mapped packed weights (`mmap = true`), incl. per-expert streaming | Real, tested (~6× less RAM, same output) |
+| Prefill batched layer-major when the checkpoint outgrows RAM | Real, tested — cuts the prefill working set from the whole model per token to one layer (7.1 GB → 816 MB for Mixtral Q4_K_M). Off when the model fits, where it costs ~8%; `model.prefill_batch` overrides |
 | Integer (NEON `i8`) matmul kernel for Q8_0, Q4_K and Q6_K | Real, tested (2.6× / ~9–10× / ~9–10× faster respectively than dequantise-then-dot, same output within quantisation tolerance). Q4_K and Q6_K are almost all of a `Q4_K_M` file's bytes |
 | A real MoE checkpoint at scale (Mixtral-8x7B, Q4_K_M, 26 GB) | Real, tested — loads and generates on a 16 GB machine via `mmap`; both GGUF expert-tensor layouts (merged `..._exps` and the older per-expert tensors some conversions use) load correctly |
-| Speculative expert prefetch against a real checkpoint | Real, tested — a per-layer Markov predictor warms the likely next experts' mmap pages on a background thread while the current step still computes |
+| Speculative expert prefetch against a real checkpoint | Real, tested — a per-layer Markov predictor warms the likely next experts' mmap pages via `madvise(WILLNEED)` on a background thread while the current step still computes (5–6× faster than faulting them in by hand) |
 | Built-in chat page (`GET /`) | Real — talks to `/v1/chat/completions`, same origin, no separate frontend; multiple conversations (sidebar, switch, delete), saved in the browser's `localStorage` (the API key is not: that lives in `sessionStorage`) |
 | API key authentication (`Authorization: Bearer` or `x-api-key`) | Real, tested — off by default; set `server.api_keys` to require one. WebSockets may present it as a subprotocol, since browsers cannot set handshake headers |
 | **GPU backend** | **Not implemented** (`gpu = true` is a startup error) |
