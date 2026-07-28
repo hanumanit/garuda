@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.0] - 2026-07-28
+
+### Added
+
+- **A fused int8 kernel for `Q6_K`**, the second tensor type a `Q4_K_M` checkpoint is
+  made of. Like the `Q4_K` kernel it dots the packed row straight against an
+  int8-quantised activation, never expanding the row to `f32`: **9–10× faster** than
+  dequantise-then-dot at Mixtral's own FFN row width (9.1 ms → 0.9–1.0 ms for a
+  14336×4096 matvec; repeat runs measured 9.4× and 10.3×), p50 relative error 0.005.
+  `Q6_K` is symmetric, so unlike `Q4_K` there is no per-block activation sum to carry
+  — only the dot products.
+
+  With `Q4_K` and `Q6_K` both on the integer path, almost every byte of a `Q4_K_M`
+  file now avoids the `f32` round trip. `Q2_K`/`Q3_K`/`Q5_K` still take the slower
+  path.
+
+### Tests
+
+- The `Q6_K` kernel is checked against the dequantise-then-dot reference, and the
+  check calls the kernel directly as well as through `matvec` — comparing only via
+  `matvec` would silently become a comparison of the reference against itself if the
+  dispatch were ever dropped.
+- A `Weight::Packed` row-addressing test over a k-quant. An F32 row is 4 bytes an
+  element; a `Q6_K` row is 210 bytes per 256, so `row_start * row_bytes` does
+  genuinely different arithmetic — and a stacked MoE expert tensor is addressed
+  entirely through it, where an off-by-one would quietly read a neighbouring expert.
+
 ## [0.12.0] - 2026-07-28
 
 A full re-read of the codebase against its own documentation. Most of what it turned

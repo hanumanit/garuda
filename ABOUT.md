@@ -38,9 +38,9 @@ experts a token routes to (and, under `mmap`, paging in only those); both GGUF e
 tensor layouts load (the merged `..._exps` tensors newer conversions use, and the
 older per-expert tensors some, including the original TheBloke Mixtral quantisations,
 use instead). That MoE path is verified against a real large MoE now — Mixtral-8x7B,
-Q4_K_M, 26 GB — loading and generating on a 16 GB machine via `mmap`. `Q8_0` and
-`Q4_K` (the dominant tensor type in that file) dot directly against an int8-quantised
-activation rather than expanding to `f32` first. There is **no GPU backend**
+Q4_K_M, 26 GB — loading and generating on a 16 GB machine via `mmap`. `Q8_0`, `Q4_K`
+and `Q6_K` — between them almost every byte of that file — dot directly against an
+int8-quantised activation rather than expanding to `f32` first. There is **no GPU backend**
 (`gpu = true` is a startup error, not a silent fallback), and authentication is off
 by default — set `server.api_keys` to require one, or do not expose it to a network
 you do not control.
@@ -52,7 +52,7 @@ the runtime already depended on. See [PLUGIN.md](PLUGIN.md).
 ## Facts
 
 - **Language:** Rust (edition 2024, 1.85+)
-- **Tests:** 160 (144 unit + 16 end-to-end HTTP)
+- **Tests:** 163 (147 unit + 16 end-to-end HTTP)
 - **Verified:** loads and runs both the TinyStories 260K checkpoint and a real
   Mixtral-8x7B (Q4_K_M, 26 GB) end to end, the latter on a 16 GB machine via `mmap`
 - **API:** OpenAI-compatible REST + SSE + WebSocket, plus a built-in chat page at `/`
