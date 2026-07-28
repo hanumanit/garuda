@@ -169,24 +169,39 @@ impl ExpertLoader for GgufPagePrefetcher {
     fn unload(&self, _id: ExpertId) {}
 
     fn prefetch(&self, id: ExpertId) -> Result<(), crate::core::GarudaError> {
-        // One touch per (likely) page is enough to fault it in; page size varies by
-        // platform, so stride conservatively rather than query it.
-        const STRIDE: usize = 4096;
         let Some(ranges) = self.ranges.get(id as usize) else {
             return Ok(());
         };
-        let mut sink = 0u8;
+
+        // `madvise(MADV_WILLNEED)` rather than reading a byte per page.
+        //
+        // Touching pages by hand faulted them in one at a time: one expert of a
+        // Mixtral-sized model is ~99 MB, which at a 16 KB page size is over six
+        // thousand separate faults, and it dragged every page through the CPU,
+        // evicting cache lines the forward pass was still using. Handing the kernel
+        // the whole range instead lets it issue large sequential reads. Measured cold
+        // over 400 MB, twice with the order reversed: 217 ms / 232 ms for the advice
+        // against 1.12 s / 1.43 s for the byte loop — 5-6x.
+        //
+        // Note this does not return before the I/O does, at least on macOS; the
+        // advice is faster, not asynchronous. That is fine here — the point of the
+        // prefetcher is to spend a *background* thread on that wait while the
+        // foreground step computes — but it is why this is not a fire-and-forget call.
+        //
+        // Advisory in both directions: a kernel that ignores the hint, or a range it
+        // declines, costs nothing. The forward pass still faults whatever it needs.
         for &(start, len) in ranges {
-            let end = (start + len).min(self.mmap.len());
-            let mut i = start;
-            while i < end {
-                sink ^= self.mmap.get(i).copied().unwrap_or(0);
-                i += STRIDE;
+            let len = len.min(self.mmap.len().saturating_sub(start));
+            if len == 0 {
+                continue;
+            }
+            if let Err(e) = self
+                .mmap
+                .advise_range(memmap2::Advice::WillNeed, start, len)
+            {
+                tracing::debug!(expert = id, error = %e, "madvise(WILLNEED) declined");
             }
         }
-        // Nothing reads `sink`; without this the touching loop above is dead code an
-        // optimiser is free to remove entirely.
-        std::hint::black_box(sink);
         Ok(())
     }
 

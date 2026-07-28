@@ -23,6 +23,14 @@ use crate::{quant, simd};
 use memmap2::Mmap;
 use std::sync::Arc;
 
+/// Default prompt tokens driven through one layer before moving to the next, when
+/// the checkpoint is large enough for it to pay. See
+/// [`LlamaBackend::with_prefill_chunk`] for when that is, and why.
+///
+/// The value bounds the activation buffer (`chunk * d_model * 4` bytes — 4 MB at
+/// Mixtral's width), not the benefit, which saturates long before this.
+pub const DEFAULT_PREFILL_CHUNK: usize = 256;
+
 /// One weight matrix, either expanded to `f32` in RAM or kept packed (quantised) in a
 /// memory-mapped file and dequantised a row at a time during matmul.
 ///
@@ -283,6 +291,10 @@ pub struct LlamaBackend {
     output: Arc<Weight>,
     layers: Vec<Layer>,
     prefetch: Option<Arc<crate::prefetch::PrefetchEngine>>,
+    /// Prompt tokens pushed through one layer before moving to the next; `1` is
+    /// token-major. Set via [`Self::with_prefill_chunk`], which documents the
+    /// tradeoff.
+    prefill_chunk: usize,
 }
 
 impl LlamaBackend {
@@ -420,6 +432,9 @@ impl LlamaBackend {
             output,
             layers,
             prefetch: None,
+            // Token-major unless something tells us the checkpoint is too big to
+            // cache; `Engine::build` makes that call.
+            prefill_chunk: 1,
         })
     }
 
@@ -463,6 +478,38 @@ impl LlamaBackend {
             }
         }
         out
+    }
+
+    /// Set how many prompt tokens share one pass over a layer's weights. `0` and
+    /// `1` both mean token-major: a token traverses every layer before the next
+    /// one starts.
+    ///
+    /// Which order wins depends entirely on whether the weights fit in the page
+    /// cache, and the two cases point opposite ways.
+    ///
+    /// **When the checkpoint fits**, token-major is faster — measured ~8% on a
+    /// 620 MB mmapped MoE model (512-token prefill: 9.49 s token-major against
+    /// 10.25 s layer-major). Neither order gets reuse out of the CPU caches, because
+    /// one layer's weights already exceed L3; layer-major just additionally keeps
+    /// `chunk` activations live instead of one, and pays for the worse locality.
+    ///
+    /// **When it does not fit**, token-major re-reads every layer once per prompt
+    /// token, so the working set is the whole model per token — 7.1 GB for
+    /// Mixtral-8x7B Q4_K_M, against 816 MB for a single layer with all eight
+    /// experts. Above the page cache that is the difference between streaming the
+    /// model from disk once per token and once per chunk.
+    ///
+    /// [`crate::server::Engine`] therefore chooses from the checkpoint's size
+    /// against physical RAM rather than fixing one. The crossover has not been
+    /// measured directly — it needs a checkpoint larger than the host's RAM — which
+    /// is why `model.prefill_batch` exists to override the guess.
+    ///
+    /// Either order computes the same thing: each token's hidden state flows through
+    /// the layers independently, and the only coupling — layer `l`'s attention
+    /// reading layer `l`'s KV — is appended in token order either way.
+    pub fn with_prefill_chunk(mut self, chunk: usize) -> Self {
+        self.prefill_chunk = chunk.max(1);
+        self
     }
 
     /// Attach a prefetch engine, so each MoE layer's routing decision warms the
@@ -673,24 +720,52 @@ impl InferenceBackend for LlamaBackend {
         }
 
         let d = self.cfg.d_model;
-        let mut last = None;
-        for &token in &context[already..] {
-            let idx = token as usize;
-            if idx >= self.cfg.vocab {
-                return Err(GarudaError::InvalidToken(token));
-            }
-            let mut x = self.token_embd.row(idx)?;
-            for l in 0..self.cfg.n_layers {
-                // Split the layer borrow from the per-layer cache borrow.
-                let kv = seq.layer(l);
-                self.block(l, &mut x, kv)?;
-            }
-            last = Some(x);
+        let new = &context[already..];
+        if new.is_empty() {
+            return Err(GarudaError::Inference(
+                "no new tokens to process for this context".into(),
+            ));
         }
 
-        let mut x = last.ok_or_else(|| {
-            GarudaError::Inference("no new tokens to process for this context".into())
-        })?;
+        // Refuse an over-long prefill before touching anything. Discovering it
+        // partway through would leave the layers at different lengths, and
+        // layer-major makes that gap a whole chunk wide rather than one position.
+        let capacity = seq.layer(0).max_positions();
+        if already + new.len() > capacity {
+            return Err(GarudaError::Cache(format!(
+                "{} tokens do not fit the {capacity}-position context window ({already} used)",
+                new.len()
+            )));
+        }
+
+        let mut last: Option<Vec<f32>> = None;
+        for chunk in new.chunks(self.prefill_chunk.max(1)) {
+            // Embed the chunk first, so an out-of-vocabulary token is rejected before
+            // any layer has run rather than after the tokens ahead of it.
+            let mut xs: Vec<Vec<f32>> = Vec::with_capacity(chunk.len());
+            for &token in chunk {
+                let idx = token as usize;
+                if idx >= self.cfg.vocab {
+                    return Err(GarudaError::InvalidToken(token));
+                }
+                xs.push(self.token_embd.row(idx)?);
+            }
+
+            // Layer-major: one layer, every token in the chunk, then the next layer.
+            // Each token's hidden state flows through the layers independently, and
+            // the only coupling — layer `l`'s attention reading layer `l`'s KV — is
+            // built in token order either way, so this is the same arithmetic in the
+            // same order. What changes is which weights are hot: see PREFILL_CHUNK.
+            for l in 0..self.cfg.n_layers {
+                let kv = seq.layer(l);
+                for x in xs.iter_mut() {
+                    self.block(l, x, kv)?;
+                }
+            }
+            last = xs.pop();
+        }
+
+        let mut x = last.expect("the chunk loop ran at least once over a non-empty slice");
         simd::rmsnorm(&mut x, self.cfg.rms_eps);
         simd::mul_assign(&mut x, &self.output_norm);
         Tensor::new(vec![d], x)
@@ -984,6 +1059,109 @@ mod tests {
             assert!((op[r] - naive).abs() < 1e-5, "packed row {r}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn seq_with_capacity(b: &LlamaBackend, max_positions: usize) -> SeqState {
+        let lc = b.config();
+        SeqState::new(
+            KvConfig {
+                dims: b.dims(),
+                kv_dim: lc.kv_dim(),
+                n_layers: lc.n_layers,
+                max_positions,
+                max_resident_blocks: 1024,
+                sliding_window: None,
+                storage: None,
+            },
+            1,
+        )
+    }
+
+    /// Prefill drives a chunk of tokens through one layer before moving to the next,
+    /// so a layer's weights are read once for many tokens instead of once each. That
+    /// reorders *nothing* the arithmetic depends on — each token's hidden state flows
+    /// through the layers independently, and layer `l`'s attention reads layer `l`'s
+    /// KV, which is appended in token order either way — so a batched prefill must
+    /// agree exactly with feeding the same tokens one at a time.
+    #[test]
+    fn a_batched_prefill_matches_feeding_tokens_one_at_a_time() {
+        let bytes = build_moe_gguf(ExpertLayout::Merged);
+        let batched_backend = LlamaBackend::load(&bytes).unwrap().with_prefill_chunk(16);
+        let stepwise_backend = LlamaBackend::load(&bytes).unwrap().with_prefill_chunk(1);
+        let tokens: Vec<Token> = vec![3, 7, 1, 9, 2, 5, 4, 8, 6, 0, 11, 13];
+
+        // One call, layer-major over a single chunk of 12.
+        let mut batched_seq = seq_for(&batched_backend);
+        let batched = batched_backend.logits(&tokens, &mut batched_seq).unwrap();
+
+        // Token-major, one token per call — the order this replaced.
+        let mut stepwise_seq = seq_for(&stepwise_backend);
+        let mut stepwise = None;
+        for n in 1..=tokens.len() {
+            stepwise = Some(
+                stepwise_backend
+                    .logits(&tokens[..n], &mut stepwise_seq)
+                    .unwrap(),
+            );
+        }
+
+        assert_eq!(
+            batched.data(),
+            stepwise.unwrap().data(),
+            "batching the prefill changed the output"
+        );
+        assert_eq!(batched_seq.len(), stepwise_seq.len());
+    }
+
+    /// The same equivalence across a chunk boundary, where the layer loop restarts
+    /// and each layer's KV is already part-filled by the previous chunk.
+    #[test]
+    fn a_prefill_spanning_several_chunks_matches_a_stepwise_one() {
+        const CHUNK: usize = 32;
+        let backend = LlamaBackend::load(&build_moe_gguf(ExpertLayout::Merged))
+            .unwrap()
+            .with_prefill_chunk(CHUNK);
+        let n = CHUNK + CHUNK / 2; // 1.5 chunks: one full pass, one partial
+        let vocab = backend.config().vocab as Token;
+        let tokens: Vec<Token> = (0..n).map(|i| (i as Token * 7 + 1) % vocab).collect();
+
+        let mut batched_seq = seq_with_capacity(&backend, n + 8);
+        let batched = backend.logits(&tokens, &mut batched_seq).unwrap();
+
+        // Two calls that split at a point unrelated to the chunk size, so the second
+        // call's chunking starts from a non-zero `already`.
+        let mut split_seq = seq_with_capacity(&backend, n + 8);
+        backend.logits(&tokens[..13], &mut split_seq).unwrap();
+        let split = backend.logits(&tokens, &mut split_seq).unwrap();
+
+        assert_eq!(
+            batched.data(),
+            split.data(),
+            "chunk boundary changed output"
+        );
+        assert_eq!(batched_seq.len(), n);
+    }
+
+    /// An over-long prefill is refused before any layer runs, rather than discovered
+    /// partway through — which under layer-major would leave the layers a whole chunk
+    /// apart instead of one position.
+    #[test]
+    fn an_oversized_prefill_is_refused_before_the_layers_run() {
+        let backend = LlamaBackend::load(&build_moe_gguf(ExpertLayout::Merged)).unwrap();
+        let vocab = backend.config().vocab as Token;
+        let tokens: Vec<Token> = (0..40).map(|i| (i as Token) % vocab).collect();
+
+        let mut seq = seq_with_capacity(&backend, 16);
+        let err = backend.logits(&tokens, &mut seq).unwrap_err();
+        assert!(matches!(err, GarudaError::Cache(_)), "got {err:?}");
+        assert_eq!(
+            seq.len(),
+            0,
+            "a refused prefill must not have touched the kv"
+        );
+        for l in 0..backend.config().n_layers {
+            assert_eq!(seq.layer(l).len(), 0, "layer {l} was advanced anyway");
+        }
     }
 
     /// The same row-range plumbing as above, but over a k-quant. F32 rows are 4 bytes

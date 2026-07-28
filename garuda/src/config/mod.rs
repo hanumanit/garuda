@@ -33,6 +33,12 @@ pub struct ModelConfig {
     pub top_k: usize,
     /// Attention window; `0` attends to the whole context.
     pub sliding_window: usize,
+    /// Prompt tokens that share one pass over a layer's weights during prefill.
+    ///
+    /// `0` decides from the checkpoint's size against physical RAM; `1` disables the
+    /// batching (a token traverses every layer before the next one starts). Only
+    /// affects a memory-mapped gguf model — see `llama::LlamaBackend::prefill_chunk`.
+    pub prefill_batch: usize,
     /// There is no GPU backend. `true` is rejected at startup rather than ignored.
     pub gpu: bool,
 }
@@ -48,6 +54,7 @@ impl Default for ModelConfig {
             experts: 8,
             top_k: 2,
             sliding_window: 0,
+            prefill_batch: 0,
             gpu: false,
         }
     }
