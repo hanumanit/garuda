@@ -296,18 +296,78 @@ impl Scheduler {
     }
 }
 
-/// Prompt tokens one admitted request absorbs per scheduler iteration, while others
-/// are decoding.
+/// Prompt tokens absorbed per scheduler iteration before anything is known about
+/// what they cost, and the range the measured estimate is held to.
 ///
 /// Prefill is unbounded in a way decode is not — its cost is whatever prompt the
 /// caller sent. Absorbing a long one in a single burst stalls every request already
 /// streaming for its whole duration, which is precisely the latency spike batching
 /// was supposed to remove. Feeding it in a piece at a time bounds that stall to one
-/// piece; the cost is a little scheduling overhead per piece.
+/// piece.
 ///
-/// It only applies when something *is* decoding. With nothing else running there is
-/// no one to stall, so the prompt goes in whole.
-const PREFILL_TOKENS_PER_STEP: usize = 32;
+/// How big a piece should be is not a constant, though: 32 tokens is imperceptible
+/// on a small model and seconds on a large one. [`Pacing`] measures both sides and
+/// sizes each chunk to cost about one decode step, so the two interleave evenly
+/// whatever the model. These bounds only keep a wild estimate in check.
+const PREFILL_TOKENS_INITIAL: usize = 32;
+const PREFILL_TOKENS_MIN: usize = 1;
+const PREFILL_TOKENS_MAX: usize = 512;
+
+/// Running estimates of what a decode step and a prefill token cost.
+///
+/// The scheduler alternates between the two, so the chunk that keeps them balanced
+/// is the one whose work matches a decode step's: a newly admitted request then gets
+/// roughly half the machine while the requests already streaming keep the other
+/// half, instead of one starving the other. Both are exponential moving averages —
+/// the per-token costs drift as a batch grows and shrinks.
+#[derive(Debug, Default, Clone, Copy)]
+struct Pacing {
+    decode_step: Option<f64>,
+    prefill_token: Option<f64>,
+}
+
+impl Pacing {
+    /// Weight on the newest sample. Responsive enough to follow a batch changing
+    /// size, damped enough not to chase one slow step.
+    const ALPHA: f64 = 0.25;
+
+    fn blend(slot: &mut Option<f64>, sample: f64) {
+        *slot = Some(match *slot {
+            Some(prev) => prev * (1.0 - Self::ALPHA) + sample * Self::ALPHA,
+            None => sample,
+        });
+    }
+
+    fn observe_decode(&mut self, elapsed: Duration) {
+        Self::blend(&mut self.decode_step, elapsed.as_secs_f64());
+    }
+
+    fn observe_prefill(&mut self, elapsed: Duration, tokens: usize) {
+        if tokens > 0 {
+            Self::blend(
+                &mut self.prefill_token,
+                elapsed.as_secs_f64() / tokens as f64,
+            );
+        }
+    }
+
+    /// Prompt tokens to absorb this iteration, given something is decoding.
+    fn chunk(&self) -> usize {
+        match (self.decode_step, self.prefill_token) {
+            (Some(step), Some(per_token)) if per_token > 0.0 => {
+                ((step / per_token) as usize).clamp(PREFILL_TOKENS_MIN, PREFILL_TOKENS_MAX)
+            }
+            _ => PREFILL_TOKENS_INITIAL,
+        }
+    }
+}
+
+/// What the decode worker owns between iterations.
+struct Batch {
+    active: Vec<Active>,
+    prefilling: Vec<Prefilling>,
+    pacing: Pacing,
+}
 
 /// A request that has been admitted and whose prompt is still going in.
 struct Prefilling {
@@ -338,14 +398,17 @@ async fn run_loop(
 ) {
     let max_active = config.max_concurrent.max(1);
     let mut heap: BinaryHeap<Queued> = BinaryHeap::new();
-    let mut active: Vec<Active> = Vec::new();
-    let mut prefilling: Vec<Prefilling> = Vec::new();
+    let mut batch = Batch {
+        active: Vec::new(),
+        prefilling: Vec::new(),
+        pacing: Pacing::default(),
+    };
 
     loop {
         // Only ever block when there is genuinely nothing to do. Waiting here rather
         // than admitting eagerly is what gives priority its meaning: the heap keeps
         // filling while the current batch decodes.
-        if active.is_empty() && prefilling.is_empty() && heap.is_empty() {
+        if batch.active.is_empty() && batch.prefilling.is_empty() && heap.is_empty() {
             match rx.recv().await {
                 Some(q) => heap.push(q),
                 None => break, // All senders dropped: the scheduler is gone.
@@ -378,7 +441,7 @@ async fn run_loop(
         }
 
         let mut admit = Vec::new();
-        while active.len() + prefilling.len() + admit.len() < max_active {
+        while batch.active.len() + batch.prefilling.len() + admit.len() < max_active {
             let Some(Queued { request, .. }) = heap.pop() else {
                 break;
             };
@@ -396,28 +459,42 @@ async fn run_loop(
         let rt = runtime.clone();
         let sch = scheduler.clone();
         let joined = tokio::task::spawn_blocking(move || {
-            let (mut active, mut prefilling) = (active, prefilling);
+            let mut batch = batch;
             for request in admit {
-                admit_one(&rt, &sch, &mut prefilling, request);
+                admit_one(&rt, &sch, &mut batch.prefilling, request);
             }
             // Nothing is streaming, so there is no one to stall: take the whole
             // prompt rather than dribbling it in over many iterations.
-            let budget = if active.is_empty() {
+            let budget = if batch.active.is_empty() {
                 usize::MAX
             } else {
-                PREFILL_TOKENS_PER_STEP
+                batch.pacing.chunk()
             };
-            advance_prefills(&rt, &sch, &mut prefilling, &mut active, budget);
-            step_batch(&rt, &sch, &mut active);
-            (active, prefilling)
+
+            let started = Instant::now();
+            let absorbed =
+                advance_prefills(&rt, &sch, &mut batch.prefilling, &mut batch.active, budget);
+            if absorbed > 0 {
+                batch.pacing.observe_prefill(started.elapsed(), absorbed);
+            }
+
+            let started = Instant::now();
+            if step_batch(&rt, &sch, &mut batch.active) {
+                batch.pacing.observe_decode(started.elapsed());
+            }
+            batch
         })
         .await;
 
-        (active, prefilling) = match joined {
-            Ok(pair) => pair,
+        batch = match joined {
+            Ok(b) => b,
             Err(e) => {
                 tracing::error!(error = %e, "decode worker died; dropping its batch");
-                (Vec::new(), Vec::new())
+                Batch {
+                    active: Vec::new(),
+                    prefilling: Vec::new(),
+                    pacing: Pacing::default(),
+                }
             }
         };
     }
@@ -457,13 +534,14 @@ fn advance_prefills(
     prefilling: &mut Vec<Prefilling>,
     active: &mut Vec<Active>,
     budget: usize,
-) {
+) -> usize {
     if prefilling.is_empty() {
-        return;
+        return 0;
     }
     let counters = &scheduler.counters;
     let now = Instant::now();
     let mut still = Vec::with_capacity(prefilling.len());
+    let mut absorbed = 0;
 
     for mut p in std::mem::take(prefilling) {
         if p.request.cancel.is_cancelled() {
@@ -487,7 +565,10 @@ fn advance_prefills(
             continue;
         }
 
-        match runtime.advance_prefill(&mut p.pending, budget) {
+        let before = p.pending.remaining();
+        let outcome = runtime.advance_prefill(&mut p.pending, budget);
+        absorbed += before.saturating_sub(p.pending.remaining());
+        match outcome {
             Ok(true) => active.push(Active {
                 session: runtime.finish_prefill(p.pending),
                 request: p.request,
@@ -501,10 +582,11 @@ fn advance_prefills(
         }
     }
     *prefilling = still;
+    absorbed
 }
 
 /// Advance every active sequence by one token, retiring those that are done.
-fn step_batch(runtime: &InferenceRuntime, scheduler: &Scheduler, active: &mut Vec<Active>) {
+fn step_batch(runtime: &InferenceRuntime, scheduler: &Scheduler, active: &mut Vec<Active>) -> bool {
     let counters = &scheduler.counters;
 
     // Cancellation and timeouts are checked between tokens, so a dropped client stops
@@ -538,7 +620,7 @@ fn step_batch(runtime: &InferenceRuntime, scheduler: &Scheduler, active: &mut Ve
         true
     });
     if active.is_empty() {
-        return;
+        return false;
     }
 
     let params: Vec<SamplingParams> = active.iter().map(|a| a.request.spec.params).collect();
@@ -568,6 +650,7 @@ fn step_batch(runtime: &InferenceRuntime, scheduler: &Scheduler, active: &mut Ve
 
     let mut keep = done.into_iter().map(|d| !d);
     active.retain(|_| keep.next().expect("one flag per active request"));
+    true
 }
 
 #[cfg(test)]
@@ -807,6 +890,49 @@ mod tests {
         assert!(s.stats().cancelled >= 1);
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pacing_sizes_a_chunk_to_cost_about_one_decode_step() {
+        let mut p = Pacing::default();
+        // Nothing measured yet: fall back to the starting guess.
+        assert_eq!(p.chunk(), PREFILL_TOKENS_INITIAL);
+
+        // A decode step costing 30 ms and prefill tokens costing 10 ms each means
+        // three prompt tokens are worth about one step.
+        p.observe_decode(Duration::from_millis(30));
+        p.observe_prefill(Duration::from_millis(100), 10);
+        assert_eq!(p.chunk(), 3);
+
+        // A model ten times faster per prefill token takes ten times as many.
+        let mut q = Pacing::default();
+        q.observe_decode(Duration::from_millis(30));
+        q.observe_prefill(Duration::from_millis(10), 10);
+        assert_eq!(q.chunk(), 30);
+
+        // And the estimate is held to sane bounds whatever the ratio says.
+        let mut wild = Pacing::default();
+        wild.observe_decode(Duration::from_secs(60));
+        wild.observe_prefill(Duration::from_nanos(1), 1000);
+        assert_eq!(wild.chunk(), PREFILL_TOKENS_MAX);
+
+        let mut tiny = Pacing::default();
+        tiny.observe_decode(Duration::from_nanos(1));
+        tiny.observe_prefill(Duration::from_secs(1), 1);
+        assert_eq!(tiny.chunk(), PREFILL_TOKENS_MIN);
+    }
+
+    #[test]
+    fn pacing_smooths_rather_than_chasing_one_sample() {
+        let mut p = Pacing::default();
+        p.observe_decode(Duration::from_millis(100));
+        // One outlier must not move the estimate all the way to it.
+        p.observe_decode(Duration::from_millis(500));
+        let blended = p.decode_step.unwrap();
+        assert!(
+            blended > 0.100 && blended < 0.250,
+            "one sample moved the average to {blended}"
+        );
     }
 
     #[tokio::test]
