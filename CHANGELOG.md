@@ -42,6 +42,39 @@ larger than RAM, the pages it warmed can already have been evicted.
   prefetcher, which is a fact about the implementation and reads like an end-to-end
   speedup.
 
+### Tried and rejected: predicting the next *layer* rather than the next token
+
+The obvious response to the result above is that the predictor is aimed the wrong
+way for decode. It learns "what will layer `l` want next token", which during decode
+is a whole pass away; the useful question would be "what will layer `l+1` want, now",
+which is milliseconds away. There was a mechanism to hope for, too: decode on this
+checkpoint runs at ~7.1 GB per token in about 11 s, i.e. ~620 MB/s, which looks like
+demand paging one fault at a time — and `madvise` over a whole expert range moves
+bytes about five times faster than that. Turning thousands of small faults into a few
+large reads should have been worth something.
+
+It was implemented — a second transition matrix over the `l -> l+1` axis, threaded
+down the layers of each forward pass — and measured the same way, three paired runs
+with the order varied:
+
+| | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| decode, within-layer only | 15.06 s/token | 10.91 s/token | 10.86 s/token |
+| decode, plus cross-layer | 12.25 s/token | 12.02 s/token | 11.61 s/token |
+| ttft, within-layer only | 42.3 s | 33.3 s | 36.4 s |
+| ttft, plus cross-layer | 58.6 s | 43.2 s | 33.8 s |
+
+No decode improvement — the ranges overlap and the baseline is faster in two rounds
+of three — and time-to-first-token got worse in two of three. So it was reverted
+rather than kept on the strength of the argument.
+
+The likely reason is that decode here is bandwidth-bound, not latency-bound.
+Prefetching reorders I/O; it does not create bandwidth. Every wrong guess spends
+bandwidth the real reads then have to wait for, and a router's choice at layer `l+1`
+depends on layer `l`'s output — the very thing that just changed — so the guesses are
+probably not good enough to pay for themselves. Recorded here so the next person with
+this idea can skip building it.
+
 ## [0.20.0] - 2026-07-29
 
 The larger-than-RAM claim is measured. It had been the one number in this project
