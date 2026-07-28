@@ -480,6 +480,58 @@ impl KVCacheState {
         src.get(off..off + d)
     }
 
+    /// Drop every position at or after `len`.
+    ///
+    /// Speculative decoding needs this: it appends several guessed tokens, checks
+    /// which the model would actually have produced, and has to undo the rest — the
+    /// cache must end up exactly as if the rejected tokens had never been seen.
+    ///
+    /// Refuses to cut into a spilled block rather than silently reloading one: a
+    /// truncation always lands on the newest positions, which are resident by
+    /// construction, so needing to is a sign the caller is doing something else.
+    pub fn truncate(&mut self, len: usize) -> Result<(), GarudaError> {
+        if len >= self.len {
+            return Ok(());
+        }
+        let bs = self.block_size;
+        let (cut_block, keep) = (len / bs, len % bs);
+
+        if keep > 0 && self.spilled.contains_key(&cut_block) {
+            return Err(GarudaError::Cache(format!(
+                "cannot truncate to {len}: block {cut_block} is spilled to disk"
+            )));
+        }
+
+        // Whole blocks past the cut go, along with any files they left behind.
+        self.resident
+            .retain(|&b, _| b < cut_block || (b == cut_block && keep > 0));
+        let stale: Vec<usize> = self
+            .spilled
+            .keys()
+            .copied()
+            .filter(|&b| b > cut_block || (b == cut_block && keep == 0))
+            .collect();
+        for b in stale {
+            if let Some(path) = self.spilled.remove(&b) {
+                if let Some(storage) = &self.storage {
+                    let _ = storage.remove(&path);
+                }
+            }
+        }
+
+        // The block the cut lands inside keeps only what precedes it.
+        if keep > 0 {
+            if let Some(block) = self.resident.get_mut(&cut_block) {
+                block.keys.truncate(keep * self.kv_dim);
+                block.values.truncate(keep * self.kv_dim);
+                block.filled = keep;
+            }
+        }
+
+        self.len = len;
+        Ok(())
+    }
+
     /// True when some of this sequence's attention state currently lives on disk.
     pub fn has_spill(&self) -> bool {
         !self.spilled.is_empty()
@@ -586,6 +638,15 @@ impl SeqState {
         for kv in &mut self.kvs {
             kv.purge_spill_files();
         }
+    }
+
+    /// Drop every position at or after `len`, in every layer. See
+    /// [`KVCacheState::truncate`].
+    pub fn truncate(&mut self, len: usize) -> Result<(), GarudaError> {
+        for kv in &mut self.kvs {
+            kv.truncate(len)?;
+        }
+        Ok(())
     }
 }
 
@@ -817,6 +878,95 @@ mod tests {
             assert_eq!(kv.key_at(p).unwrap(), &k[..], "key at {p}");
             assert_eq!(kv.value_at(p).unwrap(), &v[..], "value at {p}");
         }
+
+        kv.purge_spill_files();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Truncating must leave the cache byte-for-byte as if the dropped positions had
+    /// never been appended — that is what lets a rejected speculation be undone.
+    #[test]
+    fn truncate_rewinds_to_exactly_the_state_before_the_extra_appends() {
+        let d = dims();
+        let make = || KVCacheState::new(kv_cfg(None, 64), 1);
+        let vec_at =
+            |p: usize| -> Vec<f32> { (0..d.d_model).map(|i| p as f32 + i as f32 * 0.01).collect() };
+
+        // Ten positions, then five more that we will take back.
+        let mut rewound = make();
+        for p in 0..15 {
+            let v = vec_at(p);
+            rewound.append(&v, &v).unwrap();
+        }
+        rewound.truncate(10).unwrap();
+
+        // The same cache built with only the first ten.
+        let mut reference = make();
+        for p in 0..10 {
+            let v = vec_at(p);
+            reference.append(&v, &v).unwrap();
+        }
+
+        assert_eq!(rewound.len(), reference.len());
+        for p in 0..10 {
+            assert_eq!(rewound.key_at(p), reference.key_at(p), "key at {p}");
+            assert_eq!(rewound.value_at(p), reference.value_at(p), "value at {p}");
+        }
+        assert!(rewound.key_at(10).is_none(), "position 10 survived the cut");
+
+        // And appending after a rewind continues from the right place.
+        let v = vec_at(99);
+        rewound.append(&v, &v).unwrap();
+        assert_eq!(rewound.len(), 11);
+        assert_eq!(rewound.key_at(10).unwrap(), &v[..]);
+    }
+
+    #[test]
+    fn truncate_handles_block_boundaries_and_no_ops() {
+        let d = dims(); // block_size 4
+        let mut kv = KVCacheState::new(kv_cfg(None, 64), 1);
+        let v = vec![0.5; d.d_model];
+        for _ in 0..12 {
+            kv.append(&v, &v).unwrap();
+        }
+
+        // Exactly on a block boundary: the whole block goes.
+        kv.truncate(8).unwrap();
+        assert_eq!(kv.len(), 8);
+        assert!(kv.key_at(8).is_none());
+
+        // Asking to truncate to something longer is a no-op, not an error.
+        kv.truncate(100).unwrap();
+        assert_eq!(kv.len(), 8);
+
+        // All the way back to empty.
+        kv.truncate(0).unwrap();
+        assert_eq!(kv.len(), 0);
+        assert!(kv.is_empty());
+        kv.append(&v, &v).unwrap();
+        assert_eq!(kv.len(), 1);
+    }
+
+    #[test]
+    fn truncate_refuses_to_cut_into_a_spilled_block() {
+        let dir = std::env::temp_dir().join("garuda_truncate_spill");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorageBackend::new(&dir));
+
+        let d = dims();
+        let mut kv = KVCacheState::new(kv_cfg(Some(storage), 1), 7);
+        let v = vec![0.25; d.d_model];
+        for _ in 0..12 {
+            kv.append(&v, &v).unwrap();
+        }
+        assert!(kv.has_spill(), "fixture did not spill");
+
+        // Position 1 sits inside block 0, which is on disk. Refuse rather than
+        // quietly reload it — a speculation rewind never reaches back this far.
+        let err = kv.truncate(1).unwrap_err();
+        assert!(matches!(err, GarudaError::Cache(_)), "got {err:?}");
+        assert_eq!(kv.len(), 12, "a refused truncate must change nothing");
 
         kv.purge_spill_files();
         let _ = std::fs::remove_dir_all(&dir);

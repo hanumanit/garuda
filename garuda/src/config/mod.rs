@@ -39,6 +39,13 @@ pub struct ModelConfig {
     /// batching (a token traverses every layer before the next one starts). Only
     /// affects a memory-mapped gguf model — see `llama::LlamaBackend::prefill_chunk`.
     pub prefill_batch: usize,
+    /// Tokens to guess ahead when a single request is decoding on its own.
+    ///
+    /// A guess is drawn from earlier in the context and only kept where the model
+    /// would have chosen it anyway, so the output is unchanged; what it saves is
+    /// passes over the weights. `0` disables it. Only applies to greedy requests
+    /// (`temperature = 0`) — see `runtime::InferenceRuntime::next_tokens_speculative`.
+    pub speculative_lookahead: usize,
     /// There is no GPU backend. `true` is rejected at startup rather than ignored.
     pub gpu: bool,
 }
@@ -55,6 +62,7 @@ impl Default for ModelConfig {
             top_k: 2,
             sliding_window: 0,
             prefill_batch: 0,
+            speculative_lookahead: 4,
             gpu: false,
         }
     }
@@ -335,6 +343,7 @@ impl AppConfig {
     pub fn scheduler(&self) -> SchedulerConfig {
         SchedulerConfig {
             max_concurrent: self.server.max_concurrent,
+            speculative_lookahead: self.model.speculative_lookahead,
             queue_capacity: self.server.queue_capacity,
             max_concurrent_per_user: self.server.max_concurrent_per_user,
         }

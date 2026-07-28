@@ -887,14 +887,18 @@ impl LlamaBackend {
         debug_assert_eq!(out.len(), n * d);
         w.down.matmul_expert(e, d, &g, n, out)
     }
-}
 
-impl InferenceBackend for LlamaBackend {
-    fn dims(&self) -> ModelDims {
-        self.cfg.model_dims()
-    }
-
-    fn hidden(&self, context: &[Token], seq: &mut SeqState) -> Result<Tensor, GarudaError> {
+    /// The last `n_last` positions' final hidden states, from one pass.
+    ///
+    /// Every new token's state is computed anyway; `hidden` simply discards all but
+    /// the last. Keeping the tail is what lets a run of speculated tokens be checked
+    /// without paying for a second pass over the weights.
+    fn forward_tail(
+        &self,
+        context: &[Token],
+        seq: &mut SeqState,
+        n_last: usize,
+    ) -> Result<Vec<Vec<f32>>, GarudaError> {
         if context.is_empty() {
             return Err(GarudaError::Inference("empty context".into()));
         }
@@ -931,7 +935,12 @@ impl InferenceBackend for LlamaBackend {
             )));
         }
 
-        let mut last: Option<Vec<f32>> = None;
+        // A rolling window of the most recent hidden states, so `logits_multi` can
+        // answer for more than the last position without a second pass. It rolls
+        // across chunks rather than resetting per chunk: the prefill chunk size is
+        // about weight locality and has nothing to do with how many positions the
+        // caller asked about.
+        let mut tail: Vec<Vec<f32>> = Vec::new();
         for chunk in new.chunks(self.prefill_chunk.max(1)) {
             // Embed the chunk first, so an out-of-vocabulary token is rejected before
             // any layer has run rather than after the tokens ahead of it.
@@ -953,13 +962,32 @@ impl InferenceBackend for LlamaBackend {
                 let kv = seq.layer(l);
                 self.layer_batch(l, &mut xs, kv)?;
             }
-            last = xs.pop();
+            tail.append(&mut xs);
+            if tail.len() > n_last {
+                tail.drain(..tail.len() - n_last);
+            }
         }
 
-        let mut x = last.expect("the chunk loop ran at least once over a non-empty slice");
-        simd::rmsnorm(&mut x, self.cfg.rms_eps);
-        simd::mul_assign(&mut x, &self.output_norm);
-        Tensor::new(vec![d], x)
+        if n_last > tail.len() {
+            return Err(GarudaError::Inference(format!(
+                "asked for the last {n_last} positions but only {} were computed in \
+                 this pass",
+                tail.len()
+            )));
+        }
+        tail.drain(..tail.len() - n_last);
+        for x in tail.iter_mut() {
+            simd::rmsnorm(x, self.cfg.rms_eps);
+            simd::mul_assign(x, &self.output_norm);
+        }
+        let _ = d;
+        Ok(tail)
+    }
+}
+
+impl InferenceBackend for LlamaBackend {
+    fn dims(&self) -> ModelDims {
+        self.cfg.model_dims()
     }
 
     /// One decode step across several sequences, sharing one pass over the weights.
@@ -1042,11 +1070,48 @@ impl InferenceBackend for LlamaBackend {
             .collect()
     }
 
+    fn hidden(&self, context: &[Token], seq: &mut SeqState) -> Result<Tensor, GarudaError> {
+        let mut tail = self.forward_tail(context, seq, 1)?;
+        Tensor::new(
+            vec![self.cfg.d_model],
+            tail.pop().expect("forward_tail returns n_last states"),
+        )
+    }
+
     fn logits(&self, context: &[Token], seq: &mut SeqState) -> Result<Tensor, GarudaError> {
-        let x = self.hidden(context, seq)?;
-        let mut logits = vec![0.0; self.cfg.vocab];
-        self.output.matvec(x.data(), &mut logits)?;
-        Tensor::new(vec![self.cfg.vocab], logits)
+        Ok(self
+            .logits_multi(context, seq, 1)?
+            .pop()
+            .expect("logits_multi returns n tensors"))
+    }
+
+    fn speculation_supported(&self) -> bool {
+        true
+    }
+
+    fn logits_multi(
+        &self,
+        context: &[Token],
+        seq: &mut SeqState,
+        n: usize,
+    ) -> Result<Vec<Tensor>, GarudaError> {
+        if n == 0 {
+            return Err(GarudaError::Inference("logits_multi needs n >= 1".into()));
+        }
+        let tail = self.forward_tail(context, seq, n)?;
+        let d = self.cfg.d_model;
+        let vocab = self.cfg.vocab;
+
+        // One batched matmul over the output head rather than `n` matvecs: the head
+        // is `vocab x d_model`, the largest single matrix in the model.
+        let flat: Vec<f32> = tail.into_iter().flatten().collect();
+        let mut all = vec![0.0; n * vocab];
+        self.output.matmul_rows(0, &flat, n, &mut all)?;
+
+        let _ = d;
+        (0..n)
+            .map(|i| Tensor::new(vec![vocab], all[i * vocab..(i + 1) * vocab].to_vec()))
+            .collect()
     }
 }
 
@@ -1542,6 +1607,49 @@ mod tests {
             "a refused batch must not advance any cache"
         );
         assert_eq!(seqs[1].len(), 2);
+    }
+
+    /// Verifying speculated tokens rests entirely on this: the logits `logits_multi`
+    /// reports for an earlier position must be exactly the logits the model would
+    /// have produced had it stopped there. If they differ, speculation accepts tokens
+    /// the model would not have chosen.
+    #[test]
+    fn logits_multi_matches_stopping_at_each_position() {
+        let backend = LlamaBackend::load(&build_moe_gguf(ExpertLayout::Merged)).unwrap();
+        let tokens: Vec<Token> = vec![3, 7, 1, 9, 2, 5];
+
+        // One pass over all six, asking for the last four positions.
+        let n = 4;
+        let mut seq = seq_for(&backend);
+        let many = backend.logits_multi(&tokens, &mut seq, n).unwrap();
+        assert_eq!(many.len(), n);
+        assert_eq!(seq.len(), tokens.len(), "the pass must consume every token");
+
+        // The same positions reached one prefix at a time.
+        for (k, got) in many.iter().enumerate() {
+            let upto = tokens.len() - n + k + 1;
+            let mut alone = seq_for(&backend);
+            let want = backend.logits(&tokens[..upto], &mut alone).unwrap();
+            assert_eq!(
+                got.data(),
+                want.data(),
+                "position {upto} differs from stopping there"
+            );
+        }
+    }
+
+    #[test]
+    fn logits_multi_refuses_more_positions_than_it_computed() {
+        let backend = LlamaBackend::load(&build_moe_gguf(ExpertLayout::Merged)).unwrap();
+        let tokens: Vec<Token> = vec![3, 7, 1];
+        let mut seq = seq_for(&backend);
+        backend.logits(&tokens, &mut seq).unwrap();
+
+        // Only one token is new, so there is no earlier position to report on.
+        let more: Vec<Token> = vec![3, 7, 1, 9];
+        let err = backend.logits_multi(&more, &mut seq, 3).unwrap_err();
+        assert!(matches!(err, GarudaError::Inference(_)), "got {err:?}");
+        assert!(backend.speculation_supported());
     }
 
     /// The same row-range plumbing as above, but over a k-quant. F32 rows are 4 bytes

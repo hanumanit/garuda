@@ -262,6 +262,38 @@ pub trait InferenceBackend: Send + Sync {
         seq: &mut crate::cache::SeqState,
     ) -> Result<Tensor, GarudaError>;
 
+    /// Logits at the last `n` positions of one sequence, from a single pass.
+    ///
+    /// `logits` answers for the position after `context`; this also answers for the
+    /// `n - 1` positions before it, which is what verifying a run of guessed tokens
+    /// needs — the whole point being that one pass over the weights checks all of
+    /// them. On a checkpoint larger than RAM a pass costs gigabytes of paging, so
+    /// this is the difference between one token per read and several.
+    ///
+    /// `n` must not exceed the number of positions this call consumes. The default
+    /// handles `n == 1` by delegating and refuses anything more, so a backend that
+    /// cannot do it says so instead of guessing; check
+    /// [`Self::speculation_supported`] before relying on it.
+    fn logits_multi(
+        &self,
+        context: &[Token],
+        seq: &mut crate::cache::SeqState,
+        n: usize,
+    ) -> Result<Vec<Tensor>, GarudaError> {
+        if n == 1 {
+            return Ok(vec![self.logits(context, seq)?]);
+        }
+        Err(GarudaError::Inference(format!(
+            "this backend cannot produce logits for {n} positions in one pass"
+        )))
+    }
+
+    /// Whether [`Self::logits_multi`] works for `n > 1`, i.e. whether this backend
+    /// can verify speculated tokens. False unless a backend says otherwise.
+    fn speculation_supported(&self) -> bool {
+        false
+    }
+
     /// [`Self::logits`] for several independent sequences at once.
     ///
     /// `contexts[i]` pairs with `seqs[i]`, and the results come back in the same

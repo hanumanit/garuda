@@ -35,6 +35,16 @@ sliding_window = 0
 # what makes a checkpoint larger than RAM usable. Raising it costs activation memory
 # (chunk * d_model * 4 bytes) and nothing else.
 prefill_batch = 0
+# Tokens to guess ahead when a single request is decoding on its own. A guess is
+# copied from earlier in the context and kept only where the model would have chosen
+# it anyway, so the output never changes — what it saves is passes over the weights,
+# which on a checkpoint larger than RAM is nearly the whole cost of a token. Greedy
+# requests only (temperature = 0); sampled ones take the ordinary path, because
+# keeping a guess for matching the argmax would quietly replace the caller's
+# distribution. 0 disables it. The value is a ceiling: each sequence asks for a
+# little more than its recent guesses have been winning, so a workload the guessing
+# does not suit stops paying for it.
+speculative_lookahead = 4
 # There is no GPU backend. Setting this to true is a startup error, not a fallback.
 gpu = false
 

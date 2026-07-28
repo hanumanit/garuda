@@ -151,6 +151,12 @@ impl Ord for Queued {
 pub struct SchedulerConfig {
     /// Sequences decoding at once.
     pub max_concurrent: usize,
+    /// Tokens to guess ahead when only one sequence is decoding. `0` disables it.
+    ///
+    /// Speculation and cross-request batching buy the same thing — more tokens per
+    /// pass over the weights — so there is no point doing both. With several
+    /// sequences in flight the batch already provides it; with one, nothing else can.
+    pub speculative_lookahead: usize,
     /// Requests that may wait for a decode slot before submissions are refused.
     pub queue_capacity: usize,
     /// Concurrent requests one user may have in the system.
@@ -161,6 +167,7 @@ impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
             max_concurrent: 4,
+            speculative_lookahead: 4,
             queue_capacity: 256,
             max_concurrent_per_user: 8,
         }
@@ -479,7 +486,7 @@ async fn run_loop(
             }
 
             let started = Instant::now();
-            if step_batch(&rt, &sch, &mut batch.active) {
+            if step_batch(&rt, &sch, &mut batch.active, config.speculative_lookahead) {
                 batch.pacing.observe_decode(started.elapsed());
             }
             batch
@@ -586,7 +593,12 @@ fn advance_prefills(
 }
 
 /// Advance every active sequence by one token, retiring those that are done.
-fn step_batch(runtime: &InferenceRuntime, scheduler: &Scheduler, active: &mut Vec<Active>) -> bool {
+fn step_batch(
+    runtime: &InferenceRuntime,
+    scheduler: &Scheduler,
+    active: &mut Vec<Active>,
+    lookahead: usize,
+) -> bool {
     let counters = &scheduler.counters;
 
     // Cancellation and timeouts are checked between tokens, so a dropped client stops
@@ -621,6 +633,36 @@ fn step_batch(runtime: &InferenceRuntime, scheduler: &Scheduler, active: &mut Ve
     });
     if active.is_empty() {
         return false;
+    }
+
+    // One sequence has nothing to share a pass with, so it guesses ahead instead;
+    // several already share one, and speculating on top would only add work.
+    if active.len() == 1 && lookahead > 0 {
+        let a = &mut active[0];
+        let params = a.request.spec.params;
+        let mut tokens = Vec::new();
+        let outcome =
+            runtime.next_tokens_speculative(&mut a.session, &params, lookahead, &mut tokens);
+
+        let mut gone = false;
+        for t in tokens {
+            if a.request.events.send(StreamEvent::Token(t)).is_err() {
+                counters.cancelled.fetch_add(1, Ordering::Relaxed);
+                gone = true;
+                break;
+            }
+        }
+        if let Err(reason) = outcome {
+            if !gone {
+                counters.completed.fetch_add(1, Ordering::Relaxed);
+                let _ = a.request.events.send(StreamEvent::Done(reason));
+            }
+            gone = true;
+        }
+        if gone {
+            active.clear();
+        }
+        return true;
     }
 
     let params: Vec<SamplingParams> = active.iter().map(|a| a.request.spec.params).collect();
@@ -834,6 +876,7 @@ mod tests {
                 max_concurrent: 1,
                 queue_capacity: 2,
                 max_concurrent_per_user: 1000,
+                ..Default::default()
             },
         );
 
@@ -1015,6 +1058,7 @@ mod tests {
                 max_concurrent: 1,
                 queue_capacity: 64,
                 max_concurrent_per_user: 64,
+                ..Default::default()
             },
         );
 

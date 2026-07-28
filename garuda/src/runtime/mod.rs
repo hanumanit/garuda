@@ -188,6 +188,45 @@ impl Pending {
     }
 }
 
+/// Context tokens that must match for a guess to be drawn from an earlier passage.
+///
+/// Short enough to fire often, long enough that a match means something: two tokens
+/// repeat everywhere, and eight almost never repeat outside genuinely echoed text.
+const NGRAM: usize = 4;
+
+/// Guess the next few tokens by finding where the recent context occurred earlier
+/// and copying whatever followed it.
+///
+/// No draft model, no extra weights, no extra memory — which matters most on exactly
+/// the machine speculation is for, one already running a checkpoint bigger than its
+/// RAM. It only fires when the output echoes the input, so it does nothing for
+/// open-ended prose and a great deal for summarising, editing, extraction and
+/// anything grounded in a long prompt.
+///
+/// Returns an empty guess when it has no basis for one. That is the honest answer:
+/// a wrong guess costs a wasted slot in the verification pass, and a guess made up
+/// from nothing is wrong nearly always.
+pub fn draft_from_context(context: &[Token], max_tokens: usize, ngram: usize) -> Vec<Token> {
+    if max_tokens == 0 || ngram == 0 || context.len() <= ngram {
+        return Vec::new();
+    }
+    let needle = &context[context.len() - ngram..];
+    // Latest match first: recent context is the better predictor, and it also keeps
+    // the scan short on the common case of a repeated phrase nearby.
+    let search_end = context.len() - ngram;
+    for start in (0..search_end).rev() {
+        if &context[start..start + ngram] != needle {
+            continue;
+        }
+        let from = start + ngram;
+        let take = max_tokens.min(context.len() - from);
+        if take > 0 {
+            return context[from..from + take].to_vec();
+        }
+    }
+    Vec::new()
+}
+
 /// One in-flight sequence.
 #[derive(Debug)]
 pub struct Session {
@@ -197,6 +236,19 @@ pub struct Session {
     prompt_len: usize,
     rng: Rng,
     finished: bool,
+    /// Extra tokens the last few guesses actually won, as a moving average.
+    ///
+    /// A guess is not free: the verification pass computes every drafted position,
+    /// so a batch of six wrong guesses does six positions of expert arithmetic to
+    /// produce one token. Measured on Mixtral that is ~1.6x *slower* than not
+    /// guessing. Where the guesses land it is ~3x faster. The gap is far too wide to
+    /// settle with a fixed policy, so the sequence keeps score and stops drafting
+    /// when it is losing.
+    spec_gain: f64,
+    /// Rounds since drafting was last attempted, so a sequence that gave up gets
+    /// another look rather than being written off for good — text turns repetitive
+    /// halfway through often enough to be worth rechecking.
+    spec_idle: usize,
 }
 
 impl Session {
@@ -386,6 +438,10 @@ impl InferenceRuntime {
             context: pending.context,
             rng: Rng::new(pending.seed),
             finished: false,
+            // Start optimistic: one round of drafting is cheap to try and tells us
+            // more than any guess about the workload could.
+            spec_gain: 1.0,
+            spec_idle: 0,
         }
     }
 
@@ -464,6 +520,138 @@ impl InferenceRuntime {
             return Err(StopReason::Eos);
         }
         Ok(token)
+    }
+
+    /// Produce the next token, and as many after it as a guess gets right.
+    ///
+    /// Identical in output to [`Self::next_token`] — a guess is only ever kept where
+    /// the model would have chosen it anyway — but a run of `j` accepted guesses
+    /// costs one pass over the weights instead of `j + 1`. On a checkpoint larger
+    /// than RAM a pass is gigabytes of paging, which is the whole difference between
+    /// one token per read and several.
+    ///
+    /// Greedy only. With `temperature > 0`, keeping a guess because it matches the
+    /// argmax would quietly replace the caller's distribution with a greedy one;
+    /// doing it properly needs the rejection-sampling scheme rather than an equality
+    /// test, so sampled requests take the ordinary path instead of a subtly wrong
+    /// fast one.
+    ///
+    /// Tokens land in `out`. `Err` means the sequence finished, exactly as
+    /// `next_token` reports it, and any tokens produced before that are still in
+    /// `out`.
+    pub fn next_tokens_speculative(
+        &self,
+        session: &mut Session,
+        params: &SamplingParams,
+        lookahead: usize,
+        out: &mut Vec<Token>,
+    ) -> Result<(), StopReason> {
+        if params.temperature != 0.0 || lookahead == 0 || !self.backend.speculation_supported() {
+            return self.next_token(session, params).map(|t| out.push(t));
+        }
+        if session.finished {
+            return Err(StopReason::Length);
+        }
+        if session.generated() >= params.max_tokens {
+            session.finished = true;
+            return Err(StopReason::Length);
+        }
+        if session.context.len() >= self.max_context {
+            session.finished = true;
+            return Err(StopReason::ContextFull);
+        }
+
+        // How many guesses are worth making: no more than the budget or the window
+        // can take, since a token accepted past either would have to be thrown away.
+        let room = params
+            .max_tokens
+            .saturating_sub(session.generated())
+            .min(self.max_context.saturating_sub(session.context.len()))
+            .saturating_sub(1);
+        // Ask for a little more than has been landing rather than for the maximum
+        // every time. The verification pass computes every position drafted, so six
+        // guesses that win one token do six positions of expert arithmetic for it —
+        // measured on Mixtral, ~1.6x slower than not guessing, against ~3x faster
+        // where the guesses land. Sizing the request to the observed yield is what
+        // keeps the bad case from being paid for.
+        const WORTH_IT: f64 = 0.35;
+        const RETRY_AFTER: usize = 16;
+
+        let budget = if session.spec_gain < WORTH_IT && session.spec_idle < RETRY_AFTER {
+            session.spec_idle += 1;
+            0
+        } else {
+            session.spec_idle = 0;
+            (session.spec_gain.ceil() as usize + 1).min(lookahead)
+        };
+        let draft = draft_from_context(&session.context, budget.min(room), NGRAM);
+
+        // One pass over `context ++ draft`. Answer `i` is the token the model would
+        // produce having seen the first `i` guesses — so answer 0 is the real next
+        // token, and answer `i` is only reachable if guesses `0..i` were all right.
+        let n = draft.len() + 1;
+        let mut probe = session.context.clone();
+        probe.extend_from_slice(&draft);
+        let answers = match self.backend.logits_multi(&probe, &mut session.seq, n) {
+            Ok(a) => a,
+            Err(e) => {
+                session.finished = true;
+                tracing::warn!(error = %e, "forward pass failed");
+                return Err(StopReason::ContextFull);
+            }
+        };
+
+        let mut stop = None;
+        for (i, answer) in answers.iter().enumerate() {
+            let token = match sample(answer, params, &mut session.rng) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(error = %e, "sampling failed");
+                    stop = Some(StopReason::ContextFull);
+                    break;
+                }
+            };
+            session.context.push(token);
+            if token == self.tokenizer.eos() {
+                stop = Some(StopReason::Eos);
+                break;
+            }
+            out.push(token);
+            // Keep going only while the guesses hold; `i == draft.len()` means there
+            // are none left to check.
+            if i == draft.len() || token != draft[i] {
+                break;
+            }
+            if session.generated() >= params.max_tokens {
+                stop = Some(StopReason::Length);
+                break;
+            }
+        }
+
+        // Score the round: how many tokens beyond the one a plain step would have
+        // produced. Smoothed, so a single unlucky guess does not switch drafting off
+        // and a single lucky one does not switch it back on.
+        if !draft.is_empty() {
+            let won = (out.len() + usize::from(stop.is_some())).saturating_sub(1) as f64;
+            session.spec_gain = session.spec_gain * 0.7 + won * 0.3;
+        }
+
+        // The cache consumed every guess. Give back the positions belonging to tokens
+        // that were never produced, restoring the invariant the ordinary path keeps:
+        // one fewer cache position than context tokens.
+        let keep = session.context.len().saturating_sub(1);
+        if session.seq.truncate(keep).is_err() {
+            session.finished = true;
+            return Err(StopReason::ContextFull);
+        }
+
+        match stop {
+            Some(reason) => {
+                session.finished = true;
+                Err(reason)
+            }
+            None => Ok(()),
+        }
     }
 
     /// One decode step for several sequences at once, one result each in order.
@@ -911,6 +1099,264 @@ mod tests {
         assert_eq!(pending.remaining(), 0);
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A backend whose next token is a fixed function of the last, so the sequence
+    /// it produces is perfectly predictable and eventually repeats.
+    ///
+    /// Untrained weights cannot demonstrate this: the drafter proposes what came
+    /// after an earlier occurrence of the context, and a model with random weights
+    /// has no reason to agree, so nothing is ever accepted and an equivalence test
+    /// over it compares plain decoding against plain decoding. This one cycles with
+    /// a period short enough that the n-gram match fires.
+    struct CyclicBackend {
+        dims: ModelDims,
+        /// When set, the next token depends on the *position* through a hash rather
+        /// than on the last token, so the sequence never settles into a pattern the
+        /// n-gram lookup can find. Any deterministic function of the last token
+        /// cycles, and a cycle is exactly what the drafter predicts perfectly — so
+        /// this is the only way to build a fixture whose guesses keep missing.
+        chaotic: bool,
+    }
+
+    impl CyclicBackend {
+        /// Eight ids well clear of the tokenizer's special range, so nothing here can
+        /// be mistaken for end-of-sequence.
+        fn next(&self, last: Token, prefix_len: usize) -> Token {
+            if !self.chaotic {
+                return 8 + (last.wrapping_add(1) % 8);
+            }
+            let mut z = (prefix_len as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            8 + ((z ^ (z >> 31)) % 8) as Token
+        }
+    }
+
+    impl InferenceBackend for CyclicBackend {
+        fn dims(&self) -> ModelDims {
+            self.dims
+        }
+
+        fn hidden(&self, context: &[Token], seq: &mut SeqState) -> Result<Tensor, GarudaError> {
+            let _ = self.logits_multi(context, seq, 1)?;
+            Ok(Tensor::zeros(vec![self.dims.d_model]))
+        }
+
+        fn logits(&self, context: &[Token], seq: &mut SeqState) -> Result<Tensor, GarudaError> {
+            Ok(self
+                .logits_multi(context, seq, 1)?
+                .pop()
+                .expect("one tensor"))
+        }
+
+        fn speculation_supported(&self) -> bool {
+            true
+        }
+
+        fn logits_multi(
+            &self,
+            context: &[Token],
+            seq: &mut SeqState,
+            n: usize,
+        ) -> Result<Vec<Tensor>, GarudaError> {
+            let already = seq.len();
+            if already > context.len() {
+                return Err(GarudaError::Inference("sequence is ahead".into()));
+            }
+            let new = context.len() - already;
+            if new == 0 {
+                return Err(GarudaError::Inference("no new tokens".into()));
+            }
+            if n > new {
+                return Err(GarudaError::Inference(format!(
+                    "asked for {n} of {new} new positions"
+                )));
+            }
+            // One cache position per new token, as the contract requires.
+            let zero = vec![0.0; self.dims.d_model];
+            for _ in 0..new {
+                seq.kv().append(&zero, &zero)?;
+            }
+            Ok((0..n)
+                .map(|k| {
+                    let at = context.len() - n + k;
+                    let mut v = vec![0.0; self.dims.vocab_size];
+                    v[self.next(context[at], at + 1) as usize] = 1.0;
+                    Tensor::vector(v)
+                })
+                .collect())
+        }
+    }
+
+    fn cyclic_runtime() -> InferenceRuntime {
+        stub_runtime(false)
+    }
+
+    fn stub_runtime(chaotic: bool) -> InferenceRuntime {
+        let dims = ModelDims::default();
+        InferenceRuntime::new(
+            Arc::new(crate::tokenizer::Tokenizer::new()),
+            Arc::new(CyclicBackend { dims, chaotic }),
+            KvConfig::mha(dims, 256, 64, None, None),
+            8,
+        )
+    }
+
+    /// The whole justification for speculation: it must produce exactly what plain
+    /// greedy decoding produces. A guess is only ever accepted where the model would
+    /// have chosen it anyway, so any difference is a bug, not a tradeoff.
+    #[test]
+    fn speculative_decoding_produces_exactly_what_greedy_decoding_does() {
+        let rt = cyclic_runtime();
+        let rt2 = cyclic_runtime();
+        let p = greedy(40);
+        let prompt: Vec<Token> = vec![8, 9, 10, 11, 12];
+
+        let mut plain = rt2.start(&prompt, &p).unwrap();
+        let (want, want_reason) = drain(&rt2, &mut plain, &p);
+
+        let mut spec = rt.start(&prompt, &p).unwrap();
+        let mut got = Vec::new();
+        let reason;
+        let mut passes = 0;
+        let mut accepted_extra = 0;
+        loop {
+            let mut batch = Vec::new();
+            let outcome = rt.next_tokens_speculative(&mut spec, &p, 4, &mut batch);
+            passes += 1;
+            accepted_extra += batch.len().saturating_sub(1);
+            got.extend(batch);
+            if let Err(r) = outcome {
+                reason = r;
+                break;
+            }
+        }
+
+        // Guards the test itself: if nothing was ever guessed and accepted, this
+        // would be comparing plain decoding against plain decoding.
+        assert!(
+            accepted_extra > 0,
+            "speculation never accepted a token, so this proves nothing"
+        );
+        assert!(
+            passes < got.len(),
+            "{} passes for {} tokens — no pass produced more than one",
+            passes,
+            got.len()
+        );
+
+        assert_eq!(got, want, "speculation changed the output");
+        assert_eq!(reason, want_reason);
+        assert_eq!(
+            spec.generated(),
+            plain.generated(),
+            "generated count differs"
+        );
+        assert_eq!(spec.seq.len(), plain.seq.len(), "the caches diverged");
+    }
+
+    /// A sampled request must take the ordinary path: accepting a guess because it
+    /// equals the argmax would silently replace the caller's distribution with a
+    /// greedy one.
+    #[test]
+    fn speculation_is_declined_for_sampled_requests() {
+        let rt = cyclic_runtime();
+        let p = SamplingParams {
+            temperature: 0.9,
+            top_p: 0.95,
+            top_k: 40,
+            max_tokens: 6,
+            seed: Some(11),
+        };
+        let prompt: Vec<Token> = vec![8, 9, 10, 11, 12, 13];
+
+        // One token per call, exactly as `next_token` would give.
+        let mut s = rt.start(&prompt, &p).unwrap();
+        let mut calls = 0;
+        while calls < 4 {
+            let mut batch = Vec::new();
+            if rt
+                .next_tokens_speculative(&mut s, &p, 8, &mut batch)
+                .is_err()
+            {
+                break;
+            }
+            assert_eq!(batch.len(), 1, "a sampled request was speculated on");
+            calls += 1;
+        }
+        assert_eq!(calls, 4);
+    }
+
+    /// How far ahead a sequence guesses must follow what its guesses have been
+    /// winning, because the verification pass pays for every position drafted. Six
+    /// guesses that yield one token are six positions of arithmetic for it.
+    #[test]
+    fn how_far_ahead_it_guesses_follows_what_the_guesses_win() {
+        let rt = cyclic_runtime();
+        let p = greedy(200);
+        let prompt: Vec<Token> = vec![8, 9, 10, 11, 12];
+
+        // A predictable sequence: the guesses land, so the draft should grow to the
+        // ceiling it is allowed.
+        let mut good = rt.start(&prompt, &p).unwrap();
+        for _ in 0..12 {
+            let mut batch = Vec::new();
+            if rt
+                .next_tokens_speculative(&mut good, &p, 6, &mut batch)
+                .is_err()
+            {
+                break;
+            }
+        }
+        assert!(
+            good.spec_gain > 3.0,
+            "guesses were landing but the score stayed at {}",
+            good.spec_gain
+        );
+
+        // A sequence whose guesses have been missing stops asking for them, and
+        // starts again only after sitting out a while.
+        let mut poor = rt.start(&prompt, &p).unwrap();
+        poor.spec_gain = 0.0;
+        poor.spec_idle = 0;
+        let before = poor.seq.len();
+        let mut batch = Vec::new();
+        rt.next_tokens_speculative(&mut poor, &p, 6, &mut batch)
+            .unwrap();
+        assert_eq!(batch.len(), 1, "a losing sequence drafted anyway");
+        assert_eq!(
+            poor.seq.len() - before,
+            1,
+            "a losing sequence still paid for extra positions"
+        );
+        assert_eq!(poor.spec_idle, 1, "the idle count did not advance");
+
+        // After long enough it tries again rather than being written off for good.
+        poor.spec_idle = 16;
+        let mut batch = Vec::new();
+        rt.next_tokens_speculative(&mut poor, &p, 6, &mut batch)
+            .unwrap();
+        assert_eq!(poor.spec_idle, 0, "never retried after sitting out");
+    }
+
+    #[test]
+    fn the_drafter_only_guesses_when_the_context_repeats() {
+        // No repetition, no basis for a guess.
+        assert!(draft_from_context(&[1, 2, 3, 4, 5, 6, 7, 8], 4, 4).is_empty());
+        // Too short to hold an n-gram plus a match.
+        assert!(draft_from_context(&[1, 2, 3], 4, 4).is_empty());
+        assert!(draft_from_context(&[1, 2, 3, 4, 5], 0, 4).is_empty());
+
+        // "1 2 3 4" occurred before and was followed by 9, 9, 9.
+        let ctx = [1, 2, 3, 4, 9, 9, 9, 7, 1, 2, 3, 4];
+        assert_eq!(draft_from_context(&ctx, 3, 4), vec![9, 9, 9]);
+        // Bounded by what was asked for.
+        assert_eq!(draft_from_context(&ctx, 2, 4), vec![9, 9]);
+
+        // The most recent match wins: the later occurrence was followed by 5.
+        let ctx = [7, 7, 7, 7, 9, 1, 2, 7, 7, 7, 7, 5, 1, 2, 7, 7, 7, 7];
+        assert_eq!(draft_from_context(&ctx, 1, 4), vec![5]);
     }
 
     #[test]
