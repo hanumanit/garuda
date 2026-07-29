@@ -30,6 +30,35 @@ All notable changes to this project will be documented in this file.
 - `/v1/stats` reports the prompt cache's byte usage, which it previously hardcoded
   to zero.
 
+### Verified: a 25-minute soak
+
+Nothing here had been run for longer than about ten minutes at a stretch, which left
+leaks and drift as the largest unexamined risk. Twenty-five minutes, ten concurrent
+workers over six caller identities, ~3 requests/second, 4438 requests, against the
+620 MB MoE checkpoint under `mmap`: a mix of streaming and non-streaming, greedy and
+sampled, four wire protocols, embeddings, varied prompt lengths to churn the prompt
+cache, and **1079 deliberate mid-stream disconnects** — the path that once leaked a
+concurrency permit per hang-up and locked users out permanently.
+
+| | first third | last third |
+|---|---|---|
+| RSS | 467 MB mean (373–553) | 486 MB mean (431–559) |
+| threads | 29 | 30 |
+| file descriptors | 25 | 25 |
+
+The counters balance exactly: **3847 submitted = 2768 completed + 1079 cancelled +
+0 failed + 0 timed out, nothing unaccounted for.** Descriptors never moved. RSS
+drifted 4% between thirds with the ranges overlapping heavily, which is the
+memory-mapped model's pages coming and going rather than a leak. The prompt cache
+held at 8 entries and a 99.7% hit ratio, so the byte budget above does bound it under
+sustained churn. No panics; the one `ERROR` line is `tower_http` reporting the single
+`503` that backpressure produced. Latency p50 2.8 s, p95 7.5 s.
+
+The first attempt at this measured almost nothing: the generator sent prompts longer
+than the configured context window, so half the load was rejected at the door with a
+`400` and never reached the decode path. Worth recording, because a soak that soaks
+nothing looks exactly like a soak that passes.
+
 ## [0.22.0] - 2026-07-29
 
 Speculative decoding, by prompt lookup. This is the answer to the finding in 0.21.0
