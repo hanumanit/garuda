@@ -305,12 +305,13 @@ impl InferenceRuntime {
         backend: Arc<dyn InferenceBackend>,
         kv_template: KvConfig,
         prompt_cache_capacity: usize,
+        prompt_cache_bytes: usize,
     ) -> Self {
         let max_context = kv_template.max_positions;
         Self {
             tokenizer,
             backend,
-            prompt_cache: PromptCache::new(prompt_cache_capacity),
+            prompt_cache: PromptCache::new(prompt_cache_capacity, prompt_cache_bytes),
             kv_template,
             max_context,
             next_seq: AtomicU64::new(1),
@@ -792,7 +793,7 @@ mod tests {
 
         let kv = KvConfig::mha(dims, 128, 64, None, None);
         let tk = Arc::new(crate::tokenizer::Tokenizer::new());
-        (InferenceRuntime::new(tk, engine, kv, 8), dir)
+        (InferenceRuntime::new(tk, engine, kv, 8, 64 << 20), dir)
     }
 
     fn greedy(max_tokens: usize) -> SamplingParams {
@@ -1200,6 +1201,7 @@ mod tests {
             Arc::new(CyclicBackend { dims, chaotic }),
             KvConfig::mha(dims, 256, 64, None, None),
             8,
+            64 << 20,
         )
     }
 

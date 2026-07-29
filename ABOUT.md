@@ -52,7 +52,7 @@ the runtime already depended on. See [PLUGIN.md](PLUGIN.md).
 ## Facts
 
 - **Language:** Rust (edition 2024, 1.85+)
-- **Tests:** 185 (169 unit + 16 end-to-end HTTP)
+- **Tests:** 187 (171 unit + 16 end-to-end HTTP)
 - **Verified:** loads and runs both the TinyStories 260K checkpoint and a real
   Mixtral-8x7B (Q4_K_M, 25 GB) end to end, the latter on a 16 GB machine via `mmap`,
   where batching prefill cuts time-to-first-token from 386 s to 48 s

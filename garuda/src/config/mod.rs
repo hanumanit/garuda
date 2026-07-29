@@ -77,6 +77,13 @@ pub struct MemoryConfig {
     pub kv_resident_blocks: usize,
     /// Prompt prefixes to remember.
     pub prompt_cache_entries: usize,
+    /// RAM the remembered prefixes may occupy, e.g. `"512MB"`.
+    ///
+    /// An entry holds a whole sequence's attention state, so what it costs depends on
+    /// the model: a 2048-token prefix is a tenth of a megabyte on the synthetic engine
+    /// and half a gigabyte on Mixtral-8x7B. Counting entries alone is therefore not a
+    /// bound — this is.
+    pub prompt_cache: String,
     /// Cold archive tier. Empty disables L3.
     pub archive_path: String,
     /// Spill KV blocks to disk when a sequence exceeds `kv_resident_blocks`.
@@ -89,6 +96,7 @@ impl Default for MemoryConfig {
             expert_cache: "512MB".into(),
             kv_resident_blocks: 512,
             prompt_cache_entries: 64,
+            prompt_cache: "512MB".into(),
             archive_path: String::new(),
             kv_spill: true,
         }
@@ -253,6 +261,7 @@ impl AppConfig {
         }
         self.sampling()?.validate()?;
         parse_size(&self.memory.expert_cache)?;
+        parse_size(&self.memory.prompt_cache)?;
 
         if self.model.context == 0 {
             return Err(GarudaError::Config(
@@ -317,6 +326,10 @@ impl AppConfig {
 
     pub fn expert_cache_bytes(&self) -> Result<usize, GarudaError> {
         parse_size(&self.memory.expert_cache)
+    }
+
+    pub fn prompt_cache_bytes(&self) -> Result<usize, GarudaError> {
+        parse_size(&self.memory.prompt_cache)
     }
 
     pub fn sliding_window(&self) -> Option<usize> {

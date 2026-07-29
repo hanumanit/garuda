@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.23.0] - 2026-07-29
+
+### Fixed
+
+- **The prompt cache is bounded in bytes, not just entries** (`memory.prompt_cache`,
+  default `512MB`). It evicted by entry count alone, which is not a bound: one entry
+  holds a whole sequence's attention state, and what that costs depends entirely on
+  the model. Per cached position —
+
+  | | per position | 64 entries × 2048-token prefixes |
+  |---|---|---|
+  | synthetic MoE | 1 KB | 0.12 GB |
+  | TinyLlama 1.1B | 44 KB | 5.5 GB |
+  | Mixtral-8x7B | 256 KB | **32 GB** |
+
+  — so the shipped default was capable of asking for 32 GB on the machine this
+  runtime exists for, one already running a 25 GB checkpoint in 16 GB of RAM. The
+  expert cache has been byte-budgeted since it was written (`expert_cache`); this is
+  the same lesson, arrived at later and in the more dangerous place.
+
+  An entry larger than the whole budget is declined rather than admitted, since
+  taking it would evict everything else and then sit there alone. Confirmed on the
+  620 MB MoE checkpoint: with `512MB` five ~76 MB prefixes are retained, with `64MB`
+  none are.
+
+- `/v1/stats` reports the prompt cache's byte usage, which it previously hardcoded
+  to zero.
+
 ## [0.22.0] - 2026-07-29
 
 Speculative decoding, by prompt lookup. This is the answer to the finding in 0.21.0

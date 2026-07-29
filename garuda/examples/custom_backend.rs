@@ -103,7 +103,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // One attention layer, key/value width == d_model (full multi-head attention).
     let kv = KvConfig::mha(dims, 256, 64, None, None);
-    let runtime = InferenceRuntime::new(Arc::new(Tokenizer::new()), backend, kv, 8);
+    // The last two arguments bound the prompt cache: how many prefixes to remember,
+    // and how much RAM they may hold between them. Entries alone are not a bound —
+    // one entry is a whole sequence's attention state, which on a large model is
+    // hundreds of megabytes.
+    let runtime = InferenceRuntime::new(Arc::new(Tokenizer::new()), backend, kv, 8, 64 << 20);
 
     let params = SamplingParams {
         temperature: 0.8, // sample; the seed keeps the run reproducible

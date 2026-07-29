@@ -179,6 +179,7 @@ impl Engine {
             Arc::new(backend),
             kv,
             config.memory.prompt_cache_entries,
+            config.prompt_cache_bytes()?,
         ));
 
         Ok(Self {
@@ -251,6 +252,7 @@ impl Engine {
             backend,
             kv,
             config.memory.prompt_cache_entries,
+            config.prompt_cache_bytes()?,
         ));
 
         Ok(Self {

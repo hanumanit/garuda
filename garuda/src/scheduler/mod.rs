@@ -721,7 +721,7 @@ mod tests {
         let engine = Arc::new(MoeEngine::new(dims, weights, router, mm, None).unwrap());
 
         let kv = KvConfig::mha(dims, 256, 64, None, None);
-        let rt = InferenceRuntime::new(Arc::new(Tokenizer::new()), engine, kv, 16);
+        let rt = InferenceRuntime::new(Arc::new(Tokenizer::new()), engine, kv, 16, 64 << 20);
         (Arc::new(rt), dir)
     }
 

@@ -532,6 +532,15 @@ impl KVCacheState {
         Ok(())
     }
 
+    /// Bytes this layer's attention state occupies in RAM. Spilled blocks are on
+    /// disk and cost nothing here.
+    pub fn resident_bytes(&self) -> usize {
+        self.resident
+            .values()
+            .map(|b| (b.keys.len() + b.values.len()) * std::mem::size_of::<f32>())
+            .sum()
+    }
+
     /// True when some of this sequence's attention state currently lives on disk.
     pub fn has_spill(&self) -> bool {
         !self.spilled.is_empty()
@@ -626,6 +635,11 @@ impl SeqState {
         self.kvs.iter().any(KVCacheState::has_spill)
     }
 
+    /// Bytes this sequence's attention state occupies in RAM, across every layer.
+    pub fn resident_bytes(&self) -> usize {
+        self.kvs.iter().map(KVCacheState::resident_bytes).sum()
+    }
+
     /// Give every layer a fresh sequence identity. Fails if anything is spilled.
     pub fn rekey(&mut self, seq_id: u64) -> Result<(), GarudaError> {
         for kv in &mut self.kvs {
@@ -665,9 +679,14 @@ impl Drop for SeqState {
 /// Maps an exact prompt to the sequence state produced by prefilling it, so that
 /// re-sending the same prompt skips prefill entirely.
 ///
-/// Bounded by entry count, LRU eviction. (The previous implementation was keyed by
-/// the full token vector, never evicted, and threw the cached value away on read —
-/// it could only grow.)
+/// Bounded by **bytes as well as entries**, LRU eviction. Entries alone is not a
+/// bound at all here: one entry holds a whole sequence's attention state, and what
+/// that costs depends on the model and the prompt. A cached 2048-token prefix is
+/// 0.1 MB on the synthetic engine and 512 MB on Mixtral-8x7B, so the sixty-four
+/// entries that are nothing in the first case are 32 GB in the second — on a machine
+/// whose whole point is running a checkpoint bigger than its RAM. The expert cache
+/// has been byte-budgeted since it was written; this is the same lesson, arrived at
+/// later.
 ///
 /// Only states with nothing spilled are cached. A cached entry is handed out by
 /// clone, and a clone must be able to spill under a fresh identity; sharing an id
@@ -675,11 +694,13 @@ impl Drop for SeqState {
 pub struct PromptCache {
     inner: Mutex<PromptCacheInner>,
     capacity: usize,
+    budget_bytes: usize,
 }
 
 struct PromptCacheInner {
     entries: HashMap<[u8; 32], SeqState>,
     lru: VecDeque<[u8; 32]>,
+    bytes: usize,
     hits: u64,
     misses: u64,
 }
@@ -693,15 +714,19 @@ fn prompt_key(tokens: &[Token]) -> [u8; 32] {
 }
 
 impl PromptCache {
-    pub fn new(capacity: usize) -> Self {
+    /// `budget_bytes` caps the RAM the cached states may hold; `capacity` caps how
+    /// many there may be. Whichever binds first does the evicting.
+    pub fn new(capacity: usize, budget_bytes: usize) -> Self {
         Self {
             inner: Mutex::new(PromptCacheInner {
                 entries: HashMap::new(),
                 lru: VecDeque::new(),
+                bytes: 0,
                 hits: 0,
                 misses: 0,
             }),
             capacity: capacity.max(1),
+            budget_bytes,
         }
     }
 
@@ -739,18 +764,33 @@ impl PromptCache {
         if state.has_spill() {
             return;
         }
+        let size = state.resident_bytes();
+        // One entry larger than the whole budget would evict everything and then sit
+        // there alone, so decline it instead: the prefill it saves is not worth
+        // emptying the cache for every other caller.
+        if size > self.budget_bytes {
+            return;
+        }
+
         let key = prompt_key(tokens);
         let mut inner = self.inner.lock();
 
+        if let Some(old) = inner.entries.remove(&key) {
+            inner.bytes -= old.resident_bytes();
+            inner.lru.retain(|k| k != &key);
+        }
         inner.entries.insert(key, state);
-        inner.lru.retain(|k| k != &key);
+        inner.bytes += size;
         inner.lru.push_back(key);
 
-        while inner.lru.len() > self.capacity {
+        while inner.lru.len() > self.capacity || inner.bytes > self.budget_bytes {
             let Some(victim) = inner.lru.pop_front() else {
                 break;
             };
-            inner.entries.remove(&victim); // Drop purges anything it owns.
+            if let Some(evicted) = inner.entries.remove(&victim) {
+                // Drop purges anything it owns.
+                inner.bytes -= evicted.resident_bytes();
+            }
         }
     }
 
@@ -761,7 +801,7 @@ impl PromptCache {
             misses: inner.misses,
             evictions: 0,
             entries: inner.entries.len(),
-            bytes: 0,
+            bytes: inner.bytes,
         }
     }
 }
@@ -974,7 +1014,7 @@ mod tests {
 
     #[test]
     fn prompt_cache_hits_and_stays_bounded() {
-        let cache = PromptCache::new(2);
+        let cache = PromptCache::new(2, 64 << 20);
         let state = |id| SeqState::new(kv_cfg(None, 4), id);
 
         cache.insert(&[1, 2, 3], state(1));
@@ -1003,7 +1043,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorageBackend::new(&dir));
 
-        let cache = PromptCache::new(4);
+        let cache = PromptCache::new(4, 64 << 20);
         cache.insert(&[7, 8], SeqState::new(kv_cfg(Some(storage.clone()), 1), 1));
 
         let mut a = cache.get(&[7, 8], 100).unwrap();
@@ -1027,6 +1067,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Entries alone do not bound this cache: one entry is a whole sequence's
+    /// attention state. A budget in bytes has to evict even when the entry cap is
+    /// nowhere near reached, or a large model fills memory with cached prefixes.
+    #[test]
+    fn prompt_cache_evicts_on_bytes_before_the_entry_cap_is_reached() {
+        let d = dims();
+        // A state holding four positions, so its size is easy to reason about.
+        let state = |id: u64| {
+            let mut s = SeqState::new(kv_cfg(None, 64), id);
+            let v = vec![0.5; d.d_model];
+            for _ in 0..4 {
+                s.kv().append(&v, &v).unwrap();
+            }
+            s
+        };
+        let one = state(1).resident_bytes();
+        assert!(one > 0, "a populated state should occupy something");
+
+        // Room for two by bytes, but a hundred by entry count.
+        let cache = PromptCache::new(100, one * 2);
+        cache.insert(&[1], state(1));
+        cache.insert(&[2], state(2));
+        assert_eq!(cache.stats().entries, 2);
+        assert_eq!(cache.stats().bytes, one * 2);
+
+        cache.insert(&[3], state(3));
+        assert_eq!(
+            cache.stats().entries,
+            2,
+            "the byte budget did not evict, though the entry cap was far away"
+        );
+        assert!(
+            cache.stats().bytes <= one * 2,
+            "over budget after inserting"
+        );
+        assert!(cache.get(&[1], 10).is_none(), "the oldest should have gone");
+        assert!(cache.get(&[3], 11).is_some(), "the newest should be here");
+    }
+
+    #[test]
+    fn prompt_cache_declines_an_entry_larger_than_the_whole_budget() {
+        let d = dims();
+        let mut big = SeqState::new(kv_cfg(None, 64), 1);
+        let v = vec![0.5; d.d_model];
+        for _ in 0..8 {
+            big.kv().append(&v, &v).unwrap();
+        }
+        // Budget smaller than this single entry: taking it would evict everything
+        // else and then sit there alone.
+        let cache = PromptCache::new(100, big.resident_bytes() / 2);
+        cache.insert(&[9], big);
+        assert_eq!(cache.stats().entries, 0);
+        assert_eq!(cache.stats().bytes, 0);
+    }
+
     #[test]
     fn prompt_cache_refuses_to_store_spilled_state() {
         let dir = std::env::temp_dir().join("garuda_prompt_nospill");
@@ -1048,7 +1143,7 @@ mod tests {
         }
         assert!(state.has_spill());
 
-        let cache = PromptCache::new(4);
+        let cache = PromptCache::new(4, 64 << 20);
         cache.insert(&[1], state);
         assert_eq!(cache.stats().entries, 0, "spilled state must not be cached");
 

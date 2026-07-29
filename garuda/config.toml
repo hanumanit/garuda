@@ -58,8 +58,15 @@ expert_cache = "512MB"
 # cover the context (context / 32, rounded up) or set a window; Garuda warns at startup
 # if the combination would spill and reload once per token.
 kv_resident_blocks = 512
-# Prompt prefixes to remember, so a repeated prompt skips prefill.
+# Prompt prefixes to remember, so a repeated prompt skips prefill, and the RAM they
+# may occupy between them. Both bound the cache; whichever binds first evicts.
+#
+# The byte budget is the one that matters. An entry holds a whole sequence's
+# attention state, so what it costs depends on the model: a 2048-token prefix is
+# ~0.1 MB on the synthetic engine and ~512 MB on Mixtral-8x7B. Sixty-four entries is
+# nothing in the first case and 32 GB in the second.
 prompt_cache_entries = 64
+prompt_cache = "512MB"
 # Cold archive tier. Empty disables L3.
 archive_path = ""
 kv_spill = true
