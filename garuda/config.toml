@@ -39,9 +39,9 @@ prefill_batch = 0
 # copied from earlier in the context and kept only where the model would have chosen
 # it anyway, so the output never changes — what it saves is passes over the weights,
 # which on a checkpoint larger than RAM is nearly the whole cost of a token. Greedy
-# requests only (temperature = 0); sampled ones take the ordinary path, because
-# keeping a guess for matching the argmax would quietly replace the caller's
-# distribution. 0 disables it. The value is a ceiling: each sequence asks for a
+# requests get back exactly what plain decoding gives; sampled ones get the same
+# distribution, though at temperature 0.8 the guesses are rejected often enough that
+# it buys nothing measurable. 0 disables it. The value is a ceiling: each sequence asks for a
 # little more than its recent guesses have been winning, so a workload the guessing
 # does not suit stops paying for it.
 speculative_lookahead = 4

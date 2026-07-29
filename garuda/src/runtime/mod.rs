@@ -106,6 +106,31 @@ pub fn sample(
         return Ok(idx as Token);
     }
 
+    let candidates = candidates(data, params);
+    let total: f32 = candidates.iter().map(|(_, p)| p).sum();
+    if total <= 0.0 {
+        // Every surviving candidate has zero mass (possible after an extreme
+        // temperature). Fall back to the most likely token rather than to token 0.
+        return Ok(candidates[0].0);
+    }
+
+    let mut point = rng.next_f32() * total;
+    for (tok, p) in &candidates {
+        point -= p;
+        if point <= 0.0 {
+            return Ok(*tok);
+        }
+    }
+    Ok(candidates.last().expect("non-empty").0)
+}
+
+/// The candidates `sample` chooses between: temperature, then top-k, then top-p.
+///
+/// Weights are the softmax probabilities of the survivors, so they sum to at most
+/// one — truncation removes mass rather than redistributing it. Returned rather than
+/// consumed on the spot because verifying a speculated token needs to *read* this
+/// distribution, not just draw from it.
+fn candidates(data: &[f32], params: &SamplingParams) -> Vec<(Token, f32)> {
     // Temperature, then softmax to probabilities.
     let mut scaled: Vec<f32> = data.iter().map(|&v| v / params.temperature).collect();
     crate::simd::softmax(&mut scaled);
@@ -146,21 +171,60 @@ pub fn sample(
         candidates.truncate(keep.max(1));
     }
 
-    let total: f32 = candidates.iter().map(|(_, p)| p).sum();
+    candidates
+}
+
+/// Decide a speculated token against the distribution the caller actually asked for.
+///
+/// Returns whether the guess survived, and the token to emit either way.
+///
+/// This is what makes guessing safe for a sampled request. The drafter is
+/// deterministic — it proposes one token with certainty — so the standard
+/// speculative-sampling rule reduces to: keep the guess with probability `p(guess)`,
+/// and on rejection draw from `p` with the guess removed. Over many steps that emits
+/// exactly `p`, which an equality test against the argmax does not: that would
+/// silently hand a caller who asked for `temperature = 0.8` the greedy answer.
+fn verify_drafted(cands: &[(Token, f32)], drafted: Token, rng: &mut Rng) -> (bool, Token) {
+    let total: f32 = cands.iter().map(|(_, p)| p).sum();
     if total <= 0.0 {
-        // Every surviving candidate has zero mass (possible after an extreme
-        // temperature). Fall back to the most likely token rather than to token 0.
-        return Ok(candidates[0].0);
+        return (false, cands[0].0);
+    }
+    // Zero if top-k or top-p cut the guess away, which then always rejects — correct,
+    // since the caller's distribution gives it no mass at all.
+    let drafted_mass = cands
+        .iter()
+        .find(|(t, _)| *t == drafted)
+        .map(|(_, p)| *p)
+        .unwrap_or(0.0);
+
+    if rng.next_f32() < drafted_mass / total {
+        return (true, drafted);
     }
 
-    let mut point = rng.next_f32() * total;
-    for (tok, p) in &candidates {
+    let residual = total - drafted_mass;
+    if residual <= 0.0 {
+        // `p` was a point mass on the guess, so there is nothing else to draw.
+        return (true, drafted);
+    }
+    let mut point = rng.next_f32() * residual;
+    for (tok, p) in cands {
+        if *tok == drafted {
+            continue;
+        }
         point -= p;
         if point <= 0.0 {
-            return Ok(*tok);
+            return (false, *tok);
         }
     }
-    Ok(candidates.last().expect("non-empty").0)
+    (
+        false,
+        cands
+            .iter()
+            .rev()
+            .find(|(t, _)| *t != drafted)
+            .map(|(t, _)| *t)
+            .unwrap_or(drafted),
+    )
 }
 
 /// A sequence whose prompt is still going in.
@@ -531,11 +595,14 @@ impl InferenceRuntime {
     /// than RAM a pass is gigabytes of paging, which is the whole difference between
     /// one token per read and several.
     ///
-    /// Greedy only. With `temperature > 0`, keeping a guess because it matches the
-    /// argmax would quietly replace the caller's distribution with a greedy one;
-    /// doing it properly needs the rejection-sampling scheme rather than an equality
-    /// test, so sampled requests take the ordinary path instead of a subtly wrong
-    /// fast one.
+    /// Greedy requests get back exactly what plain decoding produces, token for
+    /// token. Sampled ones get the same *distribution*: a guess is kept with the
+    /// probability the caller's distribution assigns it, and otherwise replaced by a
+    /// draw from what remains — the standard speculative-sampling rule, reduced by
+    /// the drafter being deterministic. What that does not preserve
+    /// is the particular sequence a given seed produces — speculating consumes the
+    /// generator differently, so a seeded sampled request reproduces itself but not
+    /// its non-speculative twin.
     ///
     /// Tokens land in `out`. `Err` means the sequence finished, exactly as
     /// `next_token` reports it, and any tokens produced before that are still in
@@ -547,7 +614,7 @@ impl InferenceRuntime {
         lookahead: usize,
         out: &mut Vec<Token>,
     ) -> Result<(), StopReason> {
-        if params.temperature != 0.0 || lookahead == 0 || !self.backend.speculation_supported() {
+        if lookahead == 0 || !self.backend.speculation_supported() {
             return self.next_token(session, params).map(|t| out.push(t));
         }
         if session.finished {
@@ -604,23 +671,46 @@ impl InferenceRuntime {
 
         let mut stop = None;
         for (i, answer) in answers.iter().enumerate() {
-            let token = match sample(answer, params, &mut session.rng) {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!(error = %e, "sampling failed");
-                    stop = Some(StopReason::ContextFull);
-                    break;
+            // Answer `i` is the model's verdict on guess `i`; the last has no guess to
+            // check and simply supplies the next token.
+            let (kept, token) = match draft.get(i) {
+                None => match sample(answer, params, &mut session.rng) {
+                    Ok(t) => (false, t),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "sampling failed");
+                        stop = Some(StopReason::ContextFull);
+                        break;
+                    }
+                },
+                Some(&guess) if params.temperature == 0.0 => {
+                    // Greedy: the model's choice either is the guess or is not, and
+                    // keeping it when it matches cannot change the answer at all.
+                    match sample(answer, params, &mut session.rng) {
+                        Ok(t) => (t == guess, t),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "sampling failed");
+                            stop = Some(StopReason::ContextFull);
+                            break;
+                        }
+                    }
+                }
+                Some(&guess) => {
+                    let cands = candidates(answer.data(), params);
+                    if cands.is_empty() {
+                        stop = Some(StopReason::ContextFull);
+                        break;
+                    }
+                    verify_drafted(&cands, guess, &mut session.rng)
                 }
             };
+
             session.context.push(token);
             if token == self.tokenizer.eos() {
                 stop = Some(StopReason::Eos);
                 break;
             }
             out.push(token);
-            // Keep going only while the guesses hold; `i == draft.len()` means there
-            // are none left to check.
-            if i == draft.len() || token != draft[i] {
+            if !kept {
                 break;
             }
             if session.generated() >= params.max_tokens {
@@ -1258,88 +1348,83 @@ mod tests {
         assert_eq!(spec.seq.len(), plain.seq.len(), "the caches diverged");
     }
 
-    /// A sampled request must take the ordinary path: accepting a guess because it
-    /// equals the argmax would silently replace the caller's distribution with a
-    /// greedy one.
+    /// The property the whole sampled path rests on: over many steps, keeping a
+    /// guess with probability `p(guess)` and otherwise drawing from the remainder
+    /// emits exactly `p`. Get this wrong and a caller who asked for `temperature =
+    /// 0.8` quietly receives something else — a bias no single request could reveal.
     #[test]
-    fn speculation_is_declined_for_sampled_requests() {
-        let rt = cyclic_runtime();
-        let p = SamplingParams {
-            temperature: 0.9,
-            top_p: 0.95,
-            top_k: 40,
-            max_tokens: 6,
-            seed: Some(11),
-        };
-        let prompt: Vec<Token> = vec![8, 9, 10, 11, 12, 13];
+    fn verifying_a_guess_reproduces_the_callers_distribution() {
+        let dist = [(10u32, 0.5f32), (11, 0.3), (12, 0.2)];
 
-        // One token per call, exactly as `next_token` would give.
-        let mut s = rt.start(&prompt, &p).unwrap();
-        let mut calls = 0;
-        while calls < 4 {
-            let mut batch = Vec::new();
-            if rt
-                .next_tokens_speculative(&mut s, &p, 8, &mut batch)
-                .is_err()
-            {
-                break;
+        for drafted in [11u32, 10, 12, 99] {
+            let mut rng = Rng::new(0xD15 + drafted as u64);
+            let mut seen = [0u32; 3];
+            const N: u32 = 60_000;
+            for _ in 0..N {
+                let (_, tok) = verify_drafted(&dist, drafted, &mut rng);
+                seen[(tok - 10) as usize] += 1;
             }
-            assert_eq!(batch.len(), 1, "a sampled request was speculated on");
-            calls += 1;
+            for (i, (tok, want)) in dist.iter().enumerate() {
+                let got = seen[i] as f32 / N as f32;
+                assert!(
+                    (got - want).abs() < 0.01,
+                    "drafting {drafted}: token {tok} came out at {got:.4}, \
+                     but the caller's distribution says {want}"
+                );
+            }
         }
-        assert_eq!(calls, 4);
     }
 
-    /// How far ahead a sequence guesses must follow what its guesses have been
-    /// winning, because the verification pass pays for every position drafted. Six
-    /// guesses that yield one token are six positions of arithmetic for it.
+    /// A token the caller's own truncation removed has no mass, so a guess of it can
+    /// never be kept — and the emitted token must still follow `p`.
     #[test]
-    fn how_far_ahead_it_guesses_follows_what_the_guesses_win() {
+    fn a_guess_outside_the_candidate_set_is_always_rejected() {
+        let dist = [(10u32, 0.6f32), (11, 0.4)];
+        let mut rng = Rng::new(7);
+        for _ in 0..1000 {
+            let (kept, tok) = verify_drafted(&dist, 99, &mut rng);
+            assert!(!kept, "kept a guess with no probability mass");
+            assert!(
+                tok == 10 || tok == 11,
+                "emitted {tok}, outside the candidates"
+            );
+        }
+    }
+
+    /// Sampled requests speculate now. They did not before — the equality test that
+    /// works for greedy would have handed them the greedy answer.
+    #[test]
+    fn a_sampled_request_can_win_more_than_one_token_from_a_pass() {
         let rt = cyclic_runtime();
-        let p = greedy(200);
+        // Low temperature so the model's own choice dominates and guesses drawn from
+        // the repeating context are usually kept.
+        let p = SamplingParams {
+            temperature: 0.05,
+            top_p: 1.0,
+            top_k: 0,
+            max_tokens: 80,
+            seed: Some(3),
+        };
         let prompt: Vec<Token> = vec![8, 9, 10, 11, 12];
 
-        // A predictable sequence: the guesses land, so the draft should grow to the
-        // ceiling it is allowed.
-        let mut good = rt.start(&prompt, &p).unwrap();
-        for _ in 0..12 {
+        let mut s = rt.start(&prompt, &p).unwrap();
+        let mut multi = 0;
+        for _ in 0..30 {
             let mut batch = Vec::new();
-            if rt
-                .next_tokens_speculative(&mut good, &p, 6, &mut batch)
-                .is_err()
-            {
+            let done = rt
+                .next_tokens_speculative(&mut s, &p, 6, &mut batch)
+                .is_err();
+            if batch.len() > 1 {
+                multi += 1;
+            }
+            if done {
                 break;
             }
         }
         assert!(
-            good.spec_gain > 3.0,
-            "guesses were landing but the score stayed at {}",
-            good.spec_gain
+            multi > 0,
+            "a sampled request never won more than one token per pass"
         );
-
-        // A sequence whose guesses have been missing stops asking for them, and
-        // starts again only after sitting out a while.
-        let mut poor = rt.start(&prompt, &p).unwrap();
-        poor.spec_gain = 0.0;
-        poor.spec_idle = 0;
-        let before = poor.seq.len();
-        let mut batch = Vec::new();
-        rt.next_tokens_speculative(&mut poor, &p, 6, &mut batch)
-            .unwrap();
-        assert_eq!(batch.len(), 1, "a losing sequence drafted anyway");
-        assert_eq!(
-            poor.seq.len() - before,
-            1,
-            "a losing sequence still paid for extra positions"
-        );
-        assert_eq!(poor.spec_idle, 1, "the idle count did not advance");
-
-        // After long enough it tries again rather than being written off for good.
-        poor.spec_idle = 16;
-        let mut batch = Vec::new();
-        rt.next_tokens_speculative(&mut poor, &p, 6, &mut batch)
-            .unwrap();
-        assert_eq!(poor.spec_idle, 0, "never retried after sitting out");
     }
 
     #[test]

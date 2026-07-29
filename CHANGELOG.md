@@ -2,6 +2,44 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.24.0] - 2026-07-29
+
+### Changed
+
+- **Sampled requests speculate too, without distorting what the caller asked for.**
+  Until now guessing was greedy-only: keeping a guess because it matched the argmax
+  would have handed someone who asked for `temperature = 0.8` the greedy answer.
+  A guess is now kept with the probability the caller's own distribution assigns it,
+  and otherwise replaced by a draw from that distribution with the guess removed —
+  the standard speculative-sampling rule, which collapses to this because the
+  prompt-lookup drafter proposes a single token with certainty. Over many steps that
+  emits exactly the caller's distribution, which a 60,000-draw test asserts to within
+  one percentage point per token, including when the guess was cut away by top-k or
+  top-p and can never be kept at all.
+
+  **This made sampled speculation correct, not fast.** Measured on Mixtral-8x7B
+  (25 GB, 16 GB RAM) at the shipped default `temperature = 0.8`, paired runs with the
+  order reversed:
+
+  | | speculating | not |
+  |---|---|---|
+  | run 1 | 10.31 s/token | 8.75 s/token |
+  | run 2 | 10.03 s/token | 12.40 s/token |
+
+  The sign flips between rounds, so there is no gain to claim. The reason is in the
+  rule itself: acceptance probability *is* `p(guess)`, and at 0.8 across forty
+  candidates that is small. The 2.6× reported in 0.22.0 remains a greedy result.
+  Where this does extend the win is at low-but-nonzero temperatures; the crossover
+  was not measured.
+
+  Sequences that find their guesses missing still stop drafting, so the honest
+  summary is that sampled requests now *may* benefit and no longer pay when they do
+  not.
+
+- `sample` is unchanged, deliberately. The candidate-building it shares with the new
+  verification was factored out, but its own arithmetic was left byte-for-byte as it
+  was, so no seeded output moves.
+
 ## [0.23.0] - 2026-07-29
 
 ### Fixed
