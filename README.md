@@ -52,7 +52,7 @@ the streaming, the cancellation, the load shedding.
 | Tiered expert storage (L1 RAM → L2 disk → L3 archive) | Real, tested |
 | Paged KV cache with disk spill (multi-layer, GQA-aware) | Real, tested — pair spilling with `sliding_window`; under full attention every step reads the whole prefix, so a spilled block is reloaded the moment it is written. Garuda warns at startup when the configuration would do that |
 | Scheduler (priority, concurrency limits, cancellation, timeouts, backpressure) | Real, tested |
-| Speculative decoding (prompt lookup, no draft model) | Real, measured — on Mixtral (25 GB, 16 GB RAM) a grounded prompt decodes **2.6× faster** (12.5 → 4.8 s/token) and an open-ended one is unaffected (13.2 → 11.6 s/token). Guesses are copied from earlier in the context; greedy output is unchanged token for token, sampled output keeps the caller's distribution. **The speedup is a greedy one** — at `temperature = 0.8` acceptance is too low to measure a gain. Each sequence sizes its own lookahead to what its guesses have been winning |
+| Speculative decoding (prompt lookup, no draft model) | Real, measured — on Mixtral (25 GB, 16 GB RAM) a grounded prompt decodes **2.6× faster** (12.5 → 4.8 s/token) and an open-ended one is unaffected (13.2 → 11.6 s/token). Guesses are copied from earlier in the context; greedy output is unchanged token for token, sampled output keeps the caller's distribution. With prompt lookup the speedup is a greedy one — at `temperature = 0.8` acceptance is too low to measure a gain. With a **draft model** (`model.draft_gguf`, vocabulary-checked at startup) it pays at ordinary temperatures too: **1.7–2.0× at `temperature = 0.8`** on Mixtral against a TinyLlama-1.1B draft (9.0 → 4.6–5.3 s/token). Each sequence sizes its own lookahead to what its guesses have been winning |
 | Continuous batching — concurrent requests decode in one pass over the weights | Real, tested — ~1.6–1.8× aggregate throughput and about half the median latency at 8 concurrent, measured against one task per request |
 | Chunked prefill — a long prompt does not stall the clients already streaming | Real, tested — the worst inter-token gap a streamer sees while a 1474-token prompt is absorbed drops from ~13 s to ~0.2 s. Chunk size is measured from what a decode step actually costs, not fixed |
 | OpenAI + Ollama + Anthropic + llama.cpp + TGI APIs, SSE / NDJSON / WebSocket | Real, tested |
@@ -312,11 +312,9 @@ registered in `Engine::build` — see **[PLUGIN.md](PLUGIN.md)** and
   are refused rather than run.
 - **Architectures beyond Llama.** `LlamaBackend` covers the Llama family (dense and
   MoE, GQA). Other architectures each need their own `InferenceBackend`.
-- **Speculation that pays off at ordinary temperatures.** Sampled requests speculate
-  correctly now, but a deterministic drafter is kept only with probability
-  `p(guess)`, and at `temperature = 0.8` over forty candidates that is low enough
-  that nothing measurable is won. A draft *model* proposes a distribution rather than
-  a single token, which is what makes acceptance high enough to matter there.
+- **A draft model chosen for the target automatically.** `model.draft_gguf` has to be
+  pointed at a vocabulary-compatible checkpoint by hand, and getting it wrong is a
+  startup error rather than something the runtime can resolve.
 - **A draft model.** Prompt lookup only fires where the output echoes the input. A
   small draft checkpoint sharing the vocabulary would speculate on open-ended text
   too, at the cost of a second model to load and keep resident.

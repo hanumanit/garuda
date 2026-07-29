@@ -184,11 +184,8 @@ fn candidates(data: &[f32], params: &SamplingParams) -> Vec<(Token, f32)> {
 /// and on rejection draw from `p` with the guess removed. Over many steps that emits
 /// exactly `p`, which an equality test against the argmax does not: that would
 /// silently hand a caller who asked for `temperature = 0.8` the greedy answer.
-fn verify_drafted(cands: &[(Token, f32)], drafted: Token, rng: &mut Rng) -> (bool, Token) {
-    verify_against(cands, drafted, None, rng)
-}
-
-/// The same decision when the guess came from a *model* rather than a lookup.
+/// The same decision when the guess came from a *model* rather than a lookup, and
+/// the deterministic case besides.
 ///
 /// A draft model proposes a whole distribution `q`, so the rule is the general one:
 /// keep the guess with probability `min(1, p(guess)/q(guess))`, and on rejection draw
@@ -300,6 +297,60 @@ impl Pending {
     }
 }
 
+/// Run the draft model forward `n` times, drawing a token from it each step.
+///
+/// Each proposal's own distribution is recorded alongside it: that is the `q` the
+/// rejection rule needs, and it has to be the distribution the guess was actually
+/// drawn from or the correction does not cancel.
+///
+/// The draft consumes its own cache under the same contract as the target — only
+/// positions it has not seen — so the first call absorbs the prompt and later ones
+/// only the new tokens.
+#[allow(clippy::too_many_arguments)]
+fn propose_with_model(
+    drafter: &dyn InferenceBackend,
+    seq: &mut SeqState,
+    context: &[Token],
+    params: &SamplingParams,
+    n: usize,
+    rng: &mut Rng,
+    dists: &mut Vec<Vec<(Token, f32)>>,
+) -> Result<Vec<Token>, GarudaError> {
+    let mut guesses = Vec::with_capacity(n);
+    let mut probe = context.to_vec();
+    for _ in 0..n {
+        let logits = drafter.logits(&probe, seq)?;
+        let token = if params.temperature == 0.0 {
+            // Greedy: the guess is the draft's argmax, and the target's equality test
+            // decides it. No distribution is needed, and none is recorded.
+            sample(&logits, params, rng)?
+        } else {
+            let cands = candidates(logits.data(), params);
+            if cands.is_empty() {
+                break;
+            }
+            let total: f32 = cands.iter().map(|(_, p)| p).sum();
+            if total <= 0.0 {
+                break;
+            }
+            let mut point = rng.next_f32() * total;
+            let mut drawn = cands[cands.len() - 1].0;
+            for (tok, p) in &cands {
+                point -= p;
+                if point <= 0.0 {
+                    drawn = *tok;
+                    break;
+                }
+            }
+            dists.push(cands);
+            drawn
+        };
+        guesses.push(token);
+        probe.push(token);
+    }
+    Ok(guesses)
+}
+
 /// Context tokens that must match for a guess to be drawn from an earlier passage.
 ///
 /// Short enough to fire often, long enough that a match means something: two tokens
@@ -361,6 +412,10 @@ pub struct Session {
     /// another look rather than being written off for good — text turns repetitive
     /// halfway through often enough to be worth rechecking.
     spec_idle: usize,
+    /// The draft model's attention state for this same sequence, when one is
+    /// attached. It trails the target's: only positions the target went on to accept
+    /// are kept, so the two always describe the same tokens.
+    draft_seq: Option<SeqState>,
 }
 
 impl Session {
@@ -405,6 +460,15 @@ impl StopReason {
 pub struct InferenceRuntime {
     pub tokenizer: Arc<dyn Tokenize>,
     backend: Arc<dyn InferenceBackend>,
+    /// A small model that proposes tokens for the big one to check, and the shape of
+    /// the cache it needs — its own, since it has its own layers and head widths.
+    ///
+    /// Where prompt lookup can only guess text that already appeared, a model guesses
+    /// anywhere; what it costs is a second checkpoint resident alongside the first.
+    /// It must share the target's vocabulary, which [`crate::server::Engine`] checks
+    /// at startup, because otherwise identical token ids mean different words and
+    /// nothing downstream would notice.
+    drafter: Option<(Arc<dyn InferenceBackend>, KvConfig)>,
     prompt_cache: PromptCache,
     kv_template: KvConfig,
     max_context: usize,
@@ -423,11 +487,27 @@ impl InferenceRuntime {
         Self {
             tokenizer,
             backend,
+            drafter: None,
             prompt_cache: PromptCache::new(prompt_cache_capacity, prompt_cache_bytes),
             kv_template,
             max_context,
             next_seq: AtomicU64::new(1),
         }
+    }
+
+    /// Attach a small model that proposes tokens for this one to check.
+    ///
+    /// Its vocabulary must match this runtime's tokenizer. Nothing here can verify
+    /// that — a token id is a token id — so [`crate::server::Engine`] refuses a
+    /// mismatched checkpoint at startup instead.
+    pub fn with_drafter(mut self, drafter: Arc<dyn InferenceBackend>, kv: KvConfig) -> Self {
+        self.drafter = Some((drafter, kv));
+        self
+    }
+
+    /// True when a draft model is available to propose tokens.
+    pub fn has_drafter(&self) -> bool {
+        self.drafter.is_some()
     }
 
     pub fn dims(&self) -> ModelDims {
@@ -555,6 +635,7 @@ impl InferenceRuntime {
             // more than any guess about the workload could.
             spec_gain: 1.0,
             spec_idle: 0,
+            draft_seq: None,
         }
     }
 
@@ -700,12 +781,42 @@ impl InferenceRuntime {
             session.spec_idle = 0;
             (session.spec_gain.ceil() as usize + 1).min(lookahead)
         };
-        let draft = draft_from_context(&session.context, budget.min(room), NGRAM);
+        // Two ways to guess. A draft model proposes anywhere, at the cost of running
+        // a second checkpoint; prompt lookup only echoes text already present, but is
+        // free. Prefer the model when there is one.
+        let mut draft_dists: Vec<Vec<(Token, f32)>> = Vec::new();
+        let draft = match &self.drafter {
+            Some((drafter, kv)) if budget > 0 => {
+                let seq = session
+                    .draft_seq
+                    .get_or_insert_with(|| SeqState::new(kv.clone(), self.fresh_seq_id()));
+                match propose_with_model(
+                    drafter.as_ref(),
+                    seq,
+                    &session.context,
+                    params,
+                    budget.min(room),
+                    &mut session.rng,
+                    &mut draft_dists,
+                ) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        // The draft is advisory: if it fails, fall back rather than
+                        // failing the request the target could still serve.
+                        tracing::debug!(error = %e, "draft model failed; guessing without it");
+                        draft_dists.clear();
+                        Vec::new()
+                    }
+                }
+            }
+            _ => draft_from_context(&session.context, budget.min(room), NGRAM),
+        };
 
         // One pass over `context ++ draft`. Answer `i` is the token the model would
         // produce having seen the first `i` guesses — so answer 0 is the real next
         // token, and answer `i` is only reachable if guesses `0..i` were all right.
         let n = draft.len() + 1;
+        let base = session.context.len();
         let mut probe = session.context.clone();
         probe.extend_from_slice(&draft);
         let answers = match self.backend.logits_multi(&probe, &mut session.seq, n) {
@@ -748,7 +859,12 @@ impl InferenceRuntime {
                         stop = Some(StopReason::ContextFull);
                         break;
                     }
-                    verify_drafted(&cands, guess, &mut session.rng)
+                    verify_against(
+                        &cands,
+                        guess,
+                        draft_dists.get(i).map(|d| &d[..]),
+                        &mut session.rng,
+                    )
                 }
             };
 
@@ -782,6 +898,17 @@ impl InferenceRuntime {
         if session.seq.truncate(keep).is_err() {
             session.finished = true;
             return Err(StopReason::ContextFull);
+        }
+
+        // The draft ran ahead over guesses, some of which the target threw away. Cut
+        // it back to the guesses that survived, so the two caches describe the same
+        // tokens; a draft left describing tokens that were never emitted would poison
+        // every guess after it.
+        if let Some(ds) = session.draft_seq.as_mut() {
+            let kept_guesses = out.len().saturating_sub(1).min(draft.len());
+            if ds.truncate(base + kept_guesses).is_err() {
+                session.draft_seq = None; // start it over rather than trust it
+            }
         }
 
         match stop {
@@ -1409,7 +1536,7 @@ mod tests {
             let mut seen = [0u32; 3];
             const N: u32 = 60_000;
             for _ in 0..N {
-                let (_, tok) = verify_drafted(&dist, drafted, &mut rng);
+                let (_, tok) = verify_against(&dist, drafted, None, &mut rng);
                 seen[(tok - 10) as usize] += 1;
             }
             for (i, (tok, want)) in dist.iter().enumerate() {
@@ -1467,7 +1594,7 @@ mod tests {
         let dist = [(10u32, 0.6f32), (11, 0.4)];
         let mut rng = Rng::new(7);
         for _ in 0..1000 {
-            let (kept, tok) = verify_drafted(&dist, 99, &mut rng);
+            let (kept, tok) = verify_against(&dist, 99, None, &mut rng);
             assert!(!kept, "kept a guess with no probability mass");
             assert!(
                 tok == 10 || tok == 11,

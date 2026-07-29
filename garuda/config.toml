@@ -45,6 +45,18 @@ prefill_batch = 0
 # little more than its recent guesses have been winning, so a workload the guessing
 # does not suit stops paying for it.
 speculative_lookahead = 4
+# A small GGUF checkpoint that proposes tokens for the model above to check. It must
+# share the model's vocabulary — startup refuses otherwise, since the same token id
+# would mean different words to each and nothing downstream could tell.
+#
+# Empty uses prompt lookup instead, which needs no second model but can only guess
+# text already in the context: worth ~2.6x on a grounded prompt at temperature 0 and
+# nothing at all at 0.8. A draft model guesses anywhere, and is what makes speculation
+# pay at ordinary temperatures — measured 1.7-2.0x on Mixtral at 0.8, against a
+# TinyLlama-1.1B draft. It costs a second checkpoint resident alongside the first.
+#   draft_gguf = "/path/to/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
+draft_gguf = ""
+draft_mmap = true
 # There is no GPU backend. Setting this to true is a startup error, not a fallback.
 gpu = false
 

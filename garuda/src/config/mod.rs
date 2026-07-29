@@ -39,6 +39,16 @@ pub struct ModelConfig {
     /// batching (a token traverses every layer before the next one starts). Only
     /// affects a memory-mapped gguf model — see `llama::LlamaBackend::prefill_chunk`.
     pub prefill_batch: usize,
+    /// A small GGUF checkpoint used to propose tokens for the main model to check.
+    ///
+    /// Must share the main model's vocabulary — startup refuses otherwise, since
+    /// identical token ids would mean different words and nothing downstream could
+    /// tell. Empty (the default) uses prompt lookup instead, which needs no second
+    /// model but can only guess text already in the context.
+    pub draft_gguf: String,
+    /// Keep the draft checkpoint packed in a memory-mapped file, as `mmap` does for
+    /// the main one.
+    pub draft_mmap: bool,
     /// Tokens to guess ahead when a single request is decoding on its own.
     ///
     /// A guess is drawn from earlier in the context and only kept where the model
@@ -62,6 +72,8 @@ impl Default for ModelConfig {
             top_k: 2,
             sliding_window: 0,
             prefill_batch: 0,
+            draft_gguf: String::new(),
+            draft_mmap: true,
             speculative_lookahead: 4,
             gpu: false,
         }
@@ -294,6 +306,13 @@ impl AppConfig {
                 "server.request_timeout_secs must be at least 1".into(),
             ));
         }
+        if self.draft_path().is_some() && self.gguf_path().is_none() {
+            return Err(GarudaError::Config(
+                "model.draft_gguf is set but model.gguf is not — there is nothing for \
+                 the draft model to propose to"
+                    .into(),
+            ));
+        }
         if self.server.api_keys.iter().any(|k| k.is_empty()) {
             return Err(GarudaError::Config(
                 "server.api_keys must not contain an empty string — a request with an \
@@ -305,6 +324,12 @@ impl AppConfig {
     }
 
     /// The GGUF checkpoint to load, if one is configured.
+    /// The draft checkpoint, if one is configured.
+    pub fn draft_path(&self) -> Option<PathBuf> {
+        let p = self.model.draft_gguf.trim();
+        (!p.is_empty()).then(|| PathBuf::from(p))
+    }
+
     pub fn gguf_path(&self) -> Option<PathBuf> {
         let p = self.model.gguf.trim();
         (!p.is_empty()).then(|| PathBuf::from(p))

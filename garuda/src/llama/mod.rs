@@ -1652,6 +1652,90 @@ mod tests {
         assert!(backend.speculation_supported());
     }
 
+    /// A draft model must not change what the target produces. Greedy is the strict
+    /// case: a guess is kept only where the target's own argmax agrees, so the tokens
+    /// have to match plain decoding exactly — and both caches have to end up
+    /// describing those same tokens, or the next round's guesses are built on fiction.
+    #[test]
+    fn a_draft_model_does_not_change_greedy_output() {
+        use crate::cache::KvConfig;
+        use crate::runtime::{InferenceRuntime, SamplingParams};
+
+        let bytes = build_moe_gguf(ExpertLayout::Merged);
+        let target = Arc::new(LlamaBackend::load(&bytes).unwrap());
+        // A second, independently-loaded copy stands in for a draft model: it shares
+        // the vocabulary, which is the only thing the mechanism requires. Its guesses
+        // will often be right, which exercises the accept path properly.
+        let draft = Arc::new(LlamaBackend::load(&bytes).unwrap());
+        let lc = target.config();
+        let dims = target.dims();
+        let kv = move || KvConfig {
+            dims,
+            kv_dim: lc.kv_dim(),
+            n_layers: lc.n_layers,
+            max_positions: 64,
+            max_resident_blocks: 64,
+            sliding_window: None,
+            storage: None,
+        };
+
+        let plain = InferenceRuntime::new(
+            Arc::new(crate::tokenizer::Tokenizer::new()),
+            target.clone(),
+            kv(),
+            4,
+            1 << 20,
+        );
+        let spec = InferenceRuntime::new(
+            Arc::new(crate::tokenizer::Tokenizer::new()),
+            target,
+            kv(),
+            4,
+            1 << 20,
+        )
+        .with_drafter(draft, kv());
+        assert!(spec.has_drafter());
+
+        let p = SamplingParams {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            max_tokens: 20,
+            seed: Some(1),
+        };
+        let prompt: Vec<Token> = vec![3, 7, 1, 9, 2];
+
+        let mut a = plain.start(&prompt, &p).unwrap();
+        let mut want = Vec::new();
+        while let Ok(t) = plain.next_token(&mut a, &p) {
+            want.push(t);
+        }
+
+        let mut b = spec.start(&prompt, &p).unwrap();
+        let mut got = Vec::new();
+        let mut multi = 0;
+        loop {
+            let mut batch = Vec::new();
+            let done = spec
+                .next_tokens_speculative(&mut b, &p, 4, &mut batch)
+                .is_err();
+            if batch.len() > 1 {
+                multi += 1;
+            }
+            got.extend(batch);
+            if done {
+                break;
+            }
+        }
+
+        assert_eq!(got, want, "the draft model changed the output");
+        assert!(
+            multi > 0,
+            "no round ever won more than one token, so the accept path went untested"
+        );
+        assert_eq!(a.generated(), b.generated());
+    }
+
     /// The same row-range plumbing as above, but over a k-quant. F32 rows are 4 bytes
     /// an element; a Q6_K row is 210 bytes per 256 elements, so `row_start * row_bytes`
     /// is doing genuinely different arithmetic — and a stacked MoE expert tensor is

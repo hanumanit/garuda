@@ -48,6 +48,71 @@ impl Engine {
         }
     }
 
+    /// Load the draft checkpoint and the cache shape it needs.
+    ///
+    /// Refuses a vocabulary that does not match the main model's. A draft that
+    /// tokenises differently would hand back ids meaning different words, and every
+    /// layer below here would accept them without complaint — the guesses would
+    /// simply always be wrong, or worse, occasionally right by coincidence.
+    fn load_draft(
+        config: &AppConfig,
+        path: &std::path::Path,
+        target_vocab: usize,
+    ) -> anyhow::Result<(Arc<dyn InferenceBackend>, KvConfig)> {
+        let mmap: Option<Arc<memmap2::Mmap>> = if config.model.draft_mmap {
+            let file = std::fs::File::open(path)
+                .with_context(|| format!("opening draft checkpoint {}", path.display()))?;
+            // Safety: opened read-only, held for the process lifetime, never mutated.
+            Some(Arc::new(
+                unsafe { memmap2::Mmap::map(&file) }
+                    .with_context(|| format!("mmapping draft checkpoint {}", path.display()))?,
+            ))
+        } else {
+            None
+        };
+        let owned;
+        let bytes: &[u8] = match &mmap {
+            Some(m) => &m[..],
+            None => {
+                owned = std::fs::read(path)
+                    .with_context(|| format!("reading draft checkpoint {}", path.display()))?;
+                &owned
+            }
+        };
+
+        let gguf = Gguf::parse(bytes)?;
+        let draft = LlamaBackend::from_gguf(&gguf, bytes, mmap.clone())?;
+        let dc = draft.config();
+        if dc.vocab != target_vocab {
+            anyhow::bail!(
+                "draft checkpoint {} has a {}-token vocabulary but the model has {} — \
+                 they must be the same, or a token id means different words to each",
+                path.display(),
+                dc.vocab,
+                target_vocab
+            );
+        }
+
+        let kv = KvConfig {
+            dims: draft.dims(),
+            kv_dim: dc.kv_dim(),
+            n_layers: dc.n_layers,
+            max_positions: config.model.context.min(dc.context).max(1),
+            max_resident_blocks: config.memory.kv_resident_blocks,
+            sliding_window: config.sliding_window(),
+            // Small and short-lived; spilling it would cost more than it saves.
+            storage: None,
+        };
+        tracing::info!(
+            draft = %path.display(),
+            layers = dc.n_layers,
+            vocab = dc.vocab,
+            checkpoint_mb = bytes.len() / 1_048_576,
+            "draft model loaded"
+        );
+        Ok((Arc::new(draft), kv))
+    }
+
     /// How many prompt tokens share one pass over a layer's weights.
     ///
     /// Batching is a straight win — see [`crate::llama::LlamaBackend::with_prefill_chunk`]
@@ -174,13 +239,18 @@ impl Engine {
         };
         Self::warn_if_kv_spill_thrashes(&kv);
 
-        let runtime = Arc::new(InferenceRuntime::new(
+        let mut runtime = InferenceRuntime::new(
             tokenizer,
             Arc::new(backend),
             kv,
             config.memory.prompt_cache_entries,
             config.prompt_cache_bytes()?,
-        ));
+        );
+        if let Some(path) = config.draft_path() {
+            let (drafter, draft_kv) = Self::load_draft(config, &path, dims.vocab_size)?;
+            runtime = runtime.with_drafter(drafter, draft_kv);
+        }
+        let runtime = Arc::new(runtime);
 
         Ok(Self {
             dims,

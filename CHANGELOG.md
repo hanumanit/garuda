@@ -2,6 +2,54 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.25.0] - 2026-07-29
+
+Speculation that pays at the temperature people actually use.
+
+### Added
+
+- **`model.draft_gguf`** — a small checkpoint that proposes tokens for the main model
+  to check. Prompt lookup, added in 0.22.0, can only guess text already present in
+  the context; 0.24.0 made it safe for sampled requests but measured no gain from it
+  at `temperature = 0.8`, because a deterministic guess is kept with probability
+  `p(guess)` and that is small across forty candidates. A model proposes a whole
+  distribution, and the acceptance rule corrects against it, so guesses land far more
+  often.
+
+  Measured on Mixtral-8x7B Q4_K_M (25 GB, 16 GB RAM) at the shipped default
+  `temperature = 0.8`, grounded prompt, with a TinyLlama-1.1B Q4_K_M draft (638 MB):
+
+  | | s/token |
+  |---|---|
+  | no speculation | 9.01 (and 8.75 / 12.40 earlier) |
+  | prompt lookup | 8.51 (and 10.31 / 10.03 earlier) |
+  | **draft model** | **5.33 / 4.58** |
+
+  So **1.7–2.0×** where prompt lookup won nothing. The draft competes with the target
+  for page cache — a real worry on a machine already running a 25 GB model in 16 GB —
+  and it still comes out ahead, which the arithmetic suggested but did not settle.
+
+- **The vocabularies are checked at startup and a mismatch is refused.** This is the
+  one failure that could not be caught later: a token id is a token id, so a draft
+  that tokenises differently would hand back ids meaning different words and every
+  layer below would accept them without complaint. The guesses would simply be wrong,
+  or worse, right by coincidence.
+
+### Changed
+
+- The two rejection rules became one. `verify_drafted` was a wrapper for the
+  deterministic case; there is now a single `verify_against` taking an optional draft
+  distribution, so a lookup is the point-mass special case rather than a second
+  implementation that has to agree with the first.
+
+### Tests
+
+- A draft model must not change greedy output: the tokens have to match plain
+  decoding exactly, *and* the target and draft caches must end up describing the same
+  tokens — a draft left holding positions for rejected guesses would poison every
+  round after it. The test also asserts some round won more than one token, so it
+  cannot pass by never speculating.
+
 ## [0.24.0] - 2026-07-29
 
 ### Changed
