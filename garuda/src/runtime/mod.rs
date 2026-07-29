@@ -185,33 +185,81 @@ fn candidates(data: &[f32], params: &SamplingParams) -> Vec<(Token, f32)> {
 /// exactly `p`, which an equality test against the argmax does not: that would
 /// silently hand a caller who asked for `temperature = 0.8` the greedy answer.
 fn verify_drafted(cands: &[(Token, f32)], drafted: Token, rng: &mut Rng) -> (bool, Token) {
+    verify_against(cands, drafted, None, rng)
+}
+
+/// The same decision when the guess came from a *model* rather than a lookup.
+///
+/// A draft model proposes a whole distribution `q`, so the rule is the general one:
+/// keep the guess with probability `min(1, p(guess)/q(guess))`, and on rejection draw
+/// from the normalised positive part of `p - q`. The deterministic case above is this
+/// with `q` a point mass — `q(guess) = 1` makes the acceptance probability `p(guess)`
+/// and the residual `p` with the guess removed.
+///
+/// Why the subtraction matters: a draft model that likes a token *more* than the
+/// target does would, without it, over-emit that token even when guesses are
+/// rejected. Removing `q`'s mass from the residual is what cancels that bias exactly.
+fn verify_against(
+    cands: &[(Token, f32)],
+    drafted: Token,
+    draft_dist: Option<&[(Token, f32)]>,
+    rng: &mut Rng,
+) -> (bool, Token) {
     let total: f32 = cands.iter().map(|(_, p)| p).sum();
     if total <= 0.0 {
         return (false, cands[0].0);
     }
     // Zero if top-k or top-p cut the guess away, which then always rejects — correct,
     // since the caller's distribution gives it no mass at all.
-    let drafted_mass = cands
-        .iter()
-        .find(|(t, _)| *t == drafted)
-        .map(|(_, p)| *p)
-        .unwrap_or(0.0);
+    let mass = |d: &[(Token, f32)], t: Token| {
+        d.iter()
+            .find(|(x, _)| *x == t)
+            .map(|(_, w)| *w)
+            .unwrap_or(0.0)
+    };
+    let drafted_mass = mass(cands, drafted);
 
-    if rng.next_f32() < drafted_mass / total {
+    // `q(guess)`: one for a lookup, which proposes its guess with certainty.
+    let q_drafted = match draft_dist {
+        None => 1.0,
+        Some(q) => {
+            let qt: f32 = q.iter().map(|(_, w)| w).sum();
+            if qt <= 0.0 {
+                return (false, cands[0].0);
+            }
+            mass(q, drafted) / qt
+        }
+    };
+    let p_drafted = drafted_mass / total;
+    if q_drafted > 0.0 && rng.next_f32() < (p_drafted / q_drafted).min(1.0) {
         return (true, drafted);
     }
 
-    let residual = total - drafted_mass;
+    // Residual: the positive part of `p - q`, which for a lookup is `p` with the
+    // guess struck out.
+    let q_norm: f32 = draft_dist
+        .map(|q| q.iter().map(|(_, w)| w).sum())
+        .unwrap_or(1.0);
+    let residual_of = |tok: Token, p: f32| -> f32 {
+        match draft_dist {
+            None => {
+                if tok == drafted {
+                    0.0
+                } else {
+                    p
+                }
+            }
+            Some(q) => (p - mass(q, tok) / q_norm * total).max(0.0),
+        }
+    };
+    let residual: f32 = cands.iter().map(|(t, p)| residual_of(*t, *p)).sum();
     if residual <= 0.0 {
-        // `p` was a point mass on the guess, so there is nothing else to draw.
+        // Nothing is left to prefer, so the guess stands.
         return (true, drafted);
     }
     let mut point = rng.next_f32() * residual;
     for (tok, p) in cands {
-        if *tok == drafted {
-            continue;
-        }
-        point -= p;
+        point -= residual_of(*tok, *p);
         if point <= 0.0 {
             return (false, *tok);
         }
@@ -1372,6 +1420,43 @@ mod tests {
                      but the caller's distribution says {want}"
                 );
             }
+        }
+    }
+
+    /// The same guarantee when the guess came from a model whose taste differs from
+    /// the target's. This is where the `p - q` subtraction earns its keep: a drafter
+    /// that loves a token the target is lukewarm on would, without it, push that
+    /// token through even on rejection. The emitted distribution must still be the
+    /// target's, exactly.
+    #[test]
+    fn a_draft_model_that_disagrees_still_yields_the_targets_distribution() {
+        let target = [(10u32, 0.5f32), (11, 0.3), (12, 0.2)];
+        // Deliberately opposite: the drafter is besotted with 12, which the target
+        // likes least.
+        let draft = [(10u32, 0.1f32), (11, 0.2), (12, 0.7)];
+
+        let mut rng = Rng::new(0xDEAF);
+        let mut seen = [0u32; 3];
+        const N: u32 = 120_000;
+        for _ in 0..N {
+            // Draw the guess from `q`, as a real drafter would.
+            let u = rng.next_f32();
+            let guess = if u < 0.1 {
+                10
+            } else if u < 0.3 {
+                11
+            } else {
+                12
+            };
+            let (_, tok) = verify_against(&target, guess, Some(&draft), &mut rng);
+            seen[(tok - 10) as usize] += 1;
+        }
+        for (i, (tok, want)) in target.iter().enumerate() {
+            let got = seen[i] as f32 / N as f32;
+            assert!(
+                (got - want).abs() < 0.012,
+                "token {tok} came out at {got:.4}; the target distribution says {want}"
+            );
         }
     }
 
