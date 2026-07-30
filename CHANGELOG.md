@@ -2,6 +2,63 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.26.0] - 2026-07-30
+
+The prompt format a checkpoint was actually trained on.
+
+### Fixed
+
+- **Chat turns are rendered with the checkpoint's own template.** A GGUF carries
+  `tokenizer.chat_template`; nothing read it. Every chat adapter built a generic
+  `user: …\nassistant: ` transcript instead, which is not what any instruction-tuned
+  model was fine-tuned on.
+
+  This failed silently, which is why it survived. Handed a transcript, a chat model
+  reverts to the document completer it started as: it answers, then writes the user's
+  next turn and keeps going. Observed on TinyLlama — "🇫🇷 Paris" followed by
+  `user: Okay, so the capital of France is Paris. Can you tell me...` — with
+  `finish_reason: length` and no error anywhere. After the fix the same four prompts
+  all end at `finish_reason: stop`, and the system prompt takes effect
+  ("answer in one short sentence" → `2 + 2 = 4`).
+
+  Recognised by the markers a template mentions, not by running Jinja: `<|user|>` for
+  TinyLlama and Zephyr, `[INST]` for Mistral and Mixtral, `<|im_start|>` for ChatML,
+  `<|start_header_id|>` for Llama 3. Verified against the two checkpoints on hand by
+  decoding the assembled ids: Mixtral renders exactly
+  `<s>[INST] … [/INST]`, TinyLlama exactly `<|system|>\n…</s>\n<|user|>\n…\n<|assistant|>\n`.
+  ChatML and Llama 3 follow their published formats and are unit-tested, not measured.
+
+- **A reply stops on the chat format's end-of-turn token, not only on end-of-sequence.**
+  ChatML ends a turn with `<|im_end|>` and Llama 3 with `<|eot_id|>`, keeping `</s>` for
+  the end of the document. A decoder watching only `eos()` never stops on those
+  checkpoints. The three decode paths — single-token, speculative, batched — now share
+  one `ends_turn`, because a stop condition that holds in two of them is a reply that
+  runs on depending which path served it.
+
+- **SentencePiece applies its dummy space prefix once per prompt, not once per
+  fragment.** Assembling a prompt from pieces put a stray `▁` at every turn boundary:
+  TinyLlama's two-turn prompt tokenized to 39 ids where the canonical string is 37,
+  with a space token wedged between `</s>` and the newline. Invisible in the decoded
+  text, and a position the model was never trained on.
+
+### Added
+
+- **`chat` module** — `ChatFormat::detect`, and `encode_chat`, which assembles a prompt
+  as token ids rather than one string. Two reasons it cannot be a string: markers like
+  `<|eot_id|>` are single vocabulary entries that `encode` deliberately does not
+  recognise, and teaching `encode` to recognise them would let a user's own message
+  close their turn and open another. Confirmed on both real vocabularies —
+  `encode("</s>")` yields `</`, `s`, `>` as ordinary text, never the control id.
+
+- **`Tokenize::encode_fragment` and `Tokenize::token_id`** — encoding a continuation
+  without a leading begin-of-sequence, and exact-entry lookup for the renderer that
+  legitimately needs a control id.
+
+### Changed
+
+- The Anthropic adapter no longer hand-rolls its own transcript. It was the third copy
+  of the same format, and all three were wrong for a checkpoint that names a template.
+
 ## [0.25.0] - 2026-07-29
 
 Speculation that pays at the temperature people actually use.

@@ -179,6 +179,19 @@ scheduler and runtime don't know which protocol asked — each adapter (`api`, `
 of decoded pieces). Adding a protocol means parsing its request and formatting its
 reply; the engine-facing middle is written once.
 
+Every chat-shaped adapter renders turns through the **checkpoint's own chat template**,
+read from its `tokenizer.chat_template` metadata — `<|user|>…</s>` for TinyLlama and
+Zephyr, `[INST]…[/INST]` for Mistral and Mixtral, plus ChatML and Llama 3. This is not
+cosmetic. An instruction-tuned model handed a generic `user: …` transcript reverts to
+being the document completer it started as: it answers, then writes the user's next turn
+and keeps going until `max_tokens` cuts it off. Nothing errors, the prose is fluent, and
+the reply is wrong. A checkpoint that names no template gets the plain transcript and
+says so at startup.
+
+Turn markers are placed as token ids around content that is encoded separately, so a
+message containing `</s>` or `<|im_end|>` is text — a user cannot close their own turn
+and open another, putting words in the conversation as though the server had.
+
 **OpenAI** — `created` is a real timestamp, streams end with the `data: [DONE]`
 sentinel SDKs wait for, `usage` is reported, `finish_reason` is honest, and errors use
 OpenAI's envelope with the status code clients act on (`429` rate limit, `503` busy).
