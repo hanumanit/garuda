@@ -37,6 +37,27 @@ pub mod spm;
 /// 6. **`eos()`** is the id whose generation ends a sequence.
 pub trait Tokenize: Send + Sync {
     fn encode(&self, text: &str) -> Vec<Token>;
+
+    /// [`Self::encode`] for one fragment of a longer prompt: identical, minus any
+    /// leading begin-of-sequence.
+    ///
+    /// A prompt assembled from several pieces — see [`crate::chat`] — gets one
+    /// begin-of-sequence at the front, not one per piece. Defaults to `encode`, which
+    /// is correct for a tokenizer that never prepends one.
+    fn encode_fragment(&self, text: &str) -> Vec<Token> {
+        self.encode(text)
+    }
+
+    /// The id whose vocabulary entry is exactly `piece`, if there is one.
+    ///
+    /// [`Self::encode`] does not recognise control tokens by design: a user who types
+    /// `<|eot_id|>` must not thereby end their own turn. So a caller that legitimately
+    /// needs the real control id — the chat renderer, placing turn boundaries — asks
+    /// for it here instead. `None` when this vocabulary has no such entry.
+    fn token_id(&self, _piece: &str) -> Option<Token> {
+        None
+    }
+
     fn decode(&self, tokens: &[Token]) -> Result<String, GarudaError>;
     fn eos(&self) -> Token;
     fn vocab_size(&self) -> usize;

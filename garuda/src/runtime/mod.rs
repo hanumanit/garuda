@@ -469,6 +469,13 @@ pub struct InferenceRuntime {
     /// at startup, because otherwise identical token ids mean different words and
     /// nothing downstream would notice.
     drafter: Option<(Arc<dyn InferenceBackend>, KvConfig)>,
+    /// A token that ends a turn besides the vocabulary's end-of-sequence.
+    ///
+    /// ChatML ends a turn with `<|im_end|>` and Llama 3 with `<|eot_id|>`, keeping
+    /// `</s>` for the end of the whole document. A decoder watching only `eos()` on
+    /// those checkpoints never stops on its own: it answers and then writes the user's
+    /// next turn, until `max_tokens` cuts it off. See [`crate::chat::ChatFormat`].
+    turn_end: Option<Token>,
     prompt_cache: PromptCache,
     kv_template: KvConfig,
     max_context: usize,
@@ -488,6 +495,7 @@ impl InferenceRuntime {
             tokenizer,
             backend,
             drafter: None,
+            turn_end: None,
             prompt_cache: PromptCache::new(prompt_cache_capacity, prompt_cache_bytes),
             kv_template,
             max_context,
@@ -508,6 +516,21 @@ impl InferenceRuntime {
     /// True when a draft model is available to propose tokens.
     pub fn has_drafter(&self) -> bool {
         self.drafter.is_some()
+    }
+
+    /// Also stop when the chat format's end-of-turn token is generated.
+    pub fn with_turn_end(mut self, turn_end: Option<Token>) -> Self {
+        self.turn_end = turn_end;
+        self
+    }
+
+    /// Whether `token` ends the reply.
+    ///
+    /// One rule in one place, because three decode paths ask — single-token,
+    /// speculative, and batched — and a stop condition that holds in two of them is a
+    /// reply that runs on depending which path served it.
+    fn ends_turn(&self, token: Token) -> bool {
+        token == self.tokenizer.eos() || Some(token) == self.turn_end
     }
 
     pub fn dims(&self) -> ModelDims {
@@ -709,7 +732,7 @@ impl InferenceRuntime {
 
         session.context.push(token);
 
-        if token == self.tokenizer.eos() {
+        if self.ends_turn(token) {
             session.finished = true;
             return Err(StopReason::Eos);
         }
@@ -869,7 +892,7 @@ impl InferenceRuntime {
             };
 
             session.context.push(token);
-            if token == self.tokenizer.eos() {
+            if self.ends_turn(token) {
                 stop = Some(StopReason::Eos);
                 break;
             }
@@ -1013,7 +1036,7 @@ impl InferenceRuntime {
             out[i] = Some(match sample(&logits[k], &params[i], &mut s.rng) {
                 Ok(token) => {
                     s.context.push(token);
-                    if token == self.tokenizer.eos() {
+                    if self.ends_turn(token) {
                         s.finished = true;
                         Err(StopReason::Eos)
                     } else {

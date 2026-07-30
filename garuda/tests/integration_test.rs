@@ -60,6 +60,7 @@ fn harness(tag: &str, tune: impl FnOnce(&mut AppConfig)) -> Harness {
         defaults: config.sampling().unwrap(),
         request_timeout: config.request_timeout(),
         started: std::time::Instant::now(),
+        chat: engine.chat,
     });
 
     // Every protocol front end, not just the OpenAI-shaped one: the scheduler

@@ -30,19 +30,6 @@ pub enum Piece {
     Error(GarudaError),
 }
 
-/// Flatten chat turns into the flat prompt the tokenizer sees.
-pub fn render_chat<'a>(turns: impl IntoIterator<Item = (&'a str, &'a str)>) -> String {
-    let mut p = String::new();
-    for (role, content) in turns {
-        p.push_str(role);
-        p.push_str(": ");
-        p.push_str(content);
-        p.push('\n');
-    }
-    p.push_str("assistant: ");
-    p
-}
-
 /// Queue a prompt on the scheduler; the returned handle streams the result and cancels
 /// the work when dropped.
 pub fn submit(

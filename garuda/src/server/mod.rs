@@ -5,6 +5,7 @@
 //! from GGUF. Both expose the same runtime, so nothing downstream knows which it is.
 
 use crate::cache::KvConfig;
+use crate::chat::ChatFormat;
 use crate::config::AppConfig;
 use crate::core::{ExpertLoader, InferenceBackend, ModelDims, StorageBackend};
 use crate::gguf::Gguf;
@@ -37,6 +38,9 @@ pub struct Engine {
     pub memory: Option<Arc<MemoryManager>>,
     pub runtime: Arc<InferenceRuntime>,
     pub prefetch: Option<Arc<PrefetchEngine>>,
+    /// The turn markup this checkpoint was fine-tuned on, read from its own
+    /// `tokenizer.chat_template`. The API adapters render with it.
+    pub chat: ChatFormat,
 }
 
 impl Engine {
@@ -239,13 +243,35 @@ impl Engine {
         };
         Self::warn_if_kv_spill_thrashes(&kv);
 
+        // A checkpoint states its own prompt format. Ignoring it does not fail
+        // loudly: an instruction-tuned model handed a `user: ...` transcript reverts
+        // to completing the document, answering and then writing the user's next turn.
+        let chat = ChatFormat::detect(
+            gguf.get("tokenizer.chat_template")
+                .and_then(crate::gguf::Value::as_str),
+        );
+        let turn_end = chat.turn_end().and_then(|m| tokenizer.token_id(m));
+        tracing::info!(
+            format = chat.as_str(),
+            turn_end = ?turn_end,
+            "chat template"
+        );
+        if chat == ChatFormat::Plain {
+            tracing::warn!(
+                "this checkpoint names no chat template; falling back to a plain \
+                 role transcript, which an instruction-tuned model may continue \
+                 past its own turn"
+            );
+        }
+
         let mut runtime = InferenceRuntime::new(
             tokenizer,
             Arc::new(backend),
             kv,
             config.memory.prompt_cache_entries,
             config.prompt_cache_bytes()?,
-        );
+        )
+        .with_turn_end(turn_end);
         if let Some(path) = config.draft_path() {
             let (drafter, draft_kv) = Self::load_draft(config, &path, dims.vocab_size)?;
             runtime = runtime.with_drafter(drafter, draft_kv);
@@ -261,6 +287,7 @@ impl Engine {
             memory: None,
             runtime,
             prefetch,
+            chat,
         })
     }
 
@@ -331,6 +358,8 @@ impl Engine {
             memory: Some(memory),
             runtime,
             prefetch,
+            // Synthetic weights are random, so no markup is more correct than another.
+            chat: ChatFormat::Plain,
         })
     }
 }

@@ -160,10 +160,20 @@ impl SpmTokenizer {
         if t == 0 { self.unk } else { t }
     }
 
-    /// SPM encode: prepend a space marker, then merge greedily by score.
-    fn encode_spm(&self, text: &str) -> Vec<Token> {
+    /// SPM encode: mark the spaces, then merge greedily by score.
+    ///
+    /// `lead` says whether `text` begins the prompt or continues one already started.
+    ///
+    /// A continuation gets neither the checkpoint's begin-of-sequence nor
+    /// SentencePiece's dummy space prefix. Both belong once, at the front: a prompt
+    /// assembled from fragments — see [`crate::chat::encode_chat`] — would otherwise
+    /// carry a begin-of-sequence per turn and a stray space token at every seam, at
+    /// positions where the model was trained on neither.
+    fn encode_spm(&self, text: &str, lead: bool) -> Vec<Token> {
         let mut normalized = String::with_capacity(text.len() + 3);
-        normalized.push(SPACE_MARK);
+        if lead {
+            normalized.push(SPACE_MARK);
+        }
         for ch in text.chars() {
             if ch == ' ' {
                 normalized.push(SPACE_MARK);
@@ -215,7 +225,7 @@ impl SpmTokenizer {
         }
 
         let mut out = Vec::new();
-        if self.add_bos {
+        if lead && self.add_bos {
             out.push(self.vocab.bos);
         }
         let mut i = 0i32;
@@ -262,7 +272,15 @@ impl SpmTokenizer {
 
 impl Tokenize for SpmTokenizer {
     fn encode(&self, text: &str) -> Vec<Token> {
-        self.encode_spm(text)
+        self.encode_spm(text, true)
+    }
+
+    fn encode_fragment(&self, text: &str) -> Vec<Token> {
+        self.encode_spm(text, false)
+    }
+
+    fn token_id(&self, piece: &str) -> Option<Token> {
+        self.lookup.get(piece).copied()
     }
 
     fn decode(&self, tokens: &[Token]) -> Result<String, GarudaError> {
@@ -497,6 +515,31 @@ mod tests {
         let ids = tk.encode("ab");
         assert_ne!(ids[0], tk.bos(), "BOS was prepended against the flag");
         assert_eq!(tk.decode(&ids).unwrap(), "ab", "text must be unchanged");
+    }
+
+    /// A prompt built from fragments must tokenize as the one string it represents.
+    ///
+    /// Both extras this guards against are invisible in the decoded text — one is a
+    /// control token, the other a space — but the model sees tokens, and it was trained
+    /// on neither at those positions.
+    #[test]
+    fn a_fragment_carries_neither_begin_of_sequence_nor_a_dummy_space() {
+        let tk = toy();
+        // The seams a chat prompt actually has: a space, and a newline before a marker.
+        for (head, tail) in [("ab", " cd"), ("ab", "\ncd")] {
+            let whole = tk.encode(&format!("{head}{tail}"));
+            let split = [tk.encode(head), tk.encode_fragment(tail)].concat();
+            assert_eq!(
+                split, whole,
+                "encoding {head:?} then {tail:?} must equal encoding them as one string"
+            );
+        }
+
+        assert_ne!(
+            tk.encode_fragment("ab")[0],
+            tk.bos(),
+            "a continuation must not restart the prompt"
+        );
     }
 
     #[test]

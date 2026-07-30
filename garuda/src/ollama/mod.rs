@@ -290,12 +290,13 @@ async fn chat(
         Ok(p) => p,
         Err(e) => return map_error(&e),
     };
-    let prompt = session::render_chat(
+    let tokens = crate::chat::encode_chat(
+        state.chat,
+        &*state.runtime.tokenizer,
         req.messages
             .iter()
             .map(|m| (m.role.as_str(), m.content.as_str())),
     );
-    let tokens = state.runtime.tokenizer.encode(&prompt);
     let model = req.model.unwrap_or_else(|| MODEL_ID.to_owned());
     let user = crate::api::user_id(&headers);
     run(state, Kind::Chat, model, &user, tokens, params, req.stream).await

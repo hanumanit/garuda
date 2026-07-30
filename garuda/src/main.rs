@@ -175,6 +175,7 @@ async fn serve(config: AppConfig) -> anyhow::Result<()> {
         defaults: config.sampling()?,
         request_timeout: config.request_timeout(),
         started: std::time::Instant::now(),
+        chat: engine.chat,
     });
 
     let mut app = create_router(state.clone())

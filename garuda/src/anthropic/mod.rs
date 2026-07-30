@@ -127,24 +127,23 @@ async fn messages(
         return map_error(&e);
     }
 
-    // Render system + turns into a flat prompt.
-    let mut prompt = String::new();
-    if let Some(sys) = &req.system {
-        let s = text_of(sys);
-        if !s.is_empty() {
-            prompt.push_str(&s);
-            prompt.push_str("\n\n");
-        }
-    }
-    for m in &req.messages {
-        prompt.push_str(&m.role);
-        prompt.push_str(": ");
-        prompt.push_str(&text_of(&m.content));
-        prompt.push('\n');
-    }
-    prompt.push_str("assistant: ");
+    // Anthropic carries the system prompt beside the turns rather than as one of
+    // them; the renderer wants a single sequence, so it becomes the leading turn and
+    // each format places it however that format does.
+    let system = req.system.as_ref().map(text_of).unwrap_or_default();
+    let bodies: Vec<(String, String)> = req
+        .messages
+        .iter()
+        .map(|m| (m.role.clone(), text_of(&m.content)))
+        .collect();
+    let turns = system
+        .is_empty()
+        .then(Vec::new)
+        .unwrap_or_else(|| vec![("system", system.as_str())])
+        .into_iter()
+        .chain(bodies.iter().map(|(r, c)| (r.as_str(), c.as_str())));
 
-    let tokens = state.runtime.tokenizer.encode(&prompt);
+    let tokens = crate::chat::encode_chat(state.chat, &*state.runtime.tokenizer, turns);
     let input_tokens = tokens.len();
     let model = req.model.unwrap_or_else(|| MODEL_ID.to_owned());
     let id = format!("msg_{}", Uuid::new_v4().simple());

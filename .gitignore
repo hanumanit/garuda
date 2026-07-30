@@ -8,3 +8,4 @@ target/
 
 # Machine-specific model locations.
 /garuda/mixtral-local.toml
+/garuda/chat.toml

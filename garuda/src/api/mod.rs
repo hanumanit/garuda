@@ -43,6 +43,11 @@ pub struct ApiState {
     pub defaults: SamplingParams,
     pub request_timeout: Duration,
     pub started: std::time::Instant,
+    /// How to mark up chat turns for the loaded checkpoint. Every chat-shaped adapter
+    /// renders through this, so they cannot drift apart — they used to hand-roll the
+    /// same transcript format in three places, and all three were wrong for a model
+    /// that names a template.
+    pub chat: crate::chat::ChatFormat,
 }
 
 pub type SharedState = Arc<ApiState>;
@@ -369,12 +374,13 @@ async fn chat_completions(
         Err(e) => return error_response(&e),
     };
 
-    let rendered = session::render_chat(
+    let prompt = crate::chat::encode_chat(
+        state.chat,
+        &*state.runtime.tokenizer,
         req.messages
             .iter()
             .map(|m| (m.role.as_str(), m.content.as_str())),
     );
-    let prompt = state.runtime.tokenizer.encode(&rendered);
     let prompt_tokens = prompt.len();
     let model = req.model.unwrap_or_else(|| MODEL_ID.to_owned());
 
