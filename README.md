@@ -160,12 +160,69 @@ cargo run --release -- benchmark --iterations 40 --tokens 32
 cargo test
 ```
 
+### A checkpoint larger than RAM — Mixtral-8x7B
+
+[`garuda/mixtral.toml`](garuda/mixtral.toml) is a worked config for Mixtral-8x7B
+Instruct Q4_K_M (~26 GB) on a 16 GB machine — the setup the Mixtral figures above
+were measured on. It sets `mmap = true` so the weights stay packed on disk,
+`prefill_batch = 256`, a 2048-token window, one sequence at a time, and a
+900-second request timeout, because here a token costs seconds rather than
+milliseconds.
+
+```bash
+cd garuda
+
+# ~26 GB
+curl -L https://huggingface.co/TheBloke/Mixtral-8x7B-Instruct-v0.1-GGUF/resolve/main/mixtral-8x7b-instruct-v0.1.Q4_K_M.gguf \
+  -o mixtral-8x7b-instruct-v0.1.Q4_K_M.gguf
+
+# Check what you downloaded — architecture, expert count, and whether it loads
+cargo run --release -- inspect mixtral-8x7b-instruct-v0.1.Q4_K_M.gguf
+
+# Edit mixtral.toml: model.gguf ships as a "/path/to/…" placeholder
+cargo run --release -- --config mixtral.toml serve
+```
+
+`--config` is a top-level flag, so it goes **before** the subcommand —
+`garuda --config mixtral.toml serve`, not `garuda serve --config mixtral.toml`,
+which is a usage error. That config binds port **8090**, not 8080:
+
+```bash
+curl -s localhost:8090/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Name three prime numbers."}],"max_tokens":32}'
+```
+
+The built-in chat page is there too, at `http://localhost:8090/`.
+
+Expect the first token in **33–51 s** and **~5–12 s per token** after it — the
+figures in the table above, on a 16 GB machine. Every generated token is another
+pass over 26 GB of memory-mapped weights, so length is what costs time:
+`sampling.max_tokens` is pinned to 48 in that config, and the benchmark wants a
+handful of iterations rather than the forty a small model tolerates.
+
+```bash
+cargo run --release -- --config mixtral.toml benchmark --iterations 3 --tokens 8
+```
+
+That config speculates by prompt lookup, which pays on grounded prompts at
+`temperature = 0` and not at the `0.7` it samples at. To speculate at that
+temperature, point it at a small draft checkpoint whose vocabulary matches — a
+TinyLlama-1.1B was worth 1.7–2.0× — and the size is checked against the main
+model's at startup rather than assumed:
+
+```toml
+[model]
+draft_gguf = "/path/to/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
+```
+
 For prerequisites, installing onto your PATH, running a real model, and
 troubleshooting, see [INSTALL.md](INSTALL.md).
 
-Configuration lives in [`garuda/config.toml`](garuda/config.toml). Every key
-reaches something; an unknown key is a startup error rather than being silently
-ignored.
+Configuration lives in [`garuda/config.toml`](garuda/config.toml), read from the
+working directory when no `--config` is given; [`garuda/mixtral.toml`](garuda/mixtral.toml)
+is a second, self-contained example of the same keys. Every key reaches something;
+an unknown key is a startup error rather than being silently ignored.
 
 ---
 
