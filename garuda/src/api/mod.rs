@@ -332,6 +332,14 @@ async fn stats(State(state): State<SharedState>) -> impl IntoResponse {
         "model": {
             "kind": state.model_kind,
         },
+        // What a request gets when it asks for nothing. The built-in chat page seeds
+        // its own controls from these, so a slow model's shipped `max_tokens` is what
+        // the page asks for rather than a hardcoded number that cannot finish inside
+        // the server's own request timeout.
+        "sampling": {
+            "temperature": state.defaults.temperature,
+            "max_tokens": state.defaults.max_tokens,
+        },
     }))
 }
 

@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.27.1] - 2026-08-19
+
+The chat page asks for a length the server can actually reach.
+
+### Fixed
+
+- **The built-in chat page opened at 512 tokens whatever was loaded**, which on a
+  model that takes seconds per token is a request that cannot finish inside the
+  server's own request timeout. Serving Qwen3.8-27B, every reply from the page came
+  back as `Error: request timed out` — after the work had been done and thrown away,
+  since the deadline is measured from submission and 512 tokens at ~24 s each is three
+  and a half hours against a 900-second limit.
+
+  `/v1/stats` now reports the sampling defaults this server would apply to a request
+  that asks for nothing, and the page seeds its Max tokens and Temperature controls
+  from them. A slow checkpoint's shipped `max_tokens` is what the page asks for; a
+  fast one is unchanged in practice.
+
+- **`qwen3.8.toml` could not finish its own default reply.** `max_tokens = 48` at
+  ~24 s per token is ~19 minutes against a `request_timeout_secs = 900` limit. Now 32
+  tokens against 1800 seconds, with the arithmetic written next to both keys, because
+  the failure it produces looks like a server fault rather than a configuration that
+  asked for more than it allowed.
+
 ## [0.27.0] - 2026-08-19
 
 Qwen3.8-27B, whose blocks are mostly not attention.

@@ -435,7 +435,20 @@
 
       const stats = await fetch('/v1/stats', { headers: authHeaders() });
       if (!stats.ok) throw new Error(await responseMessage(stats));
-      const kind = (await stats.json()).model?.kind;
+      const info = await stats.json();
+      const kind = info.model?.kind;
+
+      // Start from what this server would use if a request asked for nothing. The
+      // page used to open at 512 tokens whatever was loaded, which on a model that
+      // takes seconds per token is a request that cannot finish before the server's
+      // request timeout — the reply arrived as "request timed out" every time.
+      if (Number.isFinite(info.sampling?.max_tokens)) {
+        maxTokensInput.value = info.sampling.max_tokens;
+      }
+      if (Number.isFinite(info.sampling?.temperature)) {
+        temperatureInput.value = info.sampling.temperature;
+        temperatureVal.textContent = Number(info.sampling.temperature).toFixed(2);
+      }
       if (kind === 'synthetic') {
         modelBadge.textContent = `${model} · synthetic`;
         setNotice('Synthetic weights: responses have no semantic meaning.', true);

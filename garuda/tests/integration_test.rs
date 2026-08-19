@@ -626,4 +626,11 @@ async fn stats_reports_measured_counters() {
     assert_eq!(v["scheduler"]["rejected_rate_limit"], 0);
     assert_eq!(v["context_window"], 512);
     assert_eq!(v["model"]["kind"], "synthetic");
+
+    // The chat page opens its controls at whatever this server would use for a request
+    // that asks for nothing. Before it could read them, the page asked for 512 tokens
+    // whatever was loaded — which a model taking seconds per token cannot finish
+    // inside the request timeout, so every reply came back as "request timed out".
+    assert_eq!(v["sampling"]["max_tokens"], 16, "the harness's own default");
+    assert!(v["sampling"]["temperature"].is_number());
 }
