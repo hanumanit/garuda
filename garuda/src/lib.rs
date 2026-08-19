@@ -50,6 +50,7 @@ pub mod server;
 pub mod session;
 pub mod simd;
 pub mod storage;
+pub mod stream;
 pub mod tgi;
 pub mod tokenizer;
 pub mod ui;

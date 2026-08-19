@@ -2,6 +2,58 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.31.0] - 2026-08-19
+
+Stop using the page cache for the half of the model that streams.
+
+### Added
+
+- **`stream::BlockStreamer`** — the blocks the engine does not hold resident are read
+  explicitly now, with `F_NOCACHE` on the descriptor, into a three-slot ring of buffers
+  this process owns. A pass borrows a slot for exactly as long as it computes that
+  block, which is also the backpressure that stops a reader running ahead of it; asking
+  for a block nobody fetched reads it inline, slower and still correct.
+
+  Warming the page cache (0.28.0, 0.30.0) was still warming *it*: every block read on
+  the way past evicted whatever was being kept resident, and on a model larger than RAM
+  there is no recency to exploit, because every block is read exactly once per token in
+  the same order. Bypassing it leaves the cache to the resident half and the drive to
+  the streamed one.
+
+  | seconds per forward pass | page-cache prefetch | streaming |
+  |---|---|---|
+  | Qwen3.8-27B Q4_K_M (19 GB) | 5.5 / 5.8 | **3.6 / 3.8** |
+  | Qwen3.8-27B Q2_K (11.8 GB) | 4.0 / 4.1 | **2.9 / 3.0** |
+
+  Streamed and mapped weights are the same bytes through the same kernel, so the logits
+  are identical rather than close, which is the test.
+
+  End to end, the 10-token reply that took **327 s** before any of this work:
+
+  | | seconds |
+  |---|---|
+  | demand paging, all cores, no speculation | 327 |
+  | + block prefetch, 2 GB pinned, P-cores only | 152 / 154 |
+  | + prompt lookup | 108 |
+  | + a Qwen3.5-0.8B draft model | 58 |
+  | + warming by reading | 42 |
+  | + streaming around the page cache | **32** |
+
+  **10×**, checkpoint still 19 GB on a 16 GB machine.
+
+### Measured
+
+- **A smaller quantisation stops paying once the streaming path works.** The same reply
+  takes 32 s on Q4_K_M (19 GB) and 34 s on Q2_K (11.8 GB) — within noise, where before
+  streaming the larger file was half again slower. Answer quality is indistinguishable
+  on the coding question both were asked. So the reason to reach for a smaller quant is
+  now disk space, not speed.
+
+- **Pinning still stops paying at about 2 GB**, streaming or not: 3.2 s a pass with
+  nothing pinned, 3.0 at 2 GB, 3.7 at 4 GB, 4.2 at 6 GB. Owned memory competes with
+  everything else on a machine whose page cache had already collapsed to 4 GB of a
+  17 GB total, and the kernel charges more for anonymous pages than for clean file ones.
+
 ## [0.30.0] - 2026-08-19
 
 Ask the drive for megabytes, not kilobytes.

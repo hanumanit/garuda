@@ -426,6 +426,10 @@ pub struct Qwen35Backend {
     pinned_bytes: usize,
     /// Warms the next block while this one computes. Only useful with `mmap`.
     prefetch: Option<Arc<crate::prefetch::LayerPrefetcher>>,
+    /// Reads the streamed blocks itself, around the page cache. When this is set the
+    /// weights of those blocks come from its buffers instead of the map.
+    streamer: Option<Arc<crate::stream::BlockStreamer>>,
+    stream_ahead: Option<crate::stream::StreamPrefetcher>,
 }
 
 impl Qwen35Backend {
@@ -584,6 +588,8 @@ impl Qwen35Backend {
             layer_spans,
             pinned_bytes,
             prefetch: None,
+            streamer: None,
+            stream_ahead: None,
         })
     }
 
@@ -603,6 +609,20 @@ impl Qwen35Backend {
     /// this and a resident one does not.
     pub fn with_prefetch(mut self, prefetch: Arc<crate::prefetch::LayerPrefetcher>) -> Self {
         self.prefetch = Some(prefetch);
+        self
+    }
+
+    /// Read the streamed blocks explicitly, around the page cache, instead of faulting
+    /// them in through the map. See [`crate::stream`] for why that is worth doing on a
+    /// checkpoint larger than RAM.
+    pub fn with_streamer(mut self, streamer: Arc<crate::stream::BlockStreamer>) -> Self {
+        self.stream_ahead = Some(crate::stream::StreamPrefetcher::new(
+            streamer.clone(),
+            crate::stream::BlockStreamer::SLOTS,
+        ));
+        self.streamer = Some(streamer);
+        // The page-cache prefetcher would only fight it for the same bytes.
+        self.prefetch = None;
         self
     }
 
@@ -645,6 +665,7 @@ impl Qwen35Backend {
         l: usize,
         xs: &mut [Vec<f32>],
         mut targets: Targets<'_, '_>,
+        block: Option<(&[u8], usize)>,
     ) -> Result<(), GarudaError> {
         let layer = &self.layers[l];
         let (d, n) = (self.cfg.d_model, xs.len());
@@ -655,8 +676,8 @@ impl Qwen35Backend {
         }
 
         let mixed = match &layer.mixer {
-            Mixer::Attn { .. } => self.attn_batch(l, layer, &hs, n, &mut targets)?,
-            Mixer::Linear { .. } => self.delta_net_batch(l, layer, &hs, n, &mut targets)?,
+            Mixer::Attn { .. } => self.attn_batch(l, layer, &hs, n, &mut targets, block)?,
+            Mixer::Linear { .. } => self.delta_net_batch(l, layer, &hs, n, &mut targets, block)?,
         };
 
         let mut hs_ffn = Vec::with_capacity(n * d);
@@ -665,11 +686,40 @@ impl Qwen35Backend {
             hs_ffn.extend_from_slice(&self.norm(x, &layer.post_attn_norm));
         }
 
-        let ffn = self.feed_forward_batch(layer, &hs_ffn, n)?;
+        let ffn = self.feed_forward_batch(layer, &hs_ffn, n, block)?;
         for (i, x) in xs.iter_mut().enumerate() {
             simd::add_assign(x, &ffn[i * d..(i + 1) * d]);
         }
         Ok(())
+    }
+
+    /// One block, with its weights wherever they are: in the map, in a buffer this
+    /// process pinned, or in one it streamed a moment ago.
+    ///
+    /// Asking for the blocks ahead comes first, so the reads overlap the arithmetic
+    /// instead of taking turns with it. The borrow is held for exactly as long as this
+    /// block computes, which is what stops a reader running ahead from overwriting
+    /// bytes still in use.
+    fn run_layer(
+        &self,
+        l: usize,
+        xs: &mut [Vec<f32>],
+        targets: Targets<'_, '_>,
+    ) -> Result<(), GarudaError> {
+        if let Some(pf) = &self.prefetch {
+            pf.hint_ahead(l);
+        }
+        if let Some(ahead) = &self.stream_ahead {
+            ahead.hint_ahead(l);
+        }
+        match &self.streamer {
+            Some(s) if s.streams(l) => {
+                let guard = s.borrow(l);
+                let block = Some((guard.bytes(), s.base(l)));
+                self.layer_batch(l, xs, targets, block)
+            }
+            _ => self.layer_batch(l, xs, targets, None),
+        }
     }
 
     /// Dense SwiGLU: `down(silu(gate(x)) * up(x))`, batched.
@@ -678,16 +728,19 @@ impl Qwen35Backend {
         layer: &Layer,
         hs: &[f32],
         n: usize,
+        block: Option<(&[u8], usize)>,
     ) -> Result<Vec<f32>, GarudaError> {
         let (d, f) = (self.cfg.d_model, self.cfg.d_ff);
         let mut gate = vec![0.0; n * f];
         let mut up = vec![0.0; n * f];
-        layer.ffn_gate.matmul_rows(0, hs, n, &mut gate)?;
-        layer.ffn_up.matmul_rows(0, hs, n, &mut up)?;
+        layer.ffn_gate.matmul_rows_in(block, 0, hs, n, &mut gate)?;
+        layer.ffn_up.matmul_rows_in(block, 0, hs, n, &mut up)?;
         simd::silu(&mut gate);
         simd::mul_assign(&mut gate, &up);
         let mut out = vec![0.0; n * d];
-        layer.ffn_down.matmul_rows(0, &gate, n, &mut out)?;
+        layer
+            .ffn_down
+            .matmul_rows_in(block, 0, &gate, n, &mut out)?;
         Ok(out)
     }
 
@@ -700,6 +753,7 @@ impl Qwen35Backend {
         hs: &[f32],
         n: usize,
         targets: &mut Targets<'_, '_>,
+        block: Option<(&[u8], usize)>,
     ) -> Result<Vec<f32>, GarudaError> {
         let Mixer::Attn {
             wqg,
@@ -718,9 +772,9 @@ impl Qwen35Backend {
         let mut qg = vec![0.0; n * 2 * a_dim];
         let mut k = vec![0.0; n * kv_dim];
         let mut v = vec![0.0; n * kv_dim];
-        wqg.matmul_rows(0, hs, n, &mut qg)?;
-        wk.matmul_rows(0, hs, n, &mut k)?;
-        wv.matmul_rows(0, hs, n, &mut v)?;
+        wqg.matmul_rows_in(block, 0, hs, n, &mut qg)?;
+        wk.matmul_rows_in(block, 0, hs, n, &mut k)?;
+        wv.matmul_rows_in(block, 0, hs, n, &mut v)?;
 
         let group = cfg.n_heads / cfg.n_kv_heads;
         let scale = 1.0 / (hd as f32).sqrt();
@@ -796,7 +850,7 @@ impl Qwen35Backend {
         }
 
         let mut out = vec![0.0; n * d];
-        wo.matmul_rows(0, &contexts, n, &mut out)?;
+        wo.matmul_rows_in(block, 0, &contexts, n, &mut out)?;
         Ok(out)
     }
 
@@ -811,6 +865,7 @@ impl Qwen35Backend {
         hs: &[f32],
         n: usize,
         targets: &mut Targets<'_, '_>,
+        block: Option<(&[u8], usize)>,
     ) -> Result<Vec<f32>, GarudaError> {
         let Mixer::Linear {
             wqkv,
@@ -836,10 +891,10 @@ impl Qwen35Backend {
         let mut z = vec![0.0; n * v_dim];
         let mut beta = vec![0.0; n * cfg.n_v_heads];
         let mut alpha = vec![0.0; n * cfg.n_v_heads];
-        wqkv.matmul_rows(0, hs, n, &mut qkv)?;
-        wz.matmul_rows(0, hs, n, &mut z)?;
-        wbeta.matmul_rows(0, hs, n, &mut beta)?;
-        walpha.matmul_rows(0, hs, n, &mut alpha)?;
+        wqkv.matmul_rows_in(block, 0, hs, n, &mut qkv)?;
+        wz.matmul_rows_in(block, 0, hs, n, &mut z)?;
+        wbeta.matmul_rows_in(block, 0, hs, n, &mut beta)?;
+        walpha.matmul_rows_in(block, 0, hs, n, &mut alpha)?;
 
         let (conv_len, state_len) = cfg.linear_state_shape();
         let mut mixed = vec![0.0; n * v_dim];
@@ -930,7 +985,7 @@ impl Qwen35Backend {
         }
 
         let mut out = vec![0.0; n * d];
-        wout.matmul_rows(0, &mixed, n, &mut out)?;
+        wout.matmul_rows_in(block, 0, &mixed, n, &mut out)?;
         Ok(out)
     }
 
@@ -983,13 +1038,7 @@ impl Qwen35Backend {
                 xs.push(self.token_embd.row(idx)?);
             }
             for l in 0..self.cfg.n_layers {
-                // Ask for the blocks ahead before running this one, so the reads and
-                // the arithmetic overlap instead of taking turns. More than one, so
-                // the drive has more than one request to work on.
-                if let Some(pf) = &self.prefetch {
-                    pf.hint_ahead(l);
-                }
-                self.layer_batch(l, &mut xs, Targets::Shared(seq))?;
+                self.run_layer(l, &mut xs, Targets::Shared(seq))?;
             }
             tail.append(&mut xs);
             if tail.len() > n_last {
@@ -1092,10 +1141,7 @@ impl InferenceBackend for Qwen35Backend {
         }
 
         for l in 0..self.cfg.n_layers {
-            if let Some(pf) = &self.prefetch {
-                pf.hint_ahead(l);
-            }
-            self.layer_batch(l, &mut xs, Targets::PerToken(seqs))?;
+            self.run_layer(l, &mut xs, Targets::PerToken(seqs))?;
         }
 
         let mut hidden = Vec::with_capacity(n * d);
@@ -1999,6 +2045,58 @@ mod tests {
         // Without a map there is nothing to pin: the weights are already f32 in RAM.
         let expanded = Qwen35Backend::from_gguf_pinned(&g, &map, None, usize::MAX).unwrap();
         assert_eq!(expanded.pinned_bytes(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Streaming changes where a block's bytes come from on the way into the matmul,
+    /// and nothing else. The logits have to be identical — not close — because the
+    /// same quantised bytes go through the same kernel either way.
+    #[test]
+    fn streamed_blocks_answer_exactly_as_mapped_ones_do() {
+        let bytes = build_qwen35_gguf(Head::Separate, "qwen35");
+        let dir = std::env::temp_dir().join("garuda_qwen35_stream_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.gguf");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+        let map = Arc::new(unsafe { Mmap::map(&std::fs::File::open(&path).unwrap()).unwrap() });
+        let g = Gguf::parse(&map).unwrap();
+
+        let mapped = Qwen35Backend::from_gguf(&g, &map, Some(map.clone())).unwrap();
+        let streamed = Qwen35Backend::from_gguf(&g, &map, Some(map.clone()))
+            .unwrap()
+            .with_streamer(Arc::new(
+                crate::stream::BlockStreamer::open(&path, mapped.layer_spans().to_vec()).unwrap(),
+            ));
+
+        let ctx: Vec<Token> = vec![3, 1, 4, 1, 5, 9, 2, 6];
+        let a = mapped.logits(&ctx, &mut seq_for(&mapped)).unwrap();
+        let b = streamed.logits(&ctx, &mut seq_for(&streamed)).unwrap();
+        assert_eq!(
+            a.data(),
+            b.data(),
+            "streaming is a memory decision, not a maths one"
+        );
+
+        // And again over several passes, which is where the ring wraps.
+        let mut seq = seq_for(&streamed);
+        for n in 1..=6 {
+            let c: Vec<Token> = (0..n as Token).collect();
+            streamed.logits(&c, &mut seq).unwrap();
+        }
+        assert_eq!(seq.len(), 6);
+
+        // A checkpoint whose blocks are all pinned streams nothing at all.
+        let pinned = Qwen35Backend::from_gguf_pinned(&g, &map, Some(map.clone()), usize::MAX)
+            .unwrap()
+            .with_streamer(Arc::new(
+                crate::stream::BlockStreamer::open(&path, vec![(0, 0); N_LAYERS]).unwrap(),
+            ));
+        let c = pinned.logits(&ctx, &mut seq_for(&pinned)).unwrap();
+        assert_eq!(a.data(), c.data());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

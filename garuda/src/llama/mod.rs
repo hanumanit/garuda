@@ -90,10 +90,38 @@ impl Weight {
         self.matvec_rows(0, x, out)
     }
 
+    /// Where this weight's packed bytes are, given a block buffer the caller may have
+    /// streamed them into.
+    ///
+    /// `block` is `(bytes, base)`: the buffer, and the file offset it starts at. A
+    /// weight inside it sits at `self.start - base`. `None` reads from wherever the
+    /// weight was loaded — the map, or a buffer it was pinned into.
+    fn located<'a>(
+        src: &'a Bytes,
+        start: usize,
+        block: Option<(&'a [u8], usize)>,
+    ) -> (&'a [u8], usize) {
+        match block {
+            Some((bytes, base)) if start >= base => (bytes, start - base),
+            _ => (src.as_slice(), start),
+        }
+    }
+
     /// `out[i] = dot(row (row_start + i), x)`, i.e. a matvec over the `out.len()` rows
     /// starting at `row_start`. Used to view one expert's slice of a stacked 3D expert
     /// tensor without copying it out.
     fn matvec_rows(&self, row_start: usize, x: &[f32], out: &mut [f32]) -> Result<(), GarudaError> {
+        self.matvec_rows_in(None, row_start, x, out)
+    }
+
+    /// [`Self::matvec_rows`], reading from a streamed block. See [`Self::located`].
+    pub(crate) fn matvec_rows_in(
+        &self,
+        block: Option<(&[u8], usize)>,
+        row_start: usize,
+        x: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), GarudaError> {
         let n = out.len();
         match self {
             Weight::Full { data, cols } => {
@@ -107,16 +135,10 @@ impl Weight {
                 src,
                 start,
             } => {
+                let (bytes, at) = Self::located(src, *start, block);
                 let row_bytes = quant::byte_size(*qtype, *cols)?;
-                let off = start + row_start * row_bytes;
-                quant::matvec(
-                    *qtype,
-                    &src.as_slice()[off..off + n * row_bytes],
-                    n,
-                    *cols,
-                    x,
-                    out,
-                )
+                let off = at + row_start * row_bytes;
+                quant::matvec(*qtype, &bytes[off..off + n * row_bytes], n, *cols, x, out)
             }
         }
     }
@@ -125,6 +147,19 @@ impl Weight {
     /// where `n = xs.len() / cols`. The batched twin of [`Self::matvec_rows`].
     pub(crate) fn matmul_rows(
         &self,
+        row_start: usize,
+        xs: &[f32],
+        n: usize,
+        out: &mut [f32],
+    ) -> Result<(), GarudaError> {
+        self.matmul_rows_in(None, row_start, xs, n, out)
+    }
+
+    /// [`Self::matmul_rows`], reading from a block the caller streamed into memory of
+    /// its own rather than from wherever this weight was loaded. See [`Self::located`].
+    pub(crate) fn matmul_rows_in(
+        &self,
+        block: Option<(&[u8], usize)>,
         row_start: usize,
         xs: &[f32],
         n: usize,
@@ -143,11 +178,12 @@ impl Weight {
                 src,
                 start,
             } => {
+                let (bytes, at) = Self::located(src, *start, block);
                 let row_bytes = quant::byte_size(*qtype, *cols)?;
-                let off = start + row_start * row_bytes;
+                let off = at + row_start * row_bytes;
                 quant::matmul(
                     *qtype,
-                    &src.as_slice()[off..off + rows * row_bytes],
+                    &bytes[off..off + rows * row_bytes],
                     rows,
                     *cols,
                     xs,

@@ -60,7 +60,8 @@ the streaming, the cancellation, the load shedding.
 | OpenAI + Ollama + Anthropic + llama.cpp + TGI APIs, SSE / NDJSON / WebSocket | Real, tested |
 | Dequantisation: F32 / F16 / Q4_0 / Q8_0 / Q2_K–Q6_K | Real, tested (runs Q2_K…Q5_K_M models) |
 | Memory-mapped packed weights (`mmap = true`), incl. per-expert streaming | Real, tested (~6× less RAM, same output) |
-| **Block prefetching for a dense checkpoint larger than RAM** | Real, measured — **4× on Qwen3.8-27B** (19 GB on a 16 GB machine): 27–31 s per forward pass down to ~7 s. Three background threads read the blocks ahead of the pass in 32 MB pieces, which is what takes the drive from 1.2–1.8 GB/s to 2.2–2.6 GB/s; warming is advisory, so the answer is unchanged token for token |
+| **Streaming a dense checkpoint larger than RAM** | Real, measured — **7× on Qwen3.8-27B** (19 GB on a 16 GB machine): 27–31 s per forward pass down to 3.6–3.8 s. Blocks the engine does not hold resident are read with `F_NOCACHE` into a ring of buffers it owns, so the bytes moving past stop evicting the ones it keeps; a pass borrows a slot for as long as it computes that block |
+| Block prefetching into the page cache (the fallback) | Real, measured — **4× on Qwen3.8-27B** (19 GB on a 16 GB machine): 27–31 s per forward pass down to ~7 s. Three background threads read the blocks ahead of the pass in 32 MB pieces, which is what takes the drive from 1.2–1.8 GB/s to 2.2–2.6 GB/s; warming is advisory, so the answer is unchanged token for token |
 | **Speculative decoding on a recurrent architecture** | Real, measured — **2.6×** on Qwen3.8-27B with a Qwen3.5-0.8B draft (152 s → 58 s for the same 10-token reply), 1.4× with prompt lookup and no second model. A recurrent state cannot be rewound by arithmetic, so it is copied per position while a round is in flight and dropped when the round settles; a rejected guess leaves the sequence byte-identical to never having speculated, which is a test |
 | Batched, expert-grouped prefill | Real, tested — **8× faster prefill on Mixtral-8x7B Q4_K_M (25 GB) on a 16 GB machine**: 386 s → 48 s to first token for a 38-token prompt, because the working set drops from the whole model per token to one layer (7.1 GB → 816 MB). ~2× even on a model that fits in RAM, where the win is decoding each expert's rows once per batch instead of once per token. `model.prefill_batch` tunes or disables it |
 | Integer (NEON `i8`) matmul kernel for **every** quantised type | Real, tested — `Q8_0` and all five k-quants dot straight against an int8-quantised activation. Roughly 4–15× faster than dequantise-then-dot depending on type (see below), within quantisation tolerance of it |
@@ -299,9 +300,10 @@ every time:
 | + block prefetch, 2 GB pinned, performance cores only | 152 / 154 |
 | + prompt lookup (no second model) | 108 |
 | + a Qwen3.5-0.8B draft model | 58 |
-| + warming by reading the file instead of advising the map | **42** |
+| + warming by reading the file instead of advising the map | 42 |
+| + streaming the blocks around the page cache entirely | **32** |
 
-**7.8× end to end**, with the checkpoint still 19 GB on a 16 GB machine.
+**10× end to end**, with the checkpoint still 19 GB on a 16 GB machine.
 
 That last row is worth its own line, because it was not obvious. `madvise(WILLNEED)`
 over a whole block leaves the request size to the kernel's readahead, and during a pass
@@ -312,10 +314,30 @@ forward pass from 13–15 s to ~7 s. Chunk sizes from 4 MB to 64 MB all land wit
 second of each other, so the win is in asking for megabytes at all rather than in the
 exact number.
 
-The floor is 19 GB ÷ 3.9 GB/s ≈ 5 s per pass and a pass is now ~7 s, so the transport
-is close to done. What is left is reading fewer bytes: the IQ quants pack better at this
-size than anything this runtime decodes, which is a decoder to write rather than a
-policy to tune.
+**The last of it was to stop using the page cache at all for the streamed half.**
+Warming it is still warming *it*, and every block read on the way past evicts whatever
+the engine was deliberately keeping resident — on a model larger than RAM there is no
+recency to exploit, since every block is read exactly once per token. So the blocks that
+are not held resident are now read explicitly, with `F_NOCACHE` on the descriptor, into
+a three-slot ring of buffers this process owns ([`stream::BlockStreamer`](garuda/src/stream/mod.rs)).
+A pass borrows a slot for exactly as long as it computes that block, which is also the
+backpressure that stops a reader running ahead of it.
+
+| seconds per forward pass | page-cache prefetch | streaming |
+|---|---|---|
+| Qwen3.8-27B Q4_K_M (19 GB) | 5.5 / 5.8 | **3.6 / 3.8** |
+| Qwen3.8-27B Q2_K (11.8 GB) | 4.0 / 4.1 | **2.9 / 3.0** |
+
+One consequence worth knowing: **once the streaming path is doing the work, the smaller
+quantisation stops being worth much.** The same 10-token reply takes 32 s on Q4_K_M and
+34 s on Q2_K — within noise of each other, where before streaming the 19 GB file was
+half again slower than the 11.8 GB one. If bytes are moved at the drive's pace and
+overlapped with the arithmetic, the extra bytes cost less than the quality they buy.
+
+What is left is reading fewer bytes per token rather than moving them faster — which
+means predicting which weights a token actually needs (activation sparsity), not another
+quantisation. That changes the answer rather than the schedule, so it is a different kind
+of project.
 
 ### A hybrid checkpoint — Qwen3.8-27B
 
@@ -581,11 +603,11 @@ registered in `Engine::build` — see **[PLUGIN.md](PLUGIN.md)** and
   mixture-of-experts sibling `qwen35moe` (Qwen3.5/3.6-35B-A3B) is refused by name
   rather than half-run, and every other architecture needs its own
   `InferenceBackend`.
-- **The last 2.4× of the streaming path.** A pass over Qwen3.8-27B moves 19 GB in 12 s
-  (1.6 GB/s) against a disk that reads 3.9 GB/s sequentially. Getting the rest means
-  reading into owned buffers rather than faulting through the page cache, and choosing
-  what stays resident rather than leaving it to the kernel's LRU — the tiering this
-  runtime already does for MoE experts, applied to dense weights.
+- **Reading fewer bytes per token.** A pass over Qwen3.8-27B moves 19 GB in 3.7 s, which
+  is the drive working at its own pace with the arithmetic overlapped on top. Going
+  faster from here means not reading weights the token does not use — activation
+  sparsity and the prediction it needs — which approximates the model rather than
+  rescheduling the work, and is a research project rather than an engineering one.
 - **A scheduler that fills a batch.** `logits_batch` shares one pass over the weights
   across several sequences and is unit-tested, but three concurrent requests measured
   *slower* than three sequential ones (244 s against 204 s), so they are not reaching it

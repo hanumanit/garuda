@@ -215,35 +215,40 @@ impl Engine {
         // and on one larger than RAM that block has to come off disk while the current
         // one computes or the CPU spends the wait idle. Only worth anything when the
         // weights are mapped: an in-RAM checkpoint has nothing to warm.
-        let prefetch = if config.runtime.prefetch && backend.is_mmapped() {
-            let spans = backend.layer_spans().to_vec();
-            let workers = crate::prefetch::LayerPrefetcher::WORKERS;
-            // Reading the file in large pieces beats advising the map, because it gets
-            // to choose the request size and the kernel's readahead does not — see
-            // `LayerPrefetcher::CHUNK`. Advising is the fallback for when the file
-            // cannot be opened a second time.
-            match std::fs::File::open(path) {
-                Ok(file) => Some(Arc::new(crate::prefetch::LayerPrefetcher::reading(
-                    Arc::new(file),
-                    spans,
-                    workers,
-                    crate::prefetch::LayerPrefetcher::CHUNK,
-                ))),
-                Err(e) => {
-                    tracing::debug!(error = %e, "reopening the checkpoint for prefetch");
-                    mmap_for_prefetch.map(|m| {
-                        Arc::new(crate::prefetch::LayerPrefetcher::with_workers(
-                            m, spans, workers,
-                        ))
-                    })
-                }
-            }
-        } else {
-            None
+        // Three ways to get a block's weights in front of the arithmetic, in order of
+        // what they were measured to be worth on a checkpoint larger than RAM:
+        //
+        //   stream   read it into our own buffers with the page cache bypassed
+        //   prefetch read it *into* the page cache ahead of the pass
+        //   neither  fault it in a page at a time, with the CPU idle in between
+        //
+        // Streaming wins because the bytes it moves no longer evict the ones the engine
+        // is deliberately keeping resident: 5.6 s a pass down to 3.7 on Qwen3.8-27B
+        // Q4_K_M, and 4.0 to 2.9 on Q2_K. It needs the file open a second time; the
+        // prefetcher is what happens when that fails.
+        let streaming = config.runtime.prefetch && backend.is_mmapped();
+        let streamer = streaming
+            .then(|| crate::stream::BlockStreamer::open(path, backend.layer_spans().to_vec()))
+            .transpose()
+            .unwrap_or_else(|e| {
+                tracing::debug!(error = %e, "reopening the checkpoint for streaming");
+                None
+            })
+            .map(Arc::new);
+        let prefetch = match (&streamer, streaming) {
+            (Some(_), _) | (None, false) => None,
+            (None, true) => mmap_for_prefetch.map(|m| {
+                Arc::new(crate::prefetch::LayerPrefetcher::with_workers(
+                    m,
+                    backend.layer_spans().to_vec(),
+                    crate::prefetch::LayerPrefetcher::WORKERS,
+                ))
+            }),
         };
-        let backend = match &prefetch {
-            Some(pf) => backend.with_prefetch(pf.clone()),
-            None => backend,
+        let backend = match (&streamer, &prefetch) {
+            (Some(s), _) => backend.with_streamer(s.clone()),
+            (None, Some(pf)) => backend.with_prefetch(pf.clone()),
+            (None, None) => backend,
         };
         let recurrent = qc.recurrent.iter().filter(|&&r| r).count();
         tracing::info!(
@@ -255,6 +260,7 @@ impl Engine {
             heads = format!("{}x{}", qc.n_heads, qc.head_dim),
             kv_heads = qc.n_kv_heads,
             recurrent_state_mb = qc.linear_state_bytes() / 1_048_576,
+            streaming = streamer.is_some(),
             prefetch = prefetch.is_some(),
             pinned_mb = backend.pinned_bytes() / 1_048_576,
             "qwen3.5: hybrid attention, {} of {} blocks recurrent",

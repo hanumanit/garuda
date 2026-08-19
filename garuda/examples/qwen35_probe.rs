@@ -59,6 +59,19 @@ fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    // GARUDA_STREAM=1 reads the streamed blocks itself, around the page cache.
+    if std::env::var("GARUDA_STREAM").is_ok() {
+        let spans = backend.layer_spans().to_vec();
+        let streamed: usize = spans.iter().filter(|&&(_, len)| len > 0).count();
+        println!("streaming {streamed} blocks around the page cache");
+        let s = Arc::new(garuda::stream::BlockStreamer::open(
+            std::path::Path::new(&path),
+            spans,
+        )?);
+        let backend = backend.with_streamer(s.clone());
+        return run(backend, tk, prompt, steps, Some(s));
+    }
+
     let backend = if workers > 0 {
         let spans = backend.layer_spans().to_vec();
         let pf = Arc::new(if read_mb > 0 {
@@ -77,6 +90,16 @@ fn main() -> anyhow::Result<()> {
     } else {
         backend
     };
+    run(backend, tk, prompt, steps, None)
+}
+
+fn run(
+    backend: Qwen35Backend,
+    tk: BpeTokenizer,
+    prompt: String,
+    steps: usize,
+    streamer: Option<Arc<garuda::stream::BlockStreamer>>,
+) -> anyhow::Result<()> {
     let cfg = backend.config();
 
     let mut ctx = tk.encode(&prompt);
@@ -112,5 +135,9 @@ fn main() -> anyhow::Result<()> {
         "continuation: {:?}",
         tk.decode(&ctx[ctx.len() - steps..]).unwrap_or_default()
     );
+    if let Some(s) = streamer {
+        let (hits, inline) = s.stats();
+        println!("streamed blocks: {hits} prefetched, {inline} read inline");
+    }
     Ok(())
 }

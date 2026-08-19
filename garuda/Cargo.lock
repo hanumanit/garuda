@@ -457,7 +457,7 @@ dependencies = [
 
 [[package]]
 name = "garuda"
-version = "0.30.0"
+version = "0.31.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -467,6 +467,7 @@ dependencies = [
  "constant_time_eq",
  "futures-util",
  "http-body-util",
+ "libc",
  "memmap2",
  "parking_lot",
  "rayon",
