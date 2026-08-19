@@ -60,6 +60,7 @@ the streaming, the cancellation, the load shedding.
 | OpenAI + Ollama + Anthropic + llama.cpp + TGI APIs, SSE / NDJSON / WebSocket | Real, tested |
 | Dequantisation: F32 / F16 / Q4_0 / Q8_0 / Q2_K–Q6_K | Real, tested (runs Q2_K…Q5_K_M models) |
 | Memory-mapped packed weights (`mmap = true`), incl. per-expert streaming | Real, tested (~6× less RAM, same output) |
+| **Block prefetching for a dense checkpoint larger than RAM** | Real, measured — **2.3× on Qwen3.8-27B** (19 GB on a 16 GB machine): 27–31 s per forward pass down to 11.9–12.4 s, alternating runs. Three background threads hand the kernel whole blocks to read while the current one computes; the hint is advisory, so the answer is unchanged token for token |
 | Batched, expert-grouped prefill | Real, tested — **8× faster prefill on Mixtral-8x7B Q4_K_M (25 GB) on a 16 GB machine**: 386 s → 48 s to first token for a 38-token prompt, because the working set drops from the whole model per token to one layer (7.1 GB → 816 MB). ~2× even on a model that fits in RAM, where the win is decoding each expert's rows once per batch instead of once per token. `model.prefill_batch` tunes or disables it |
 | Integer (NEON `i8`) matmul kernel for **every** quantised type | Real, tested — `Q8_0` and all five k-quants dot straight against an int8-quantised activation. Roughly 4–15× faster than dequantise-then-dot depending on type (see below), within quantisation tolerance of it |
 | A real MoE checkpoint at scale (Mixtral-8x7B, Q4_K_M, 26 GB) | Real, tested — loads and generates on a 16 GB machine via `mmap`; both GGUF expert-tensor layouts (merged `..._exps` and the older per-expert tensors some conversions use) load correctly |
@@ -225,6 +226,58 @@ model's at startup rather than assumed:
 draft_gguf = "/path/to/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
 ```
 
+### Streaming a model larger than RAM
+
+The point of running a 19 GB checkpoint on a 16 GB machine is that it works at all.
+Making it *fast* is a separate problem, and on this hardware it is not an arithmetic
+problem — it is a transport one. Three measurements say so:
+
+| | |
+|---|---|
+| What the disk gives, read sequentially | **3.9 GB/s** |
+| What the forward pass was actually pulling | **0.7 GB/s** (19 GB in 27 s) |
+| CPU busy during that pass | **~140%**, out of 800% available |
+
+The same binary on a checkpoint that fits in RAM runs at **780%** CPU. The cores were
+never idle for lack of parallelism — the matmuls are already parallel across rows —
+they were idle because they were blocked on page faults, 16 KB at a time, with nothing
+fetching the next block while the current one computed.
+
+So `runtime.prefetch` now means something for a dense model too: three background
+threads that hand the kernel whole blocks to read ahead of the pass. A block's tensors
+are written together by the converter, so warming one is a single large sequential
+read — the access pattern the drive is fast at.
+
+| Prefetch | Seconds per forward pass, Qwen3.8-27B Q4_K_M |
+|---|---|
+| off | 27.1 / 30.7 / 27.6 |
+| 1 thread, 1 block ahead | 15.8 / 15.2 / 16.1 |
+| **3 threads, 3 blocks ahead** | **12.4 / 11.9 / 11.9** |
+| 6 threads | 12.3 |
+| 10 threads | 11.9 |
+
+Runs alternate between conditions so that a warming page cache cannot explain the
+difference. Three is where it stops paying: one thread cannot keep a request queued at
+the drive, and past three the drive is already busy. End to end through the API, the
+same short request went from 59–85 s to 26–38 s.
+
+Two smaller findings from the same measurements:
+
+- **Pinning to the performance cores helps.** On an 8+4 CPU, `threads = 0` (all twelve)
+  ran a pass in ~37 s against ~31 s on the eight performance cores. A slow core holding
+  up a batch costs more than it adds.
+- **Concurrency did not pay here, and the config says so.** Three simultaneous requests
+  took 244 s against 204 s for the same three run one after another, with CPU at ~100%
+  throughout — the passes were not being shared the way `logits_batch` allows. That is
+  measured, not theoretical, and it is why `max_concurrent = 1` in the shipped config.
+  Batched decode is implemented and unit-tested; what is missing is a scheduler that
+  actually presents several sequences to it in lockstep.
+
+What is left on the table: the floor is 19 GB ÷ 3.9 GB/s ≈ **5 s per pass**, and we are
+at 12. Closing that gap means not going through the page cache at all — explicit reads
+into owned buffers, and a resident tier chosen by the engine rather than by the
+kernel's LRU.
+
 ### A hybrid checkpoint — Qwen3.8-27B
 
 [`garuda/qwen3.8.toml`](garuda/qwen3.8.toml) runs `Qwen3.8-27B` in Q4_K_M (~19 GB)
@@ -265,9 +318,13 @@ What that buys, and what it costs:
   tower ships as a separate `mmproj-*.gguf` and there is no image input path here.
   The text half is complete.
 
-On a 16 GB machine a forward pass over this checkpoint takes **~24 s** — every token
+On a 16 GB machine a forward pass over this checkpoint takes **~12 s** — every token
 is another pass over 19 GB of memory-mapped weights, and unlike Mixtral there are no
-experts to skip: a dense 27B touches all of it. Budget accordingly, and use
+experts to skip: a dense 27B touches all of it. That figure is with block prefetching
+on (`runtime.prefetch = true`, the default in that config); without it the same pass
+takes 27–31 s, because demand paging fetches the weights a page at a time with the CPU
+idle in between. See [Streaming a model larger than RAM](#streaming-a-model-larger-than-ram).
+Budget accordingly, and use
 
 ```bash
 cargo run --release --example qwen35_probe -- Qwen3.8-27B-Q4_K_M.gguf "The capital of France is"
@@ -480,6 +537,16 @@ registered in `Engine::build` — see **[PLUGIN.md](PLUGIN.md)** and
   mixture-of-experts sibling `qwen35moe` (Qwen3.5/3.6-35B-A3B) is refused by name
   rather than half-run, and every other architecture needs its own
   `InferenceBackend`.
+- **The last 2.4× of the streaming path.** A pass over Qwen3.8-27B moves 19 GB in 12 s
+  (1.6 GB/s) against a disk that reads 3.9 GB/s sequentially. Getting the rest means
+  reading into owned buffers rather than faulting through the page cache, and choosing
+  what stays resident rather than leaving it to the kernel's LRU — the tiering this
+  runtime already does for MoE experts, applied to dense weights.
+- **A scheduler that fills a batch.** `logits_batch` shares one pass over the weights
+  across several sequences and is unit-tested, but three concurrent requests measured
+  *slower* than three sequential ones (244 s against 204 s), so they are not reaching it
+  in lockstep. Until that is fixed, `max_concurrent = 1` is the honest setting for a
+  checkpoint larger than RAM.
 - **Anything but text on a Qwen3.5 checkpoint.** These are vision-language models, and
   the image tower ships as a separate `mmproj` file this runtime has no input path
   for; their multi-token-prediction block ships separately too (or bundled and unused).

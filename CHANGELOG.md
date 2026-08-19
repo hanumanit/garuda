@@ -2,6 +2,63 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.28.0] - 2026-08-19
+
+Bytes, not arithmetic: 2.3x on a checkpoint larger than RAM.
+
+### Added
+
+- **Block prefetching for dense checkpoints** (`prefetch::LayerPrefetcher`). Three
+  background threads hand the kernel whole blocks to read while the current one
+  computes. Advisory in both directions — a late hint or a kernel that declines it
+  costs nothing, and the forward pass still faults whatever it needs — so the answer is
+  unchanged token for token.
+
+  The measurements that led here, on Qwen3.8-27B Q4_K_M (19 GB, 16 GB machine):
+
+  | | |
+  |---|---|
+  | Disk, read sequentially | 3.9 GB/s |
+  | What the forward pass was pulling | 0.7 GB/s (19 GB in 27 s) |
+  | CPU during that pass | ~140% of 800% available |
+  | CPU on a checkpoint that fits in RAM | 780% |
+
+  The cores were never short of parallelism — the matmuls are already parallel across
+  rows — they were blocked on page faults with nobody fetching ahead. A block's tensors
+  are written together by the converter, so warming one is a single large sequential
+  read, which is what the drive is fast at.
+
+  | Prefetch | Seconds per forward pass |
+  |---|---|
+  | off | 27.1 / 30.7 / 27.6 |
+  | 1 thread, 1 block ahead | 15.8 / 15.2 / 16.1 |
+  | **3 threads, 3 blocks ahead** | **12.4 / 11.9 / 11.9** |
+  | 6 threads | 12.3 |
+  | 10 threads | 11.9 |
+
+  Conditions alternate so that a warming page cache cannot explain the difference.
+  Three is where it stops paying: one thread cannot keep a request queued at the drive,
+  and past three the drive is already busy. CPU rises to ~165-215%, so this is still
+  I/O-bound — the floor is 19 GB / 3.9 GB/s ≈ 5 s, and that last 2.4x needs explicit
+  reads and a resident tier the engine picks, not the kernel's LRU. End to end through
+  the API the same short request went from 59-85 s to 26-38 s.
+
+### Changed
+
+- `qwen3.8.toml` turns prefetching on and explains, next to the key, what it is worth.
+  Its `[runtime] threads` comment now carries the other measurement from the same
+  session: on an 8+4 CPU, all twelve cores ran a pass in ~37 s against ~31 s on the
+  eight performance cores. A slow core holding up a batch costs more than it adds.
+
+### Measured and rejected
+
+- **Serving three requests concurrently was slower than serving them one after
+  another** — 244 s against 204 s, CPU flat at ~100% throughout. `logits_batch` shares
+  one pass across sequences and is unit-tested, so the batching itself works; the
+  sequences are not reaching it in lockstep. `max_concurrent = 1` stays in the shipped
+  config, and the gap is written into the README's "what is still missing" rather than
+  described as a feature.
+
 ## [0.27.1] - 2026-08-19
 
 The chat page asks for a length the server can actually reach.

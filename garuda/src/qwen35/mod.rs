@@ -63,7 +63,7 @@ use crate::cache::{LinearState, SeqState};
 use crate::core::{GarudaError, InferenceBackend, ModelDims, Tensor, Token};
 use crate::gguf::{Gguf, Value};
 use crate::llama::{Weight, load_norm, load_weight};
-use crate::simd;
+use crate::{quant, simd};
 use memmap2::Mmap;
 use std::sync::Arc;
 
@@ -416,6 +416,10 @@ pub struct Qwen35Backend {
     output: Arc<Weight>,
     layers: Vec<Layer>,
     prefill_chunk: usize,
+    /// Byte range of each block's weights in the mapped file, for prefetching.
+    layer_spans: Vec<(usize, usize)>,
+    /// Warms the next block while this one computes. Only useful with `mmap`.
+    prefetch: Option<Arc<crate::prefetch::LayerPrefetcher>>,
 }
 
 impl Qwen35Backend {
@@ -481,6 +485,40 @@ impl Qwen35Backend {
             });
         }
 
+        // Where each block's weights live in the file. The converter writes a block's
+        // tensors together, so this is one span per block rather than a scatter — which
+        // is what makes warming it a large sequential read.
+        let mut layer_spans = vec![(usize::MAX, 0usize); cfg.n_layers];
+        for t in &g.tensors {
+            let Some(rest) = t.name.strip_prefix("blk.") else {
+                continue;
+            };
+            let Some((idx, _)) = rest.split_once('.') else {
+                continue;
+            };
+            let Ok(l) = idx.parse::<usize>() else {
+                continue;
+            };
+            if l >= cfg.n_layers {
+                continue; // a prediction block, which this backend does not run
+            }
+            let start = g.data_offset + t.offset as usize;
+            let len = quant::byte_size(t.ggml_type, t.n_elements() as usize).unwrap_or(0);
+            let span = &mut layer_spans[l];
+            span.0 = span.0.min(start);
+            span.1 = span.1.max(start + len);
+        }
+        let layer_spans = layer_spans
+            .into_iter()
+            .map(|(start, end)| {
+                if start == usize::MAX {
+                    (0, 0)
+                } else {
+                    (start, end - start)
+                }
+            })
+            .collect();
+
         Ok(Self {
             cfg,
             token_embd,
@@ -488,7 +526,22 @@ impl Qwen35Backend {
             output,
             layers,
             prefill_chunk: 1,
+            layer_spans,
+            prefetch: None,
         })
+    }
+
+    /// The byte range of each block's weights in the mapped file.
+    pub fn layer_spans(&self) -> &[(usize, usize)] {
+        &self.layer_spans
+    }
+
+    /// Warm each block's weights on a background thread while the previous one
+    /// computes. See [`crate::prefetch::LayerPrefetcher`] for why a dense model wants
+    /// this and a resident one does not.
+    pub fn with_prefetch(mut self, prefetch: Arc<crate::prefetch::LayerPrefetcher>) -> Self {
+        self.prefetch = Some(prefetch);
+        self
     }
 
     /// True when weights are kept packed in a memory-mapped file.
@@ -860,6 +913,12 @@ impl Qwen35Backend {
                 xs.push(self.token_embd.row(idx)?);
             }
             for l in 0..self.cfg.n_layers {
+                // Ask for the blocks ahead before running this one, so the reads and
+                // the arithmetic overlap instead of taking turns. More than one, so
+                // the drive has more than one request to work on.
+                if let Some(pf) = &self.prefetch {
+                    pf.hint_ahead(l);
+                }
                 self.layer_batch(l, &mut xs, Targets::Shared(seq))?;
             }
             tail.append(&mut xs);
@@ -963,6 +1022,9 @@ impl InferenceBackend for Qwen35Backend {
         }
 
         for l in 0..self.cfg.n_layers {
+            if let Some(pf) = &self.prefetch {
+                pf.hint_ahead(l);
+            }
             self.layer_batch(l, &mut xs, Targets::PerToken(seqs))?;
         }
 

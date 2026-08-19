@@ -178,6 +178,7 @@ impl Engine {
         mmap: Option<Arc<memmap2::Mmap>>,
     ) -> anyhow::Result<Self> {
         let tokenizer: Arc<dyn Tokenize> = Arc::new(BpeTokenizer::from_gguf(gguf)?);
+        let mmap_for_prefetch = mmap.clone();
         let backend = Qwen35Backend::from_gguf(gguf, bytes, mmap)?;
         let qc = backend.config();
         let dims = backend.dims();
@@ -202,6 +203,25 @@ impl Engine {
 
         let chunk = Self::prefill_chunk(config);
         let backend = backend.with_prefill_chunk(chunk);
+
+        // A dense checkpoint has no experts to predict, but it does have a next block,
+        // and on one larger than RAM that block has to come off disk while the current
+        // one computes or the CPU spends the wait idle. Only worth anything when the
+        // weights are mapped: an in-RAM checkpoint has nothing to warm.
+        let prefetch = if config.runtime.prefetch && backend.is_mmapped() {
+            mmap_for_prefetch.map(|m| {
+                Arc::new(crate::prefetch::LayerPrefetcher::new(
+                    m,
+                    backend.layer_spans().to_vec(),
+                ))
+            })
+        } else {
+            None
+        };
+        let backend = match &prefetch {
+            Some(pf) => backend.with_prefetch(pf.clone()),
+            None => backend,
+        };
         let recurrent = qc.recurrent.iter().filter(|&&r| r).count();
         tracing::info!(
             prefill_batch = chunk,
@@ -212,6 +232,7 @@ impl Engine {
             heads = format!("{}x{}", qc.n_heads, qc.head_dim),
             kv_heads = qc.n_kv_heads,
             recurrent_state_mb = qc.linear_state_bytes() / 1_048_576,
+            prefetch = prefetch.is_some(),
             "qwen3.5: hybrid attention, {} of {} blocks recurrent",
             recurrent,
             qc.n_layers
@@ -279,6 +300,8 @@ impl Engine {
             },
             memory: None,
             runtime,
+            // `Engine::prefetch` is the MoE expert engine, which a dense model has no
+            // use for; the block prefetcher lives inside the backend.
             prefetch: None,
             chat,
         })

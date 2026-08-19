@@ -47,9 +47,21 @@ prompt_cache = "1GB"
 kv_spill = false
 
 [runtime]
+# 0 uses every core, which is not always the fastest thing on a CPU whose cores are
+# not alike. Measured on an 8+4 Apple Silicon machine, alternating runs so that page
+# cache warming could not explain it: ~37 s per forward pass across all twelve cores
+# against ~31 s across the eight performance cores, and steadier. A slow core holding
+# up a batch costs more than it adds. Set this to your performance-core count.
 threads = 0
-# Nothing to prefetch: a dense model has no experts to warm.
-prefetch = false
+# Warm the next blocks while this one computes. This is the setting that matters on a
+# checkpoint larger than RAM: left to demand paging, the forward pass faults its
+# weights in a page at a time and the CPU idles between faults — measured 140% busy
+# out of 800% available, pulling 0.7 GB/s from a disk that reads 3.9 GB/s. Three
+# background threads handing the kernel whole blocks took a forward pass from 27 s to
+# 12 s on this machine, with the answer unchanged (the hint is advisory; the pass
+# still faults whatever it needs).
+prefetch = true
+# Expert routing history, which a dense model does not have.
 predictor = false
 
 [server]

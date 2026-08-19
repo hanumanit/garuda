@@ -33,6 +33,27 @@ fn main() -> anyhow::Result<()> {
     let gguf = Gguf::parse(&map)?;
     let tk = BpeTokenizer::from_gguf(&gguf)?;
     let backend = Qwen35Backend::from_gguf(&gguf, &map, Some(map.clone()))?.with_prefill_chunk(64);
+
+    // GARUDA_PREFETCH=1 warms each block while the previous one computes. The point of
+    // having it here is the A/B: same process, same file, one flag apart.
+    let workers: usize = std::env::var("GARUDA_PREFETCH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let backend = if workers > 0 {
+        let pf = Arc::new(garuda::prefetch::LayerPrefetcher::with_workers(
+            map.clone(),
+            backend.layer_spans().to_vec(),
+            workers,
+        ));
+        println!(
+            "prefetch on: {workers} workers over {} blocks",
+            backend.layer_spans().len()
+        );
+        backend.with_prefetch(pf)
+    } else {
+        backend
+    };
     let cfg = backend.config();
 
     let mut ctx = tk.encode(&prompt);
