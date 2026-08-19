@@ -13,10 +13,12 @@
 //!   100 000 tokens as at ten. Those blocks still count positions, so every layer of a
 //!   sequence advances together as the [`InferenceBackend`] contract requires — they
 //!   just store nothing (`KvConfig::kv_dims`).
-//! * **A sequence cannot be rewound.** A recurrent state summarises every token it has
-//!   read, and no arithmetic takes the last few back out. So speculative decoding is
-//!   off for this architecture ([`Self::speculation_supported`] is `false`) rather than
-//!   quietly wrong, and [`crate::cache::SeqState::truncate`] refuses.
+//! * **A sequence is rewound from copies, or not at all.** A recurrent state
+//!   summarises every token it has read, and no arithmetic takes the last few back
+//!   out. Speculative decoding still works — [`Self::logits_multi`] copies each
+//!   recurrent layer's state per position as it goes, so a rejected guess can be
+//!   undone — but it is memory traded for passes, 149 MB a position on the 27B, and
+//!   [`crate::cache::SeqState::truncate`] refuses a rewind it kept no copy for.
 //! * **The attention blocks are not Llama's.** Heads are 256 wide against a 5120-wide
 //!   residual stream, the query projection emits a gate alongside the query, queries
 //!   and keys are RMS-normalised per head before rotation, and only the first quarter
@@ -62,7 +64,7 @@
 use crate::cache::{LinearState, SeqState};
 use crate::core::{GarudaError, InferenceBackend, ModelDims, Tensor, Token};
 use crate::gguf::{Gguf, Value};
-use crate::llama::{Weight, load_norm, load_weight};
+use crate::llama::{Bytes, Weight, load_norm, load_weight};
 use crate::{quant, simd};
 use memmap2::Mmap;
 use std::sync::Arc;
@@ -130,7 +132,8 @@ pub struct Qwen35Config {
     /// `qwen35.block_count` counts these, so the stack this backend runs is the first
     /// `block_count - n_nextn` blocks. Their weights are a draft head — llama.cpp runs
     /// them to propose tokens the main stack then checks — and this backend does not
-    /// use them: see the module docs on why speculation is off here. Some publishers
+    /// use them — prompt lookup and a smaller checkpoint from the same family already
+    /// speculate, and running these would be a third path. Some publishers
     /// bundle them (the 0.8B does), others ship them as a separate `mtp-*.gguf` (the
     /// 27B does), and both have to load.
     pub n_nextn: usize,
@@ -416,8 +419,11 @@ pub struct Qwen35Backend {
     output: Arc<Weight>,
     layers: Vec<Layer>,
     prefill_chunk: usize,
-    /// Byte range of each block's weights in the mapped file, for prefetching.
+    /// Byte range of each block's weights in the mapped file, for prefetching. Empty
+    /// for a block this process holds itself.
     layer_spans: Vec<(usize, usize)>,
+    /// How much of the checkpoint is held in owned buffers.
+    pinned_bytes: usize,
     /// Warms the next block while this one computes. Only useful with `mmap`.
     prefetch: Option<Arc<crate::prefetch::LayerPrefetcher>>,
 }
@@ -434,8 +440,62 @@ impl Qwen35Backend {
     /// With `mmap`, projections stay packed in the mapped file and are dequantised a
     /// row at a time (low RAM, slower); without it every weight is expanded to `f32`.
     pub fn from_gguf(g: &Gguf, bytes: &[u8], mmap: Option<Arc<Mmap>>) -> Result<Self, GarudaError> {
+        Self::from_gguf_pinned(g, bytes, mmap, 0)
+    }
+
+    /// Load, holding up to `pin_budget` bytes of weights in buffers this process owns
+    /// rather than leaving them to the page cache.
+    ///
+    /// Only meaningful with `mmap`: without it every weight is already in RAM, as
+    /// `f32`. The budget is spent on what is read most: the output head first, which
+    /// every token reads in full, then whole blocks in order. A block is pinned or not
+    /// — never half — so that what remains mapped is still one contiguous span for
+    /// [`crate::prefetch::LayerPrefetcher`] to warm.
+    pub fn from_gguf_pinned(
+        g: &Gguf,
+        bytes: &[u8],
+        mmap: Option<Arc<Mmap>>,
+        pin_budget: usize,
+    ) -> Result<Self, GarudaError> {
         let cfg = Qwen35Config::from_gguf(g)?;
         let (d, f, v) = (cfg.d_model, cfg.d_ff, cfg.vocab);
+        let spans = block_spans(g, cfg.n_layers);
+
+        // Spend the budget, most-read first. `mmap` off means the weights are `f32` in
+        // RAM already and there is nothing to pin.
+        let mut budget = if mmap.is_some() { pin_budget } else { 0 };
+        let head_span = g.tensor("output.weight").and_then(|t| {
+            let len = quant::byte_size(t.ggml_type, v * d).ok()?;
+            Some((g.data_offset + t.offset as usize, len))
+        });
+        let mut pinned_bytes = 0usize;
+        let pin_head = match head_span {
+            Some((_, len)) if len <= budget => {
+                budget -= len;
+                pinned_bytes += len;
+                true
+            }
+            _ => false,
+        };
+        let mut pinned = vec![false; cfg.n_layers];
+        for (l, &(_, len)) in spans.iter().enumerate() {
+            if len > 0 && len <= budget {
+                budget -= len;
+                pinned_bytes += len;
+                pinned[l] = true;
+            }
+        }
+
+        // Read a span once, into memory this process owns. `bytes` is the mapped file,
+        // so this is one sequential copy per block rather than a fault per page.
+        let pin = |start: usize, len: usize| -> Result<Bytes, GarudaError> {
+            if start + len > bytes.len() {
+                return Err(GarudaError::Model(
+                    "a block runs past the end of the file".into(),
+                ));
+            }
+            Ok(Bytes::Owned(Arc::new(bytes[start..start + len].to_vec())))
+        };
 
         let norm = |name: &str, n: usize| load_norm(g, bytes, name, n);
         let weight =
@@ -444,14 +504,36 @@ impl Qwen35Backend {
         let token_embd = Arc::new(weight("token_embd.weight", v, d)?);
         let output_norm = norm("output_norm.weight", d)?;
         let output = if g.tensor("output.weight").is_some() {
-            Arc::new(weight("output.weight", v, d)?)
+            match (pin_head, head_span) {
+                (true, Some((start, len))) => Arc::new(crate::llama::pinned_weight(
+                    g,
+                    &pin(start, len)?,
+                    start,
+                    "output.weight",
+                    v,
+                    d,
+                )?),
+                _ => Arc::new(weight("output.weight", v, d)?),
+            }
         } else {
             token_embd.clone()
         };
 
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for l in 0..cfg.n_layers {
+            // A pinned block's tensors are read out of its own buffer; the rest stay
+            // mapped and are streamed.
+            let held = if pinned[l] {
+                let (start, len) = spans[l];
+                Some((pin(start, len)?, start))
+            } else {
+                None
+            };
             let p = |name: &str| format!("blk.{l}.{name}.weight");
+            let weight = |name: &str, rows: usize, cols: usize| match &held {
+                Some((src, base)) => crate::llama::pinned_weight(g, src, *base, name, rows, cols),
+                None => load_weight(g, bytes, &mmap, name, rows, cols),
+            };
             let mixer = if cfg.recurrent[l] {
                 Mixer::Linear {
                     wqkv: weight(&p("attn_qkv"), cfg.conv_dim(), d)?,
@@ -485,38 +567,11 @@ impl Qwen35Backend {
             });
         }
 
-        // Where each block's weights live in the file. The converter writes a block's
-        // tensors together, so this is one span per block rather than a scatter — which
-        // is what makes warming it a large sequential read.
-        let mut layer_spans = vec![(usize::MAX, 0usize); cfg.n_layers];
-        for t in &g.tensors {
-            let Some(rest) = t.name.strip_prefix("blk.") else {
-                continue;
-            };
-            let Some((idx, _)) = rest.split_once('.') else {
-                continue;
-            };
-            let Ok(l) = idx.parse::<usize>() else {
-                continue;
-            };
-            if l >= cfg.n_layers {
-                continue; // a prediction block, which this backend does not run
-            }
-            let start = g.data_offset + t.offset as usize;
-            let len = quant::byte_size(t.ggml_type, t.n_elements() as usize).unwrap_or(0);
-            let span = &mut layer_spans[l];
-            span.0 = span.0.min(start);
-            span.1 = span.1.max(start + len);
-        }
-        let layer_spans = layer_spans
-            .into_iter()
-            .map(|(start, end)| {
-                if start == usize::MAX {
-                    (0, 0)
-                } else {
-                    (start, end - start)
-                }
-            })
+        // A pinned block never faults, so there is nothing to warm for it.
+        let layer_spans = spans
+            .iter()
+            .enumerate()
+            .map(|(l, &span)| if pinned[l] { (0, 0) } else { span })
             .collect();
 
         Ok(Self {
@@ -527,8 +582,15 @@ impl Qwen35Backend {
             layers,
             prefill_chunk: 1,
             layer_spans,
+            pinned_bytes,
             prefetch: None,
         })
+    }
+
+    /// Weight bytes this process holds in its own buffers, rather than leaving to the
+    /// page cache. Zero unless a pin budget was given.
+    pub fn pinned_bytes(&self) -> usize {
+        self.pinned_bytes
     }
 
     /// The byte range of each block's weights in the mapped file.
@@ -786,7 +848,13 @@ impl Qwen35Backend {
             let raw = &qkv[i * c_dim..(i + 1) * c_dim];
             // This token's own sequence: its convolution history and its state.
             let seq = targets.get(i);
+            let recording = seq.recording();
             let ls: &mut LinearState = seq.linear(l, conv_len, state_len)?;
+            // Copy the state before this token changes it, so a rejected guess can be
+            // taken back out. Only while a speculative round is being verified.
+            if recording {
+                ls.snapshot();
+            }
 
             // Depthwise causal convolution over the last `kernel` inputs of each
             // channel, then SiLU. `ls.conv` holds the `kernel - 1` previous ones,
@@ -856,7 +924,9 @@ impl Qwen35Backend {
 
             // A recurrent block stores nothing per position, but it still counts them:
             // the runtime reads `seq.len()` from layer 0 and every layer has to agree.
-            targets.get(i).layer(l).append(&[], &[])?;
+            let seq = targets.get(i);
+            seq.linear(l, conv_len, state_len)?.advance();
+            seq.layer(l).append(&[], &[])?;
         }
 
         let mut out = vec![0.0; n * d];
@@ -1042,15 +1112,47 @@ impl InferenceBackend for Qwen35Backend {
             .collect()
     }
 
-    /// Off for this architecture, deliberately.
+    /// Logits at the last `n` positions, from a single pass — which is what checking a
+    /// run of guessed tokens needs.
     ///
-    /// Verifying a run of guesses means being able to throw the rejected ones away.
-    /// Three quarters of these blocks keep a recurrent state that summarises every
-    /// token it has read, so there is nothing to throw away — the state cannot be
-    /// rewound. Answering `false` here keeps the runtime on the plain decode path
-    /// instead of producing a state that describes tokens the caller discarded.
+    /// The pass records a copy of every recurrent layer's state per token as it goes,
+    /// because that is the only way back: rejecting a guess means putting the state
+    /// where it was, and no arithmetic takes a token out of a summary. The copies are
+    /// large (149 MB per position on the 27B) and live exactly as long as the round —
+    /// [`SeqState::truncate`] drops them once the caller has settled which guesses
+    /// survived.
+    fn logits_multi(
+        &self,
+        context: &[Token],
+        seq: &mut SeqState,
+        n: usize,
+    ) -> Result<Vec<Tensor>, GarudaError> {
+        if n == 1 {
+            return Ok(vec![self.logits(context, seq)?]);
+        }
+        seq.begin_recording();
+        let tail = self.forward_tail(context, seq, n);
+        seq.end_recording();
+
+        let vocab = self.cfg.vocab;
+        tail?
+            .into_iter()
+            .map(|h| {
+                let mut logits = vec![0.0; vocab];
+                self.output.matvec(&h, &mut logits)?;
+                Tensor::new(vec![vocab], logits)
+            })
+            .collect()
+    }
+
+    /// On, and paid for by the copies [`Self::logits_multi`] records.
+    ///
+    /// Verifying a run of guesses means being able to throw the rejected ones away, and
+    /// three quarters of these blocks keep a state that summarises every token they
+    /// have read. Nothing takes a token back out of a summary — so the state is copied
+    /// on the way in instead, once per position, for the length of the round.
     fn speculation_supported(&self) -> bool {
-        false
+        true
     }
 }
 
@@ -1111,6 +1213,46 @@ fn delta_step(s: &mut [f32], q: &[f32], k: &[f32], v: &[f32], g: DeltaGates, out
             simd::add_scaled(out, &s[r * vh..(r + 1) * vh], qr);
         }
     }
+}
+
+/// Where each block's weights live in the file, as `(start, len)` per block.
+///
+/// The converter writes a block's tensors together, so this is one span per block
+/// rather than a scatter — which is what makes reading a block, whether to pin it or to
+/// warm it, a single large sequential read. Blocks past the decoder stack (a
+/// multi-token-prediction block, if the file carries one) get an empty span, since this
+/// backend never reads them.
+fn block_spans(g: &Gguf, n_layers: usize) -> Vec<(usize, usize)> {
+    let mut spans = vec![(usize::MAX, 0usize); n_layers];
+    for t in &g.tensors {
+        let Some(rest) = t.name.strip_prefix("blk.") else {
+            continue;
+        };
+        let Some((idx, _)) = rest.split_once('.') else {
+            continue;
+        };
+        let Ok(l) = idx.parse::<usize>() else {
+            continue;
+        };
+        if l >= n_layers {
+            continue;
+        }
+        let start = g.data_offset + t.offset as usize;
+        let len = quant::byte_size(t.ggml_type, t.n_elements() as usize).unwrap_or(0);
+        let span = &mut spans[l];
+        span.0 = span.0.min(start);
+        span.1 = span.1.max(start + len);
+    }
+    spans
+        .into_iter()
+        .map(|(start, end)| {
+            if start == usize::MAX {
+                (0, 0)
+            } else {
+                (start, end - start)
+            }
+        })
+        .collect()
 }
 
 /// Rotary embedding over the first `n_rot` dimensions of one head, rotate-half
@@ -1692,19 +1834,82 @@ mod tests {
         }
     }
 
-    /// Speculation is off, and the cache says why: a recurrent state cannot be rewound.
+    /// A recurrent sequence can only be rewound to a position it kept a copy of, and
+    /// asking for any other is refused rather than approximated.
     #[test]
-    fn a_sequence_carrying_recurrent_state_refuses_to_be_rewound() {
+    fn a_recurrent_sequence_rewinds_only_where_it_kept_a_copy() {
         let b = backend(Head::Separate);
-        assert!(!b.speculation_supported());
-        assert!(b.logits_multi(&[1, 2, 3], &mut seq_for(&b), 2).is_err());
-
         let mut seq = seq_for(&b);
         b.logits(&[1, 2, 3], &mut seq).unwrap();
+
         assert!(seq.truncate(3).is_ok(), "a no-op truncation is fine");
         let err = seq.truncate(1).unwrap_err().to_string();
-        assert!(err.contains("recurrent state"), "unexpected error: {err}");
+        assert!(err.contains("no copy of it"), "unexpected error: {err}");
         assert_eq!(seq.len(), 3, "a refused truncation changes nothing");
+        let after = b.logits(&[1, 2, 3, 7], &mut seq).unwrap();
+        assert!(after.data().iter().all(|v| v.is_finite()));
+    }
+
+    /// The whole point of the copies: a speculative round must leave no trace of the
+    /// guesses it threw away. Decoding on after a rejected run has to match decoding
+    /// the same tokens with no speculation at all — for the recurrent layers as much
+    /// as for the attention ones, since a state that still remembers a rejected token
+    /// would go wrong quietly and stay wrong.
+    #[test]
+    fn a_rejected_guess_leaves_the_sequence_exactly_as_it_was() {
+        let b = backend(Head::Separate);
+        assert!(b.speculation_supported());
+
+        // The honest answer: decode 3 tokens one at a time.
+        let mut plain = seq_for(&b);
+        b.logits(&[1, 2, 3], &mut plain).unwrap();
+        let straight = b.logits(&[1, 2, 3, 4], &mut plain).unwrap();
+
+        // The speculative path: guess two tokens, check both in one pass, then reject
+        // them and take the same step the plain decoder took.
+        let mut spec = seq_for(&b);
+        b.logits(&[1, 2, 3], &mut spec).unwrap();
+        let answers = b.logits_multi(&[1, 2, 3, 9, 9], &mut spec, 2).unwrap();
+        assert_eq!(answers.len(), 2);
+        assert_eq!(spec.len(), 5, "the guesses were consumed");
+
+        spec.truncate(3)
+            .expect("the round kept copies from position 3");
+        assert_eq!(spec.len(), 3);
+        let after = b.logits(&[1, 2, 3, 4], &mut spec).unwrap();
+
+        for (i, (x, y)) in after.data().iter().zip(straight.data()).enumerate() {
+            assert!(
+                (x - y).abs() < 1e-5,
+                "logit {i} after a rejected round: {x} vs {y} without one"
+            );
+        }
+
+        // The copies are released once the round is settled, and a later rewind past
+        // them is refused again.
+        assert!(spec.truncate(1).is_err());
+    }
+
+    /// A guess that is accepted is not rewound at all, and the state carries on.
+    #[test]
+    fn an_accepted_guess_continues_from_where_the_round_left_it() {
+        let b = backend(Head::Separate);
+        let mut plain = seq_for(&b);
+        b.logits(&[1, 2, 3], &mut plain).unwrap();
+        b.logits(&[1, 2, 3, 9], &mut plain).unwrap();
+        let straight = b.logits(&[1, 2, 3, 9, 9], &mut plain).unwrap();
+
+        let mut spec = seq_for(&b);
+        b.logits(&[1, 2, 3], &mut spec).unwrap();
+        let answers = b.logits_multi(&[1, 2, 3, 9, 9], &mut spec, 2).unwrap();
+        spec.truncate(5).expect("keeping every guess is a no-op");
+
+        for (i, (x, y)) in answers[1].data().iter().zip(straight.data()).enumerate() {
+            assert!(
+                (x - y).abs() < 1e-5,
+                "logit {i} from the verified run: {x} vs {y} decoded plainly"
+            );
+        }
     }
 
     #[test]
@@ -1733,6 +1938,68 @@ mod tests {
                 "logit {i}: expanded {x} vs packed {y}"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pinning changes where the bytes live, never what they say. The budget is spent
+    /// most-read-first — the output head, then whole blocks — and whatever is pinned
+    /// drops out of the prefetch list, because it can no longer fault.
+    #[test]
+    fn pinned_weights_answer_exactly_as_mapped_ones_do() {
+        let bytes = build_qwen35_gguf(Head::Separate, "qwen35");
+        let dir = std::env::temp_dir().join("garuda_qwen35_pin_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.gguf");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+        let map = Arc::new(unsafe { Mmap::map(&std::fs::File::open(&path).unwrap()).unwrap() });
+        let g = Gguf::parse(&map).unwrap();
+
+        let mapped = Qwen35Backend::from_gguf(&g, &map, Some(map.clone())).unwrap();
+        assert_eq!(mapped.pinned_bytes(), 0, "no budget, nothing pinned");
+        assert!(
+            mapped.layer_spans().iter().all(|&(_, len)| len > 0),
+            "every block is a candidate for warming when none is pinned"
+        );
+
+        // Enough for the head and some of the blocks, not all of them.
+        let budget = bytes.len() / 3;
+        let pinned = Qwen35Backend::from_gguf_pinned(&g, &map, Some(map.clone()), budget).unwrap();
+        assert!(pinned.pinned_bytes() > 0 && pinned.pinned_bytes() <= budget);
+        assert!(
+            pinned.layer_spans().iter().any(|&(_, len)| len == 0),
+            "a pinned block has nothing left to prefetch"
+        );
+        assert!(
+            pinned.layer_spans().iter().any(|&(_, len)| len > 0),
+            "and a budget this size does not cover the whole model"
+        );
+
+        let ctx: Vec<Token> = vec![3, 1, 4, 1, 5];
+        let a = mapped.logits(&ctx, &mut seq_for(&mapped)).unwrap();
+        let b = pinned.logits(&ctx, &mut seq_for(&pinned)).unwrap();
+        assert_eq!(
+            a.data(),
+            b.data(),
+            "pinning is a memory decision, not a maths one"
+        );
+
+        // A budget larger than the file pins everything it can and still answers.
+        let all = Qwen35Backend::from_gguf_pinned(&g, &map, Some(map.clone()), usize::MAX).unwrap();
+        assert!(all.pinned_bytes() > pinned.pinned_bytes());
+        assert!(
+            all.layer_spans().iter().all(|&(_, len)| len == 0),
+            "nothing left to warm"
+        );
+        let c = all.logits(&ctx, &mut seq_for(&all)).unwrap();
+        assert_eq!(a.data(), c.data());
+
+        // Without a map there is nothing to pin: the weights are already f32 in RAM.
+        let expanded = Qwen35Backend::from_gguf_pinned(&g, &map, None, usize::MAX).unwrap();
+        assert_eq!(expanded.pinned_bytes(), 0);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

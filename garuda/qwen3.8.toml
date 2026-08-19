@@ -23,10 +23,17 @@ prefill_batch = 256
 # and only the 16 attention blocks store anything per position, so the cache is a
 # quarter of what an all-attention model of this size would want.
 context = 4096
-# Speculation is unavailable for this architecture: a recurrent state summarises
-# every token it has read and cannot be rewound, so a rejected guess cannot be taken
-# back out. Setting model.draft_gguf here is a startup error rather than a key that
-# quietly does nothing.
+# A small checkpoint that proposes tokens for this one to check. The natural draft for
+# a Qwen3.5-family model is a smaller one from the same family — it is the only thing
+# that shares the 248 320-token vocabulary, and startup refuses a mismatch.
+#
+# This is the single largest win available here, because it cuts *passes over the
+# weights*, which is what a checkpoint larger than RAM actually spends its time on.
+# Measured on the same 10-token reply: 152 s with no speculation, 108 s with prompt
+# lookup (which needs no second model), and 58 s with a Qwen3.5-0.8B draft — 2.6x,
+# with the output identical token for token.
+#
+#   draft_gguf = "/path/to/Qwen3.5-0.8B-Q8_0.gguf"
 draft_gguf = ""
 # Let the model reason. Its template opens a `<think>` block for the assistant;
 # `false` closes it immediately, so a reply is the answer alone. `true` leaves it
@@ -44,6 +51,14 @@ kv_resident_blocks = 128
 # at all, and Garuda says so at startup.
 prompt_cache_entries = 4
 prompt_cache = "1GB"
+# Weights to hold in buffers this process owns rather than leaving to the page cache.
+# Counter-intuitively, small is what pays here. Measured on this checkpoint, seconds
+# per forward pass: 12.5 with none pinned, 11.8 at 2 GB, 13.7 at 6 GB, 25.8 at 9 GB.
+# Owned memory competes with the page cache and, once the machine is under pressure,
+# gets compressed or swapped — while a mapped weight is a clean page the kernel can
+# drop for free and read back sequentially. 2 GB covers the output head, which every
+# token reads in full, plus a block. Raising it much past that backfires.
+weight_cache = "2GB"
 kv_spill = false
 
 [runtime]

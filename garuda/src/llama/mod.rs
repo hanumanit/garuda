@@ -48,9 +48,40 @@ pub(crate) enum Weight {
     Packed {
         qtype: u32,
         cols: usize,
-        src: Arc<Mmap>,
+        src: Bytes,
         start: usize,
     },
+}
+
+/// Where a packed weight's bytes live: in the mapped file, or in a buffer this process
+/// read them into and holds.
+///
+/// The distinction is the difference between "the kernel may evict this at any moment"
+/// and "this is ours until we drop it". On a checkpoint larger than RAM the kernel's
+/// LRU is not a good judge — every block is read exactly once per token, so there is no
+/// recency to exploit, and what it evicts is whatever it happens to have. Pinning a
+/// chosen subset takes that decision away from it: those blocks never fault again, and
+/// the ones left mapped are streamed by [`crate::prefetch::LayerPrefetcher`].
+#[derive(Clone)]
+pub(crate) enum Bytes {
+    Mapped(Arc<Mmap>),
+    Owned(Arc<Vec<u8>>),
+}
+
+impl Bytes {
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        match self {
+            Bytes::Mapped(m) => &m[..],
+            Bytes::Owned(v) => &v[..],
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Bytes::Mapped(m) => m.len(),
+            Bytes::Owned(v) => v.len(),
+        }
+    }
 }
 
 impl Weight {
@@ -78,7 +109,14 @@ impl Weight {
             } => {
                 let row_bytes = quant::byte_size(*qtype, *cols)?;
                 let off = start + row_start * row_bytes;
-                quant::matvec(*qtype, &src[off..off + n * row_bytes], n, *cols, x, out)
+                quant::matvec(
+                    *qtype,
+                    &src.as_slice()[off..off + n * row_bytes],
+                    n,
+                    *cols,
+                    x,
+                    out,
+                )
             }
         }
     }
@@ -109,7 +147,7 @@ impl Weight {
                 let off = start + row_start * row_bytes;
                 quant::matmul(
                     *qtype,
-                    &src[off..off + rows * row_bytes],
+                    &src.as_slice()[off..off + rows * row_bytes],
                     rows,
                     *cols,
                     xs,
@@ -132,7 +170,7 @@ impl Weight {
             } => {
                 let row_bytes = quant::byte_size(*qtype, *cols)?;
                 let off = start + r * row_bytes;
-                quant::dequantize(*qtype, &src[off..off + row_bytes], *cols)
+                quant::dequantize(*qtype, &src.as_slice()[off..off + row_bytes], *cols)
             }
         }
     }
@@ -237,6 +275,46 @@ pub(crate) fn load_norm(
     Ok(data)
 }
 
+/// A packed `rows x cols` weight matrix inside `src`, which holds the file's bytes
+/// from offset `base` onwards.
+///
+/// `base` is zero for a whole-file map and the block's own offset for a buffer holding
+/// one block — see [`Bytes`] for why a caller would read a block into one.
+pub(crate) fn pinned_weight(
+    g: &Gguf,
+    src: &Bytes,
+    base: usize,
+    name: &str,
+    rows: usize,
+    cols: usize,
+) -> Result<Weight, GarudaError> {
+    let t = g
+        .tensor(name)
+        .ok_or_else(|| GarudaError::Model(format!("tensor '{name}' not found")))?;
+    if t.n_elements() as usize != rows * cols {
+        return Err(GarudaError::Model(format!(
+            "tensor '{name}' has {} elements, expected {}",
+            t.n_elements(),
+            rows * cols
+        )));
+    }
+    let len = quant::byte_size(t.ggml_type, rows * cols)?;
+    let start = (g.data_offset + t.offset as usize)
+        .checked_sub(base)
+        .ok_or_else(|| GarudaError::Model(format!("tensor '{name}' starts before its buffer")))?;
+    if start + len > src.len() {
+        return Err(GarudaError::Model(format!(
+            "tensor '{name}' runs past the end of its buffer"
+        )));
+    }
+    Ok(Weight::Packed {
+        qtype: t.ggml_type,
+        cols,
+        src: src.clone(),
+        start,
+    })
+}
+
 /// A `rows x cols` weight matrix from a GGUF file: packed in the memory map when
 /// `mmap` is `Some`, expanded to `f32` in RAM when it is `None`.
 ///
@@ -260,21 +338,7 @@ pub(crate) fn load_weight(
         )));
     }
     match mmap {
-        Some(src) => {
-            let len = quant::byte_size(t.ggml_type, rows * cols)?;
-            let start = g.data_offset + t.offset as usize;
-            if start + len > src.len() {
-                return Err(GarudaError::Model(format!(
-                    "tensor '{name}' runs past the end of the file"
-                )));
-            }
-            Ok(Weight::Packed {
-                qtype: t.ggml_type,
-                cols,
-                src: src.clone(),
-                start,
-            })
-        }
+        Some(src) => pinned_weight(g, &Bytes::Mapped(src.clone()), 0, name, rows, cols),
         None => Ok(Weight::Full {
             data: g.tensor_f32(bytes, name)?,
             cols,
@@ -544,8 +608,11 @@ impl LlamaBackend {
     /// The backing memory map, if this checkpoint was loaded with `mmap`.
     pub fn mmap(&self) -> Option<Arc<Mmap>> {
         match &*self.token_embd {
-            Weight::Packed { src, .. } => Some(src.clone()),
-            Weight::Full { .. } => None,
+            Weight::Packed {
+                src: Bytes::Mapped(m),
+                ..
+            } => Some(m.clone()),
+            _ => None,
         }
     }
 
@@ -1408,7 +1475,7 @@ mod tests {
         let packed = Weight::Packed {
             qtype: crate::quant::F32,
             cols,
-            src: mmap,
+            src: Bytes::Mapped(mmap),
             start: 0,
         };
 
@@ -1815,7 +1882,7 @@ mod tests {
         let packed_w = Weight::Packed {
             qtype: quant::Q6_K,
             cols,
-            src: mmap,
+            src: Bytes::Mapped(mmap),
             start: 0,
         };
 

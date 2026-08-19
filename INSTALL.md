@@ -172,9 +172,11 @@ Three things differ from a Llama-family checkpoint of this size:
   as at a hundred thousand, on top of a KV cache that only the 16 attention blocks
   contribute to. If `memory.prompt_cache` is smaller than that state, no prompt can
   ever be cached, and startup says so.
-- **`model.draft_gguf` is refused**, with a message explaining why: a recurrent state
-  summarises every token it has read, so a rejected guess cannot be taken back out,
-  and speculative decoding needs exactly that. Prompt lookup is off here too.
+- **`model.draft_gguf` is where the time goes.** Each token costs a pass over 19 GB,
+  so cutting passes beats everything else: 152 s for a 10-token reply with no
+  speculation, 108 s with prompt lookup, 58 s with a `Qwen3.5-0.8B` draft. The draft
+  must share the target's vocabulary — startup checks — so use a smaller model from
+  the same family.
 - **Its chat template opens a `<think>` block.** By default Garuda closes it
   immediately, so replies are answers. `model.thinking = true` leaves it open — the
   checkpoint's own default — and the reasoning then arrives as content ahead of the
@@ -261,8 +263,9 @@ GARUDA_QWEN35_GGUF=Qwen3.5-0.8B-Q8_0.gguf \
 - **`architecture 'qwen35moe' is not supported`** — the mixture-of-experts sibling of
   Qwen3.5 (the `-A3B` models) is a different architecture and is refused rather than
   half-run. The dense checkpoints — Qwen3.8-27B, Qwen3.6-27B, Qwen3.5-0.8B…27B — load.
-- **`model.draft_gguf is set … but this architecture cannot verify speculated
-  tokens`** — a Qwen3.5-family checkpoint cannot speculate (see above). Clear the key.
+- **`draft checkpoint … has a N-token vocabulary but the model has M`** — a draft
+  hands back token ids, so it has to tokenise identically. For a Qwen3.5-family target
+  that means another Qwen3.5-family checkpoint; a Llama-family draft will not do.
 - **`no prompt will ever be cached`** (a startup warning) — one sequence's recurrent
   state is larger than `memory.prompt_cache`. Raise the budget past the figure in the
   message, or accept that a repeated prompt re-runs prefill.

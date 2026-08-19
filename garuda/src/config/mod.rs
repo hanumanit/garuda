@@ -107,6 +107,17 @@ pub struct MemoryConfig {
     /// and half a gigabyte on Mixtral-8x7B. Counting entries alone is therefore not a
     /// bound — this is.
     pub prompt_cache: String,
+    /// Weights to hold in RAM, in buffers this process owns, e.g. `"9GB"`.
+    ///
+    /// For a checkpoint larger than RAM. Mapped weights live in the page cache, where
+    /// the kernel decides what to evict — and on this workload it has nothing to go on,
+    /// since every block is read exactly once per token and no block is more recent
+    /// than another. Naming a budget takes that decision back: whatever fits is read
+    /// once at startup and never faults again, and the rest is streamed from the map.
+    ///
+    /// `"0"` (the default) pins nothing. The budget is charged against the process, so
+    /// leave the machine room for the streaming half and for everything else.
+    pub weight_cache: String,
     /// Cold archive tier. Empty disables L3.
     pub archive_path: String,
     /// Spill KV blocks to disk when a sequence exceeds `kv_resident_blocks`.
@@ -120,6 +131,7 @@ impl Default for MemoryConfig {
             kv_resident_blocks: 512,
             prompt_cache_entries: 64,
             prompt_cache: "512MB".into(),
+            weight_cache: "0".into(),
             archive_path: String::new(),
             kv_spill: true,
         }
@@ -366,6 +378,10 @@ impl AppConfig {
 
     pub fn prompt_cache_bytes(&self) -> Result<usize, GarudaError> {
         parse_size(&self.memory.prompt_cache)
+    }
+
+    pub fn weight_cache_bytes(&self) -> Result<usize, GarudaError> {
+        parse_size(&self.memory.weight_cache)
     }
 
     pub fn sliding_window(&self) -> Option<usize> {

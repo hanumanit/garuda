@@ -59,10 +59,11 @@ speculative_lookahead = 4
 # pay at ordinary temperatures — measured 1.7-2.0x on Mixtral at 0.8, against a
 # TinyLlama-1.1B draft. It costs a second checkpoint resident alongside the first.
 #
-# Neither form of speculation is available on a qwen35 checkpoint: its recurrent
-# layers summarise every token they have read, so a rejected guess cannot be taken
-# back out. Setting this key with such a model loaded is a startup error rather than
-# a key that quietly does nothing.
+# On a qwen35 checkpoint this is worth more than anywhere else, because a token there
+# costs a pass over the whole model: 152 s for a 10-token reply with no speculation,
+# 108 s with prompt lookup, 58 s with a Qwen3.5-0.8B draft. Its recurrent layers keep
+# a state that cannot be rewound by arithmetic, so verifying a round copies that state
+# per position — which is memory (149 MB a position on the 27B) traded for passes.
 #   draft_gguf = "/path/to/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
 draft_gguf = ""
 draft_mmap = true

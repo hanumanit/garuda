@@ -61,6 +61,7 @@ the streaming, the cancellation, the load shedding.
 | Dequantisation: F32 / F16 / Q4_0 / Q8_0 / Q2_K–Q6_K | Real, tested (runs Q2_K…Q5_K_M models) |
 | Memory-mapped packed weights (`mmap = true`), incl. per-expert streaming | Real, tested (~6× less RAM, same output) |
 | **Block prefetching for a dense checkpoint larger than RAM** | Real, measured — **2.3× on Qwen3.8-27B** (19 GB on a 16 GB machine): 27–31 s per forward pass down to 11.9–12.4 s, alternating runs. Three background threads hand the kernel whole blocks to read while the current one computes; the hint is advisory, so the answer is unchanged token for token |
+| **Speculative decoding on a recurrent architecture** | Real, measured — **2.6×** on Qwen3.8-27B with a Qwen3.5-0.8B draft (152 s → 58 s for the same 10-token reply), 1.4× with prompt lookup and no second model. A recurrent state cannot be rewound by arithmetic, so it is copied per position while a round is in flight and dropped when the round settles; a rejected guess leaves the sequence byte-identical to never having speculated, which is a test |
 | Batched, expert-grouped prefill | Real, tested — **8× faster prefill on Mixtral-8x7B Q4_K_M (25 GB) on a 16 GB machine**: 386 s → 48 s to first token for a 38-token prompt, because the working set drops from the whole model per token to one layer (7.1 GB → 816 MB). ~2× even on a model that fits in RAM, where the win is decoding each expert's rows once per batch instead of once per token. `model.prefill_batch` tunes or disables it |
 | Integer (NEON `i8`) matmul kernel for **every** quantised type | Real, tested — `Q8_0` and all five k-quants dot straight against an int8-quantised activation. Roughly 4–15× faster than dequantise-then-dot depending on type (see below), within quantisation tolerance of it |
 | A real MoE checkpoint at scale (Mixtral-8x7B, Q4_K_M, 26 GB) | Real, tested — loads and generates on a 16 GB machine via `mmap`; both GGUF expert-tensor layouts (merged `..._exps` and the older per-expert tensors some conversions use) load correctly |
@@ -273,10 +274,36 @@ Two smaller findings from the same measurements:
   Batched decode is implemented and unit-tested; what is missing is a scheduler that
   actually presents several sequences to it in lockstep.
 
-What is left on the table: the floor is 19 GB ÷ 3.9 GB/s ≈ **5 s per pass**, and we are
-at 12. Closing that gap means not going through the page cache at all — explicit reads
-into owned buffers, and a resident tier chosen by the engine rather than by the
-kernel's LRU.
+**A resident tier chosen by the engine was tried, and mostly does not work here.**
+`memory.weight_cache` reads that many bytes into buffers this process owns, so they
+never fault again. Seconds per pass against the budget: 12.5 at none, 11.8 at 2 GB,
+13.7 at 6 GB, 25.8 at 9 GB. Owned memory competes with the page cache and, on a machine
+already under pressure, gets compressed or swapped — while a mapped weight is a clean
+page the kernel can drop for free and read back sequentially. So the knob ships
+defaulting to nothing, with 2 GB (the output head, which every token reads in full,
+plus a block) as the only size measured to help.
+
+**What actually closes the gap is not moving bytes faster but needing fewer passes.**
+Speculative decoding checks a run of guessed tokens in one pass over the weights, and
+on this workload a pass *is* the cost. It needs a sequence that can be put back if a
+guess is rejected, which a recurrent state cannot do by arithmetic — so the state is
+copied per position while a round is in flight, 149 MB at a time, and dropped when the
+round settles. Memory for passes, and here that trade is heavily one-sided.
+
+The whole stack, measured on one request — a 10-token reply, greedy, identical output
+every time:
+
+| | seconds |
+|---|---|
+| as it started: demand paging, all cores, no speculation | **327** |
+| + block prefetch, 2 GB pinned, performance cores only | 152 / 154 |
+| + prompt lookup (no second model) | 108 |
+| + a Qwen3.5-0.8B draft model | **58** |
+
+**5.6× end to end**, with the checkpoint still 19 GB on a 16 GB machine. The floor is
+19 GB ÷ 3.9 GB/s ≈ 5 s per pass and a pass is ~12 s, so there is more in the transport
+yet: explicit reads into owned buffers rather than faulting through the page cache is
+the next thing to try.
 
 ### A hybrid checkpoint — Qwen3.8-27B
 
@@ -310,10 +337,15 @@ What that buys, and what it costs:
   same at ten tokens as at a hundred thousand. That is charged to the prompt cache's
   byte budget, so `memory.prompt_cache` has to exceed it before a prompt can be
   cached at all; Garuda warns at startup when it does not.
-- **Speculative decoding is off** for this architecture, and says so rather than
-  guessing wrong. Verifying guesses means being able to discard the rejected ones,
-  and a recurrent state that summarises every token it has read cannot be rewound.
-  `model.draft_gguf` is a startup error here, not a silently ignored key.
+- **Speculative decoding works, and it is the largest win here** — because it cuts
+  *passes over the weights*, which is what a checkpoint larger than RAM spends its
+  time on. Verifying guesses means being able to discard the rejected ones, and no
+  arithmetic takes a token back out of a recurrent summary, so the state is copied on
+  the way in instead: one copy per position, held for the length of a round. Measured
+  on the same 10-token reply: **152 s** with none, **108 s** with prompt lookup, and
+  **58 s** with a Qwen3.5-0.8B draft — output identical token for token. A draft has
+  to share the target's vocabulary, which in practice means a smaller model from the
+  same family.
 - **Vision is not supported.** Qwen3.8-27B is a vision-language model; its image
   tower ships as a separate `mmproj-*.gguf` and there is no image input path here.
   The text half is complete.

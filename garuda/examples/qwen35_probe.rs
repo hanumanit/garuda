@@ -32,7 +32,20 @@ fn main() -> anyhow::Result<()> {
     let map = Arc::new(unsafe { memmap2::Mmap::map(&file) }?);
     let gguf = Gguf::parse(&map)?;
     let tk = BpeTokenizer::from_gguf(&gguf)?;
-    let backend = Qwen35Backend::from_gguf(&gguf, &map, Some(map.clone()))?.with_prefill_chunk(64);
+    // GARUDA_PIN=9GB holds that much of the checkpoint in buffers this process owns,
+    // instead of leaving every byte to the page cache.
+    let pin = std::env::var("GARUDA_PIN")
+        .ok()
+        .and_then(|v| garuda::config::parse_size(&v).ok())
+        .unwrap_or(0);
+    if pin > 0 {
+        println!("pinning up to {} MB", pin / 1_048_576);
+    }
+    let backend = Qwen35Backend::from_gguf_pinned(&gguf, &map, Some(map.clone()), pin)?
+        .with_prefill_chunk(64);
+    if pin > 0 {
+        println!("pinned {} MB", backend.pinned_bytes() / 1_048_576);
+    }
 
     // GARUDA_PREFETCH=1 warms each block while the previous one computes. The point of
     // having it here is the A/B: same process, same file, one flag apart.

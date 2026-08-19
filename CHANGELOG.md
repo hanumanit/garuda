@@ -2,6 +2,55 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.29.0] - 2026-08-19
+
+Fewer passes over the weights, which is the only thing that matters at this size.
+
+### Added
+
+- **Speculative decoding on a recurrent architecture.** A pass over Qwen3.8-27B reads
+  19 GB, so what a token costs is a pass — and speculation checks a run of guesses in
+  one. It needs a sequence that can be put back when a guess is rejected, and no
+  arithmetic takes a token out of a recurrent summary, so `logits_multi` copies each
+  recurrent layer's state per position while a round is in flight and
+  `SeqState::truncate` restores from those copies and drops them. Memory traded for
+  passes: 149 MB a position on the 27B, and heavily worth it.
+
+  Measured on one request — a 10-token reply, greedy, identical output every time:
+
+  | | seconds |
+  |---|---|
+  | as 0.27.1 shipped: demand paging, all cores, no speculation | **327** |
+  | + block prefetch, 2 GB pinned, performance cores only | 152 / 154 |
+  | + prompt lookup (no second model) | 108 |
+  | + a Qwen3.5-0.8B draft model | **58** |
+
+  **5.6× end to end**, checkpoint still 19 GB on a 16 GB machine. A rejected guess has
+  to leave no trace, so that is a test: decoding on after a round whose guesses were
+  all thrown away matches decoding the same tokens with speculation switched off, to
+  within 1e-5, for the recurrent layers as much as the attention ones.
+
+- **A draft model may be any architecture this runtime loads.** `Engine::load_draft`
+  reads the file's architecture and builds the matching backend, so a Qwen3.5-family
+  target can be drafted by a smaller Qwen3.5 — which is the only thing that shares its
+  248 320-token vocabulary, and the vocabulary check at startup still refuses anything
+  else.
+
+- **`memory.weight_cache`** — weights held in buffers this process owns instead of the
+  page cache, for a checkpoint larger than RAM. It ships defaulting to nothing, because
+  the measurement is not what it looks like (below).
+
+### Measured and rejected
+
+- **Pinning weights in owned memory backfires past about 2 GB.** Seconds per forward
+  pass against the budget: 12.5 with none, 11.8 at 2 GB, 13.7 at 6 GB, 25.8 at 9 GB —
+  on a machine already 23 GB into swap. Owned memory competes with the page cache and
+  gets compressed or swapped under pressure, while a mapped weight is a clean page the
+  kernel can drop for free and read back sequentially at 3.9 GB/s. The knob stays,
+  defaulted off, with 2 GB — the output head plus a block — documented as the only size
+  measured to help. What the kernel is bad at here is not caching; it is prefetching,
+  which 0.28.0 took over.
+
 ## [0.28.0] - 2026-08-19
 
 Bytes, not arithmetic: 2.3x on a checkpoint larger than RAM.

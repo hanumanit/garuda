@@ -613,6 +613,9 @@ pub struct SeqState {
     /// Recurrent state for the layers that have it, indexed like `kvs`. `None` for an
     /// ordinary attention layer, which keeps its history in `kvs` instead.
     linear: Vec<Option<LinearState>>,
+    /// Set while a round of speculated tokens is being verified: the backend then
+    /// copies each recurrent layer's state before folding a token into it.
+    recording: bool,
 }
 
 /// What a linear-attention layer carries between tokens, instead of a growing cache
@@ -621,8 +624,9 @@ pub struct SeqState {
 /// A gated delta net summarises everything it has read into two fixed-size buffers,
 /// so this costs the same whether the sequence is ten tokens long or a hundred
 /// thousand — which is the point of the architecture. It is also why a linear layer
-/// cannot be rewound: the state is a summary, not a log, and dropping the last few
-/// positions from it is not an operation. See [`SeqState::truncate`].
+/// cannot be rewound by arithmetic: the state is a summary, not a log. The way back is
+/// a copy taken on the way in — see [`SeqState::begin_recording`] and
+/// [`SeqState::truncate`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct LinearState {
     /// The `kernel - 1` most recent inputs to the depthwise causal convolution,
@@ -631,6 +635,16 @@ pub struct LinearState {
     /// The recurrent matrix state: one `key_head_dim * value_head_dim` matrix per
     /// value head.
     pub state: Vec<f32>,
+    /// Tokens folded into `state` so far.
+    folded: usize,
+    /// Copies of `(folded, conv, state)` taken before folding a token, oldest first.
+    ///
+    /// Only recorded while a sequence is verifying speculated tokens — see
+    /// [`SeqState::begin_recording`]. The state cannot be rewound by arithmetic, so
+    /// the only way back is a copy taken on the way in, and a copy is the size of the
+    /// state: 149 MB per position on Qwen3.8-27B. That is why they are kept for
+    /// exactly as long as a round of guesses and dropped the moment it is settled.
+    history: Vec<(usize, Vec<f32>, Vec<f32>)>,
 }
 
 impl LinearState {
@@ -638,11 +652,48 @@ impl LinearState {
         Self {
             conv: vec![0.0; conv_len],
             state: vec![0.0; state_len],
+            folded: 0,
+            history: Vec::new(),
         }
     }
 
     fn bytes(&self) -> usize {
-        (self.conv.len() + self.state.len()) * std::mem::size_of::<f32>()
+        let live = self.conv.len() + self.state.len();
+        let kept: usize = self.history.iter().map(|(_, c, s)| c.len() + s.len()).sum();
+        (live + kept) * std::mem::size_of::<f32>()
+    }
+
+    /// Copy the state as it stands, before the next token is folded into it.
+    ///
+    /// Called by the backend once per token while a speculative round is being
+    /// verified. Cheap relative to what it protects — a copy is a memcpy against a
+    /// forward pass that reads the whole model.
+    pub fn snapshot(&mut self) {
+        self.history
+            .push((self.folded, self.conv.clone(), self.state.clone()));
+    }
+
+    /// Account for a token having been folded in.
+    pub fn advance(&mut self) {
+        self.folded += 1;
+    }
+
+    /// Put the state back to what it was after `len` tokens, if a copy from then is
+    /// still held.
+    fn rewind_to(&mut self, len: usize) -> bool {
+        if len == self.folded {
+            self.history.clear();
+            return true;
+        }
+        let Some(at) = self.history.iter().position(|(n, _, _)| *n == len) else {
+            return false;
+        };
+        let (n, conv, state) = self.history.swap_remove(at);
+        self.conv = conv;
+        self.state = state;
+        self.folded = n;
+        self.history.clear();
+        true
     }
 }
 
@@ -654,6 +705,7 @@ impl SeqState {
                 .map(|l| KVCacheState::for_layer(&cfg, seq_id, l))
                 .collect(),
             linear: vec![None; n],
+            recording: false,
         }
     }
 
@@ -693,6 +745,30 @@ impl SeqState {
     /// True when any layer of this sequence carries recurrent state.
     pub fn has_linear_state(&self) -> bool {
         self.linear.iter().any(Option::is_some)
+    }
+
+    /// Start keeping a copy of each recurrent layer's state per token consumed, so
+    /// that this sequence can be put back to any position in the round about to run.
+    ///
+    /// This is what makes speculative decoding possible on a recurrent architecture:
+    /// guesses are appended, checked in one pass, and the rejected ones have to leave
+    /// no trace. The copies are the price — one state per position, and a state does
+    /// not shrink with the sequence — so they are recorded only for the round and
+    /// dropped by [`Self::truncate`] as soon as it is settled.
+    pub fn begin_recording(&mut self) {
+        for s in self.linear.iter_mut().flatten() {
+            s.history.clear();
+        }
+        self.recording = true;
+    }
+
+    pub fn end_recording(&mut self) {
+        self.recording = false;
+    }
+
+    /// Whether the backend should snapshot each recurrent layer as it consumes tokens.
+    pub fn recording(&self) -> bool {
+        self.recording
     }
 
     pub fn n_layers(&self) -> usize {
@@ -774,11 +850,25 @@ impl SeqState {
     /// backend says so up front by answering `false` to
     /// [`InferenceBackend::speculation_supported`](crate::core::InferenceBackend::speculation_supported).
     pub fn truncate(&mut self, len: usize) -> Result<(), GarudaError> {
+        // A recurrent layer is put back from a copy taken on the way in, or not at
+        // all. Checked across every layer before anything is changed, so a refusal
+        // leaves the sequence exactly as it was rather than half rewound.
         if len < self.len() && self.has_linear_state() {
-            return Err(GarudaError::Cache(format!(
-                "cannot truncate to {len}: this sequence carries recurrent state, which \
-                 summarises every token it has read and cannot be rewound"
-            )));
+            let recoverable = self
+                .linear
+                .iter()
+                .flatten()
+                .all(|s| s.folded == len || s.history.iter().any(|(n, _, _)| *n == len));
+            if !recoverable {
+                return Err(GarudaError::Cache(format!(
+                    "cannot truncate to {len}: this sequence carries recurrent state, which \
+                     summarises every token it has read, and no copy of it from that \
+                     position is held"
+                )));
+            }
+        }
+        for s in self.linear.iter_mut().flatten() {
+            s.rewind_to(len);
         }
         for kv in &mut self.kvs {
             kv.truncate(len)?;

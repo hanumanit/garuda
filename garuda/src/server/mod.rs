@@ -86,24 +86,39 @@ impl Engine {
         };
 
         let gguf = Gguf::parse(bytes)?;
-        let draft = LlamaBackend::from_gguf(&gguf, bytes, mmap.clone())?;
-        let dc = draft.config();
-        if dc.vocab != target_vocab {
+
+        // A draft is a whole model, so it may be any architecture this runtime loads —
+        // and for a Qwen3.5 target the natural draft is a smaller Qwen3.5, which is the
+        // only thing that shares its 248 320-token vocabulary.
+        let (draft, kv, layers, vocab, context): (Arc<dyn InferenceBackend>, _, _, _, _) =
+            if gguf.architecture() == Some("qwen35") {
+                let d = Qwen35Backend::from_gguf(&gguf, bytes, mmap.clone())?;
+                let c = d.config();
+                let kv = (c.kv_dim(), c.n_layers, Some(c.kv_dims()));
+                (Arc::new(d), kv, c.n_layers, c.vocab, c.context)
+            } else {
+                let d = LlamaBackend::from_gguf(&gguf, bytes, mmap.clone())?;
+                let c = d.config();
+                let kv = (c.kv_dim(), c.n_layers, None);
+                (Arc::new(d), kv, c.n_layers, c.vocab, c.context)
+            };
+        if vocab != target_vocab {
             anyhow::bail!(
                 "draft checkpoint {} has a {}-token vocabulary but the model has {} — \
                  they must be the same, or a token id means different words to each",
                 path.display(),
-                dc.vocab,
+                vocab,
                 target_vocab
             );
         }
 
+        let (kv_dim, n_layers, kv_dims) = kv;
         let kv = KvConfig {
             dims: draft.dims(),
-            kv_dim: dc.kv_dim(),
-            n_layers: dc.n_layers,
-            kv_dims: None,
-            max_positions: config.model.context.min(dc.context).max(1),
+            kv_dim,
+            n_layers,
+            kv_dims,
+            max_positions: config.model.context.min(context).max(1),
             max_resident_blocks: config.memory.kv_resident_blocks,
             sliding_window: config.sliding_window(),
             // Small and short-lived; spilling it would cost more than it saves.
@@ -111,12 +126,13 @@ impl Engine {
         };
         tracing::info!(
             draft = %path.display(),
-            layers = dc.n_layers,
-            vocab = dc.vocab,
+            architecture = gguf.architecture().unwrap_or("unknown"),
+            layers,
+            vocab,
             checkpoint_mb = bytes.len() / 1_048_576,
             "draft model loaded"
         );
-        Ok((Arc::new(draft), kv))
+        Ok((draft, kv))
     }
 
     /// How many prompt tokens share one pass over a layer's weights.
@@ -179,7 +195,8 @@ impl Engine {
     ) -> anyhow::Result<Self> {
         let tokenizer: Arc<dyn Tokenize> = Arc::new(BpeTokenizer::from_gguf(gguf)?);
         let mmap_for_prefetch = mmap.clone();
-        let backend = Qwen35Backend::from_gguf(gguf, bytes, mmap)?;
+        let pin_budget = config.weight_cache_bytes()?;
+        let backend = Qwen35Backend::from_gguf_pinned(gguf, bytes, mmap, pin_budget)?;
         let qc = backend.config();
         let dims = backend.dims();
         if dims.vocab_size != tokenizer.vocab_size() {
@@ -188,16 +205,6 @@ impl Engine {
                  a sampled id would decode to the wrong word",
                 dims.vocab_size,
                 tokenizer.vocab_size()
-            );
-        }
-
-        if let Some(draft) = config.draft_path() {
-            anyhow::bail!(
-                "model.draft_gguf is set ({}), but this architecture cannot verify \
-                 speculated tokens: its recurrent layers summarise every token they \
-                 read and cannot be rewound when a guess is rejected. Clear the key to \
-                 run this checkpoint.",
-                draft.display()
             );
         }
 
@@ -233,6 +240,7 @@ impl Engine {
             kv_heads = qc.n_kv_heads,
             recurrent_state_mb = qc.linear_state_bytes() / 1_048_576,
             prefetch = prefetch.is_some(),
+            pinned_mb = backend.pinned_bytes() / 1_048_576,
             "qwen3.5: hybrid attention, {} of {} blocks recurrent",
             recurrent,
             qc.n_layers
@@ -281,16 +289,19 @@ impl Engine {
             "chat template"
         );
 
-        let runtime = Arc::new(
-            InferenceRuntime::new(
-                tokenizer,
-                Arc::new(backend),
-                kv,
-                config.memory.prompt_cache_entries,
-                budget,
-            )
-            .with_turn_end(turn_end),
-        );
+        let mut runtime = InferenceRuntime::new(
+            tokenizer,
+            Arc::new(backend),
+            kv,
+            config.memory.prompt_cache_entries,
+            budget,
+        )
+        .with_turn_end(turn_end);
+        if let Some(path) = config.draft_path() {
+            let (drafter, draft_kv) = Self::load_draft(config, &path, dims.vocab_size)?;
+            runtime = runtime.with_drafter(drafter, draft_kv);
+        }
+        let runtime = Arc::new(runtime);
 
         Ok(Self {
             dims,
