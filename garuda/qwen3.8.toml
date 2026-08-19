@@ -86,17 +86,21 @@ port = 8091
 # memory-sensitive, and every token is another pass over 19 GB.
 max_concurrent = 1
 queue_capacity = 16
-# The timeout has to cover the whole reply, and here a token costs ~24 s on a 16 GB
-# machine: sampling.max_tokens below is 32, so the worst case is ~13 minutes and this
-# leaves room for the prompt as well. Raise both together — a max_tokens the timeout
-# cannot reach turns every long reply into "request timed out" after the work is done.
+# The timeout has to cover the whole reply. A token costs ~3-4 s here with prefetch and
+# a draft model (it was ~24 s before either), so max_tokens = 128 below is about ten
+# minutes and this leaves room for the prompt as well. Raise both together — a
+# max_tokens the timeout cannot reach turns every long reply into "request timed out"
+# after the work is already done.
 request_timeout_secs = 1800
 
 [sampling]
 temperature = 0.7
 top_p = 0.95
 top_k = 40
-# ~24 s per token here, so this is about thirteen minutes of generation. It is also
-# what the built-in chat page opens with, since it reads this server's defaults from
-# /v1/stats rather than assuming a number a fast model would want.
-max_tokens = 32
+# ~3-4 s per token with prefetch and a draft model, so this is roughly ten minutes of
+# generation. It is also what the built-in chat page opens with, since it reads this
+# server's defaults from /v1/stats rather than assuming a number a fast model would
+# want. Anything that has to write code wants more: a function with an explanation
+# around it is 300-400 tokens, which is half an hour here — set both this and the
+# timeout above to suit the answer you are asking for.
+max_tokens = 128
