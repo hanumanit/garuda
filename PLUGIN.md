@@ -23,8 +23,8 @@ the [README](README.md#adding-a-plugin). This guide shows how to satisfy them.
 
 | Trait | Job | Built-in implementations |
 |---|---|---|
-| [`core::InferenceBackend`](garuda/src/core/mod.rs) | context → logits | `moe::MoeEngine`, `llama::LlamaBackend` |
-| [`tokenizer::Tokenize`](garuda/src/tokenizer/mod.rs) | text ↔ tokens | `Tokenizer` (byte), `spm::SpmTokenizer` |
+| [`core::InferenceBackend`](garuda/src/core/mod.rs) | context → logits | `moe::MoeEngine`, `llama::LlamaBackend`, `qwen35::Qwen35Backend` |
+| [`tokenizer::Tokenize`](garuda/src/tokenizer/mod.rs) | text ↔ tokens | `Tokenizer` (byte), `spm::SpmTokenizer`, `bpe::BpeTokenizer` |
 | [`core::StorageBackend`](garuda/src/core/mod.rs) | bytes on some medium | `storage::LocalStorageBackend` |
 | [`core::ExpertLoader`](garuda/src/core/mod.rs) | id → expert weights | `memory::MemoryManager`, `prefetch::GgufPagePrefetcher` |
 
@@ -107,11 +107,18 @@ The two invariants that trip people up:
   decode step and calls again. If you reprocess the whole prefix each time, decoding
   is O(n²) *and* you append duplicate positions to the KV cache, corrupting it. Slice
   from `seq.len()`.
-- **Invariant 2 — one KV position per token, per layer.** `seq.len()` reads layer 0
+- **Invariant 2 — one position per token, per layer.** `seq.len()` reads layer 0
   and must speak for every layer, so each new token appends exactly once to each. A
   multi-layer model loops over `seq.layer(l)`; this single-layer toy uses the
   `seq.kv()` shorthand. This is also what keeps `seq.len()` advancing so invariant 1
   works next call.
+
+  A layer with nothing to store still has to count. `qwen35::Qwen35Backend`'s
+  recurrent layers append empty keys and values to a zero-width cache
+  (`KvConfig::kv_dims`) and keep their fixed-size state in `seq.linear(l, …)`, which
+  is part of `seq` and so travels with it into the prompt cache and is charged to its
+  byte budget. State kept anywhere else — in the backend, in a lock — would be shared
+  between sequences that have read different text.
 
 ### Step 3 — `logits`: project to the vocabulary, deterministically
 
@@ -225,7 +232,8 @@ backends' test modules show the pattern; the ones worth copying:
 
 - [ ] `dims()` passes `ModelDims::validate` and its `vocab_size` matches the tokenizer.
 - [ ] `hidden`/`logits` process only `ctx[seq.len()..]`.
-- [ ] Exactly one KV position appended per token, per layer.
+- [ ] Exactly one position appended per token, per layer — including layers that
+      store nothing per position.
 - [ ] `logits` returns a `vocab_size`-length tensor.
 - [ ] Out-of-vocab token, empty context, and context-full all return `Err`, never panic.
 - [ ] Output is deterministic for a fixed context and weights.

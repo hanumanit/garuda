@@ -125,6 +125,12 @@ using a fixed Mixtral-style gate instead (see [Read this first](#read-this-first
 Likewise, GQA and the ×N layer loop are real-checkpoint-only: the synthetic engine
 is a single block with plain multi-head attention.
 
+The diagram draws the Llama-family block. A Qwen3.5-family checkpoint keeps the same
+outline — norm, token mixer, residual, norm, feed-forward, residual — but three blocks
+in four replace the attention node with a gated delta net, which reads and writes a
+fixed-size recurrent state instead of the KV cache; only the fourth block touches the
+cache at all. See [A hybrid checkpoint](#a-hybrid-checkpoint--qwen38-27b).
+
 **Expert streaming** means what it says: a token pulls in only the `top_k` experts
 it routes to, through the tiered cache — not the whole layer. The predictor learns
 a first-order Markov model over which experts actually fire, and the prefetcher
@@ -424,8 +430,8 @@ matter; read the doc comments in the source for the authoritative contract.
 
 | Extension point | Trait | Job | Implementations |
 |---|---|---|---|
-| Compute backend | [`core::InferenceBackend`](garuda/src/core/mod.rs) | context → logits | `moe::MoeEngine`, `llama::LlamaBackend` |
-| Tokenizer | [`tokenizer::Tokenize`](garuda/src/tokenizer/mod.rs) | text ↔ tokens | `Tokenizer` (byte), `spm::SpmTokenizer` |
+| Compute backend | [`core::InferenceBackend`](garuda/src/core/mod.rs) | context → logits | `moe::MoeEngine`, `llama::LlamaBackend`, `qwen35::Qwen35Backend` |
+| Tokenizer | [`tokenizer::Tokenize`](garuda/src/tokenizer/mod.rs) | text ↔ tokens | `Tokenizer` (byte), `spm::SpmTokenizer`, `bpe::BpeTokenizer` |
 | Storage tier | [`core::StorageBackend`](garuda/src/core/mod.rs) | bytes on some medium | `storage::LocalStorageBackend` |
 | Expert source | [`core::ExpertLoader`](garuda/src/core/mod.rs) | id → expert weights | `memory::MemoryManager`, `prefetch::GgufPagePrefetcher` |
 
@@ -441,8 +447,10 @@ does not re-check:
 1. **Consume only unseen positions** — exactly `context[seq.len()..]`. The runtime
    grows `context` by one token per decode step; reprocessing the prefix would make
    decoding O(n²) and double-append to the KV cache.
-2. **Advance every KV layer by one position per new token**, so `seq.len()` stays in
-   lockstep across layers. Store KV state only in `seq.layer(l)`.
+2. **Advance every layer by one position per new token**, so `seq.len()` stays in
+   lockstep across layers. Store per-position state only in `seq.layer(l)`. A layer
+   that stores nothing still counts positions — a hybrid model's recurrent layers
+   append to a zero-width cache and keep their fixed-size state in `seq.linear(l, …)`.
 3. **`dims().vocab_size` must equal the tokenizer's `vocab_size()`**, and `logits`
    must return a tensor of that length. `dims()` must pass `ModelDims::validate`.
 4. **Error, never panic, on bad input** — out-of-vocab token, exhausted context
@@ -452,7 +460,9 @@ does not re-check:
 
 A backend is registered in one place — [`server::Engine::build`](garuda/src/server/mod.rs) —
 and the runtime, scheduler and API depend on the traits, not the implementations, so
-nothing else changes. The Llama backend was added exactly this way.
+nothing else changes. The Llama backend was added exactly this way, and the Qwen3.5
+one after it: `Engine::build` reads the architecture out of the file and picks the
+backend and tokenizer that match.
 
 For a step-by-step walkthrough with a **complete, runnable example** — a custom
 backend built from scratch, satisfying each invariant, wired into the runtime and

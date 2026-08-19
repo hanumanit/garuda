@@ -239,10 +239,16 @@ pub trait ExpertLoader: Send + Sync {
 ///    no more. The runtime calls with a `context` that grows by one token per decode
 ///    step; re-processing the whole prefix each time would make decoding O(n²) and
 ///    corrupt the KV cache by appending duplicate positions.
-/// 2. **Advance every KV layer by one position per new token.** After consuming `k`
-///    new tokens, every layer of `seq` must be exactly `k` positions longer, so
+/// 2. **Advance every layer by one position per new token.** After consuming `k` new
+///    tokens, every layer of `seq` must be exactly `k` positions longer, so
 ///    `seq.len()` (which reads layer 0) stays in lockstep with all layers. Append to
-///    `seq.layer(l)` — do not keep KV state anywhere else.
+///    `seq.layer(l)` — do not keep per-position state anywhere else.
+///
+///    A layer that stores nothing per position still has to count them: a hybrid
+///    model's recurrent layers (see [`crate::qwen35`]) append empty keys and values to
+///    a zero-width cache and keep their fixed-size state in
+///    [`SeqState::linear`](crate::cache::SeqState::linear), which is part of `seq` and
+///    travels with it into the prompt cache.
 /// 3. **`dims()` must agree with the tokenizer.** `dims().vocab_size` must equal the
 ///    paired `Tokenize::vocab_size`, and `logits` must return a tensor of that
 ///    length. `dims()` must satisfy [`ModelDims::validate`].
