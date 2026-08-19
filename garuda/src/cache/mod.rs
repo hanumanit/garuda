@@ -160,6 +160,15 @@ pub struct KvConfig {
     /// Attention layers, each of which gets its own cache. `1` for the single-block
     /// MoE engine; a real model has one per transformer block.
     pub n_layers: usize,
+    /// Per-layer key/value width, for a model whose layers are not all the same.
+    /// `None` gives every layer [`Self::kv_dim`].
+    ///
+    /// A hybrid model — Qwen3.5 alternates three gated-delta-net layers with one
+    /// attention layer — stores no keys or values at all in its recurrent layers,
+    /// which carry a fixed-size state instead (see [`LinearState`]). Those layers get
+    /// a width of `0`: they still count positions, so every layer advances together
+    /// as the backend contract requires, but they hold nothing and cost nothing.
+    pub kv_dims: Option<Vec<usize>>,
     /// Hard cap on sequence length (the context window).
     pub max_positions: usize,
     /// Blocks kept in RAM before spilling begins.
@@ -180,6 +189,7 @@ impl KvConfig {
         Self {
             kv_dim: dims.d_model,
             n_layers: 1,
+            kv_dims: None,
             dims,
             max_positions,
             max_resident_blocks,
@@ -272,8 +282,16 @@ impl KVCacheState {
     }
 
     fn for_layer(cfg: &KvConfig, seq_id: u64, layer: usize) -> Self {
+        // A per-layer width of 0 is deliberate and means "count positions, store
+        // nothing": see `KvConfig::kv_dims`. The uniform width keeps its old floor of
+        // 1, so a caller that leaves `kv_dim` at zero by accident still gets a cache
+        // that holds something.
+        let kv_dim = match &cfg.kv_dims {
+            Some(dims) => dims.get(layer).copied().unwrap_or(cfg.kv_dim),
+            None => cfg.kv_dim.max(1),
+        };
         Self {
-            kv_dim: cfg.kv_dim.max(1),
+            kv_dim,
             block_size: cfg.dims.block_size.max(1),
             resident: BTreeMap::new(),
             spilled: BTreeMap::new(),
@@ -363,6 +381,12 @@ impl KVCacheState {
     ///
     /// `current` is never spilled: it is the block being written to.
     fn enforce_residency(&mut self, current: usize) -> Result<(), GarudaError> {
+        if self.kv_dim == 0 {
+            // A position-only layer (see `KvConfig::kv_dims`) holds no vectors, so its
+            // blocks occupy nothing and spilling them would write empty files and read
+            // them back for no reason.
+            return Ok(());
+        }
         let Some(storage) = self.storage.clone() else {
             // No spill target. Growth is still bounded by `max_positions`.
             return Ok(());
@@ -586,6 +610,40 @@ impl KVCacheState {
 #[derive(Debug, Clone)]
 pub struct SeqState {
     kvs: Vec<KVCacheState>,
+    /// Recurrent state for the layers that have it, indexed like `kvs`. `None` for an
+    /// ordinary attention layer, which keeps its history in `kvs` instead.
+    linear: Vec<Option<LinearState>>,
+}
+
+/// What a linear-attention layer carries between tokens, instead of a growing cache
+/// of keys and values.
+///
+/// A gated delta net summarises everything it has read into two fixed-size buffers,
+/// so this costs the same whether the sequence is ten tokens long or a hundred
+/// thousand — which is the point of the architecture. It is also why a linear layer
+/// cannot be rewound: the state is a summary, not a log, and dropping the last few
+/// positions from it is not an operation. See [`SeqState::truncate`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinearState {
+    /// The `kernel - 1` most recent inputs to the depthwise causal convolution,
+    /// oldest first, `conv_dim` values each.
+    pub conv: Vec<f32>,
+    /// The recurrent matrix state: one `key_head_dim * value_head_dim` matrix per
+    /// value head.
+    pub state: Vec<f32>,
+}
+
+impl LinearState {
+    fn zeros(conv_len: usize, state_len: usize) -> Self {
+        Self {
+            conv: vec![0.0; conv_len],
+            state: vec![0.0; state_len],
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        (self.conv.len() + self.state.len()) * std::mem::size_of::<f32>()
+    }
 }
 
 impl SeqState {
@@ -595,7 +653,46 @@ impl SeqState {
             kvs: (0..n)
                 .map(|l| KVCacheState::for_layer(&cfg, seq_id, l))
                 .collect(),
+            linear: vec![None; n],
         }
+    }
+
+    /// This layer's recurrent state, allocated zeroed on first use.
+    ///
+    /// The backend owns the shapes, so it passes them in rather than the cache
+    /// guessing: `conv_len` is `conv_dim * (kernel - 1)` and `state_len` is
+    /// `n_heads * key_head_dim * value_head_dim`. Asking for a different shape than
+    /// the state already has is a backend bug and an error, not a silent reallocation
+    /// that would throw away everything the sequence has read.
+    pub fn linear(
+        &mut self,
+        l: usize,
+        conv_len: usize,
+        state_len: usize,
+    ) -> Result<&mut LinearState, GarudaError> {
+        if l >= self.linear.len() {
+            return Err(GarudaError::Cache(format!(
+                "layer {l} is out of range for a {}-layer sequence",
+                self.linear.len()
+            )));
+        }
+        match &self.linear[l] {
+            Some(s) if s.conv.len() != conv_len || s.state.len() != state_len => {
+                return Err(GarudaError::Cache(format!(
+                    "layer {l} holds a {}/{} recurrent state but {conv_len}/{state_len} was asked for",
+                    s.conv.len(),
+                    s.state.len()
+                )));
+            }
+            Some(_) => {}
+            None => self.linear[l] = Some(LinearState::zeros(conv_len, state_len)),
+        }
+        Ok(self.linear[l].as_mut().expect("just populated"))
+    }
+
+    /// True when any layer of this sequence carries recurrent state.
+    pub fn has_linear_state(&self) -> bool {
+        self.linear.iter().any(Option::is_some)
     }
 
     pub fn n_layers(&self) -> usize {
@@ -636,8 +733,18 @@ impl SeqState {
     }
 
     /// Bytes this sequence's attention state occupies in RAM, across every layer.
+    ///
+    /// Recurrent state counts: it is the larger half for a hybrid model — a Qwen3.5
+    /// 27B sequence carries ~144 MB of it regardless of length — and the prompt cache
+    /// budgets by this number.
     pub fn resident_bytes(&self) -> usize {
-        self.kvs.iter().map(KVCacheState::resident_bytes).sum()
+        let kv: usize = self.kvs.iter().map(KVCacheState::resident_bytes).sum();
+        let linear: usize = self
+            .linear
+            .iter()
+            .filter_map(|s| s.as_ref().map(LinearState::bytes))
+            .sum();
+        kv + linear
     }
 
     /// Give every layer a fresh sequence identity. Fails if anything is spilled.
@@ -656,7 +763,23 @@ impl SeqState {
 
     /// Drop every position at or after `len`, in every layer. See
     /// [`KVCacheState::truncate`].
+    /// Drop every position at or after `len`, across every layer.
+    ///
+    /// Refused outright for a sequence carrying recurrent state. A gated delta net
+    /// folds each token into a fixed-size summary, and there is no arithmetic that
+    /// takes the last few tokens back out of it — the only honest rewind is to replay
+    /// the sequence from a saved state. Returning an error here is what keeps
+    /// speculative decoding (the one caller that rewinds) from silently continuing
+    /// with a state that describes tokens the caller has thrown away; a hybrid
+    /// backend says so up front by answering `false` to
+    /// [`InferenceBackend::speculation_supported`](crate::core::InferenceBackend::speculation_supported).
     pub fn truncate(&mut self, len: usize) -> Result<(), GarudaError> {
+        if len < self.len() && self.has_linear_state() {
+            return Err(GarudaError::Cache(format!(
+                "cannot truncate to {len}: this sequence carries recurrent state, which \
+                 summarises every token it has read and cannot be rewound"
+            )));
+        }
         for kv in &mut self.kvs {
             kv.truncate(len)?;
         }

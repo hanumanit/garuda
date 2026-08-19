@@ -45,6 +45,17 @@ pub enum ChatFormat {
     Zephyr,
     /// `<|im_start|>user\n…<|im_end|>\n` — ChatML, as Qwen and OpenHermes use it.
     ChatMl,
+    /// ChatML, plus the `<think>` block the Qwen3.5 family's template opens for the
+    /// assistant. Two variants, because the template has two: [`Self::Qwen35`] closes
+    /// the block immediately (`enable_thinking = false`), so a reply is the answer and
+    /// nothing else, and [`Self::Qwen35Thinking`] leaves it open, which is the
+    /// template's own default and puts the model's reasoning in front of the answer.
+    ///
+    /// Closing it is the default here because this server has nowhere else to put
+    /// reasoning: it would arrive as ordinary content, and on a 256-token budget the
+    /// answer might never arrive at all. `model.thinking = true` switches it back.
+    Qwen35,
+    Qwen35Thinking,
     /// `[INST] … [/INST]` — Mistral and Mixtral.
     Mistral,
     /// `<|start_header_id|>user<|end_header_id|>\n\n…<|eot_id|>` — Llama 3.
@@ -61,10 +72,25 @@ impl ChatFormat {
     pub fn detect(template: Option<&str>) -> Self {
         match template {
             Some(t) if t.contains("<|start_header_id|>") => Self::Llama3,
+            // A Qwen3.5 template is ChatML that also opens a reasoning block. Checked
+            // first, because it contains `<|im_start|>` too.
+            Some(t) if t.contains("<|im_start|>") && t.contains("<think>") => Self::Qwen35,
             Some(t) if t.contains("<|im_start|>") => Self::ChatMl,
             Some(t) if t.contains("<|assistant|>") => Self::Zephyr,
             Some(t) if t.contains("[INST]") => Self::Mistral,
             _ => Self::Plain,
+        }
+    }
+
+    /// The reasoning variant of this format, for a family that has one.
+    ///
+    /// Only the Qwen3.5 family does; every other format ignores the request rather
+    /// than inventing markup its checkpoint never saw.
+    pub fn with_thinking(self, on: bool) -> Self {
+        match (self, on) {
+            (Self::Qwen35 | Self::Qwen35Thinking, true) => Self::Qwen35Thinking,
+            (Self::Qwen35 | Self::Qwen35Thinking, false) => Self::Qwen35,
+            (other, _) => other,
         }
     }
 
@@ -74,6 +100,8 @@ impl ChatFormat {
             Self::Plain => "plain",
             Self::Zephyr => "zephyr",
             Self::ChatMl => "chatml",
+            Self::Qwen35 => "qwen3.5 (thinking off)",
+            Self::Qwen35Thinking => "qwen3.5 (thinking on)",
             Self::Mistral => "mistral",
             Self::Llama3 => "llama3",
         }
@@ -86,39 +114,79 @@ impl ChatFormat {
     /// runtime asks for this so it can stop on either.
     pub fn turn_end(&self) -> Option<&'static str> {
         match self {
-            Self::ChatMl => Some("<|im_end|>"),
+            Self::ChatMl | Self::Qwen35 | Self::Qwen35Thinking => Some("<|im_end|>"),
             Self::Llama3 => Some("<|eot_id|>"),
             Self::Plain | Self::Zephyr | Self::Mistral => None,
         }
     }
 
-    /// What precedes a turn's content.
-    fn turn_prefix(&self, role: &str) -> String {
+    /// What precedes a turn's content, split into the markers a vocabulary may hold as
+    /// single entries and the text around them.
+    ///
+    /// The split is the point. `<|im_start|>` is one token in Qwen's vocabulary, and
+    /// encoding it as the six characters it is written with produces a prompt that
+    /// merely *looks* like the format the checkpoint was trained on — the model reads
+    /// `<`, `|`, `im`, `_start` where it expects a single marker. [`encode_chat`]
+    /// resolves each [`Piece::Marker`] against the vocabulary and falls back to text
+    /// only when the entry is genuinely absent.
+    fn prefix_pieces(&self, role: &str) -> Vec<Piece> {
         match self {
-            Self::Zephyr => format!("<|{role}|>\n"),
-            Self::ChatMl => format!("<|im_start|>{role}\n"),
-            Self::Llama3 => format!("<|start_header_id|>{role}<|end_header_id|>\n\n"),
-            Self::Plain | Self::Mistral => String::new(),
+            Self::Zephyr => vec![Piece::marker(format!("<|{role}|>")), Piece::text("\n")],
+            Self::ChatMl | Self::Qwen35 | Self::Qwen35Thinking => {
+                vec![
+                    Piece::marker("<|im_start|>"),
+                    Piece::text(format!("{role}\n")),
+                ]
+            }
+            Self::Llama3 => vec![
+                Piece::marker("<|start_header_id|>"),
+                Piece::text(role),
+                Piece::marker("<|end_header_id|>"),
+                Piece::text("\n\n"),
+            ],
+            Self::Plain | Self::Mistral => Vec::new(),
         }
     }
 
     /// What sits between one turn's end marker and the next turn's prefix.
     fn separator(&self) -> &'static str {
         match self {
-            Self::Zephyr | Self::ChatMl => "\n",
+            Self::Zephyr | Self::ChatMl | Self::Qwen35 | Self::Qwen35Thinking => "\n",
             Self::Plain | Self::Mistral | Self::Llama3 => "",
         }
     }
 
     /// The cue that tells the model it is the assistant's turn to speak.
-    fn generation(&self) -> String {
+    fn generation_pieces(&self) -> Vec<Piece> {
         match self {
-            Self::Zephyr => "<|assistant|>\n".into(),
-            Self::ChatMl => "<|im_start|>assistant\n".into(),
-            Self::Llama3 => "<|start_header_id|>assistant<|end_header_id|>\n\n".into(),
+            Self::Zephyr => vec![Piece::marker("<|assistant|>"), Piece::text("\n")],
+            Self::ChatMl => vec![Piece::marker("<|im_start|>"), Piece::text("assistant\n")],
+            // The checkpoint was trained with a reasoning block here, so one goes
+            // here: closed and empty, or left open for the model to fill. `<think>` is
+            // its own vocabulary entry, so it is placed as one.
+            Self::Qwen35 => vec![
+                Piece::marker("<|im_start|>"),
+                Piece::text("assistant\n"),
+                Piece::marker("<think>"),
+                Piece::text("\n\n"),
+                Piece::marker("</think>"),
+                Piece::text("\n\n"),
+            ],
+            Self::Qwen35Thinking => vec![
+                Piece::marker("<|im_start|>"),
+                Piece::text("assistant\n"),
+                Piece::marker("<think>"),
+                Piece::text("\n"),
+            ],
+            Self::Llama3 => vec![
+                Piece::marker("<|start_header_id|>"),
+                Piece::text("assistant"),
+                Piece::marker("<|end_header_id|>"),
+                Piece::text("\n\n"),
+            ],
             // Mistral's `[/INST]` is both the end of the user's turn and the cue for
             // the assistant's, so there is nothing left to add.
-            Self::Plain | Self::Mistral => String::new(),
+            Self::Plain | Self::Mistral => Vec::new(),
         }
     }
 }
@@ -127,6 +195,41 @@ impl ChatFormat {
 enum Seg {
     Text(String),
     Control(Token),
+}
+
+/// One item of a format's markup, before a vocabulary has been consulted.
+///
+/// A `Marker` is markup the checkpoint may hold as a single vocabulary entry —
+/// `<|im_start|>`, `<|eot_id|>`, `<think>`. A `Text` piece is ordinary content that is
+/// always merged as text.
+enum Piece {
+    Marker(String),
+    Text(String),
+}
+
+impl Piece {
+    fn marker(s: impl Into<String>) -> Self {
+        Self::Marker(s.into())
+    }
+    fn text(s: impl Into<String>) -> Self {
+        Self::Text(s.into())
+    }
+
+    /// Resolve against a vocabulary: a marker it holds becomes that id, a marker it
+    /// does not becomes the text it is written with.
+    ///
+    /// The fallback is what keeps a checkpoint whose vocabulary has no such entry
+    /// working exactly as before — many SentencePiece vocabularies spell their turn
+    /// markers out of ordinary pieces, and there is nothing else to place.
+    fn resolve(self, tk: &dyn Tokenize) -> Seg {
+        match self {
+            Self::Marker(m) => match tk.token_id(&m) {
+                Some(id) => Seg::Control(id),
+                None => Seg::Text(m),
+            },
+            Self::Text(t) => Seg::Text(t),
+        }
+    }
 }
 
 /// Turns into the exact token sequence `fmt` calls for.
@@ -156,28 +259,31 @@ pub fn encode_chat<'a>(
         _ => {
             let mut segs = Vec::new();
             for (role, content) in turns {
-                segs.push(Seg::Text(format!("{}{content}", fmt.turn_prefix(role))));
+                segs.extend(fmt.prefix_pieces(role).into_iter().map(|p| p.resolve(tk)));
+                segs.push(Seg::Text(content.to_owned()));
                 segs.push(Seg::Control(end));
+                segs.push(Seg::Text(fmt.separator().to_owned()));
             }
-            segs.push(Seg::Text(fmt.generation()));
+            segs.extend(fmt.generation_pieces().into_iter().map(|p| p.resolve(tk)));
             segs
         }
     };
 
     let mut out = Vec::new();
     let mut first = true;
-    let mut pending_sep = false;
     for seg in segs {
         match seg {
             Seg::Control(t) => {
-                out.push(t);
-                pending_sep = true;
-            }
-            Seg::Text(mut t) => {
-                if pending_sep {
-                    t.insert_str(0, fmt.separator());
-                    pending_sep = false;
+                // A prompt that opens with a marker still opens with whatever leading
+                // token the checkpoint asks for — `encode("")` is exactly that and
+                // nothing else, and it is empty for a vocabulary that asks for none.
+                if first {
+                    out.extend(tk.encode(""));
+                    first = false;
                 }
+                out.push(t);
+            }
+            Seg::Text(t) => {
                 if t.is_empty() {
                     continue;
                 }
@@ -273,9 +379,15 @@ mod tests {
     impl Stub {
         fn new() -> Self {
             Self {
-                specials: [("<|im_end|>".to_owned(), 50), ("<|eot_id|>".to_owned(), 51)]
-                    .into_iter()
-                    .collect(),
+                specials: [
+                    ("<|im_end|>".to_owned(), 50),
+                    ("<|eot_id|>".to_owned(), 51),
+                    ("<|im_start|>".to_owned(), 52),
+                    ("<think>".to_owned(), 53),
+                    ("</think>".to_owned(), 54),
+                ]
+                .into_iter()
+                .collect(),
                 add_bos: true,
             }
         }
@@ -330,6 +442,75 @@ mod tests {
             ChatFormat::detect(Some("no markers here")),
             ChatFormat::Plain
         );
+    }
+
+    /// A Qwen3.5 prompt: every marker its vocabulary holds is placed as that id, and
+    /// the reasoning block the template opens is opened here too.
+    #[test]
+    fn a_qwen35_prompt_places_its_markers_as_vocabulary_entries() {
+        let tk = Stub::new();
+        let ids = encode_chat(ChatFormat::Qwen35, &tk, [("user", "hi")]);
+
+        // Markers are ids, not text: the stub decodes only text, so what is left is
+        // the role name, the content and the newlines around them.
+        assert_eq!(
+            tk.decode(&ids).unwrap(),
+            "user\nhi\nassistant\n\n\n\n\n",
+            "role, content, the separator after the turn, then the reply cue and its \
+             empty reasoning block"
+        );
+        assert_eq!(
+            ids.iter().filter(|&&t| t == 52).count(),
+            2,
+            "one <|im_start|> for the turn and one for the reply"
+        );
+        assert_eq!(
+            ids.iter().filter(|&&t| t == 50).count(),
+            1,
+            "one <|im_end|>"
+        );
+        assert_eq!(ids.iter().filter(|&&t| t == 53).count(), 1, "<think> opens");
+        assert_eq!(
+            ids.iter().filter(|&&t| t == 54).count(),
+            1,
+            "and closes again, which is thinking off"
+        );
+        assert!(
+            ids.iter().position(|&t| t == 53) < ids.iter().position(|&t| t == 54),
+            "the block opens before it closes"
+        );
+
+        // Thinking on leaves the block open for the model to fill.
+        let thinking = encode_chat(ChatFormat::Qwen35Thinking, &tk, [("user", "hi")]);
+        assert_eq!(thinking.iter().filter(|&&t| t == 53).count(), 1);
+        assert_eq!(
+            thinking.iter().filter(|&&t| t == 54).count(),
+            0,
+            "an open block is what makes the model reason"
+        );
+        assert_eq!(
+            ChatFormat::Qwen35.with_thinking(true),
+            ChatFormat::Qwen35Thinking
+        );
+        assert_eq!(
+            ChatFormat::ChatMl.with_thinking(true),
+            ChatFormat::ChatMl,
+            "a format with no reasoning block is left alone"
+        );
+    }
+
+    /// A Qwen3.5 template is ChatML plus a reasoning block, and must not be mistaken
+    /// for plain ChatML — the checkpoint expects the block.
+    #[test]
+    fn a_qwen35_template_is_told_apart_from_chatml() {
+        let qwen = "{%- if add_generation_prompt %}{{- '<|im_start|>assistant\\n' }}\
+            {%- if enable_thinking is defined and enable_thinking is false %}\
+            {{- '<think>\\n\\n</think>\\n\\n' }}{%- else %}{{- '<think>\\n' }}{%- endif %}{%- endif %}";
+        assert_eq!(ChatFormat::detect(Some(qwen)), ChatFormat::Qwen35);
+
+        let hermes = "{% for message in messages %}{{'<|im_start|>' + message['role'] + \
+            '\\n' + message['content'] + '<|im_end|>' + '\\n'}}{% endfor %}";
+        assert_eq!(ChatFormat::detect(Some(hermes)), ChatFormat::ChatMl);
     }
 
     #[test]

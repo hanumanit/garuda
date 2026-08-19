@@ -56,6 +56,16 @@ pub struct ModelConfig {
     /// passes over the weights. `0` disables it. Only applies to greedy requests
     /// (`temperature = 0`) — see `runtime::InferenceRuntime::next_tokens_speculative`.
     pub speculative_lookahead: usize,
+    /// Let a reasoning checkpoint reason.
+    ///
+    /// Only reaches the Qwen3.5 family, whose chat template opens a `<think>` block
+    /// for the assistant. `false` (the default) closes that block immediately — the
+    /// template's own `enable_thinking = false` — so a reply is the answer and nothing
+    /// else. `true` leaves it open, which is what the checkpoint does by default: the
+    /// reasoning then arrives as ordinary content ahead of the answer, and
+    /// `sampling.max_tokens` has to be large enough for both. Other checkpoints ignore
+    /// this rather than being handed markup they never saw.
+    pub thinking: bool,
     /// There is no GPU backend. `true` is rejected at startup rather than ignored.
     pub gpu: bool,
 }
@@ -75,6 +85,7 @@ impl Default for ModelConfig {
             draft_gguf: String::new(),
             draft_mmap: true,
             speculative_lookahead: 4,
+            thinking: false,
             gpu: false,
         }
     }

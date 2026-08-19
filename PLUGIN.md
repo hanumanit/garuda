@@ -63,8 +63,12 @@ impl ToyBackend {
 }
 ```
 
-`dims()` must pass `ModelDims::validate`: `n_heads * head_dim == d_model` and
-`top_k` in `1..=n_experts`. **`vocab_size` must equal the paired tokenizer's
+`dims()` must pass `ModelDims::validate`: `n_heads * head_dim` has to **cover**
+`d_model` and `top_k` has to be in `1..=n_experts`. Heads wider than the residual
+stream are allowed because some architectures use them — Qwen3.5 projects 24 heads of
+256 dimensions out of a 5120-wide stream and narrows the concatenation back down in
+the output projection. A backend that slices `d_model` into its heads instead, as the
+synthetic attention does, needs exact equality and has to check for it itself. **`vocab_size` must equal the paired tokenizer's
 `vocab_size()`** — the sampler draws indices in `0..vocab_size`, and the tokenizer
 has to be able to decode every one of them.
 

@@ -46,8 +46,10 @@ the streaming, the cancellation, the load shedding.
 
 | | Status |
 |---|---|
-| Load & run a real model from GGUF (Llama; F32/F16/Q4_0/Q8_0/Q2_K–Q6_K) | Real, tested |
+| Load & run a real model from GGUF (Llama and Qwen3.5-family; F32/F16/Q4_0/Q8_0/Q2_K–Q6_K) | Real, tested |
+| **Qwen3.5-family hybrid architecture** — `qwen35`, which covers **Qwen3.8-27B**, Qwen3.6-27B, Qwen3.5-0.8B…27B | Real, tested — three blocks in four are a **gated delta net** (linear attention with a fixed-size recurrent state) and the fourth is grouped-query attention with a per-head output gate, per-head query/key norms and quarter-width rotation. Verified end to end against a real checkpoint: greedy completion, a chat turn through the checkpoint's own template, and the served API |
 | SentencePiece tokenizer from GGUF | Real, tested |
+| Byte-level BPE tokenizer from GGUF (`gpt2` vocabularies, as Qwen ships them) | Real, tested — the Qwen pre-tokenizer's split is implemented by hand, with no regex dependency; round-trips English, code, Thai, Chinese and emoji through a real 248 320-entry vocabulary |
 | Transformer forward pass — dense **and** mixture-of-experts (top-k routing) | Real, tested |
 | Tiered expert storage (L1 RAM → L2 disk → L3 archive) | Real, tested |
 | Paged KV cache with disk spill (multi-layer, GQA-aware) | Real, tested — pair spilling with `sliding_window`; under full attention every step reads the whole prefix, so a spilled block is reloaded the moment it is written. Garuda warns at startup when the configuration would do that |
@@ -66,10 +68,11 @@ the streaming, the cancellation, the load shedding.
 | API key authentication (`Authorization: Bearer` or `x-api-key`) | Real, tested — off by default; set `server.api_keys` to require one. WebSockets may present it as a subprotocol, since browsers cannot set handshake headers |
 | **GPU backend** | **Not implemented** (`gpu = true` is a startup error) |
 
-The real model runs as a **plugin**: `llama::LlamaBackend` implements the same
-`core::InferenceBackend` trait as the synthetic MoE, and `SpmTokenizer` implements
-the same `Tokenize` trait as the byte-level one. Selecting a checkpoint swaps both
-behind those traits; the scheduler and API never learn which is running.
+The real model runs as a **plugin**: `llama::LlamaBackend` and `qwen35::Qwen35Backend`
+implement the same `core::InferenceBackend` trait as the synthetic MoE, and
+`SpmTokenizer` and `BpeTokenizer` implement the same `Tokenize` trait as the byte-level
+one. Loading a checkpoint reads its architecture and vocabulary out of the file and
+swaps in the pair that matches; the scheduler and API never learn which is running.
 
 ---
 
@@ -215,6 +218,89 @@ model's at startup rather than assumed:
 [model]
 draft_gguf = "/path/to/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
 ```
+
+### A hybrid checkpoint — Qwen3.8-27B
+
+[`garuda/qwen3.8.toml`](garuda/qwen3.8.toml) runs `Qwen3.8-27B` in Q4_K_M (~19 GB)
+from a memory-mapped file. It is a different shape of model from Mixtral, and the
+config reflects that: no experts to stream, but three quarters of its 64 blocks are
+**gated delta nets** — linear attention that folds the sequence into a fixed-size
+recurrent state instead of a growing cache of keys and values.
+
+```bash
+cd garuda
+
+# ~19 GB. The BF16 and Q8_0 quantisations in the same repository also load.
+curl -L https://huggingface.co/ggml-org/Qwen3.8-27B-GGUF/resolve/main/Qwen3.8-27B-Q4_K_M.gguf \
+  -o Qwen3.8-27B-Q4_K_M.gguf
+
+# Reports the hybrid split, and whether the file bundles prediction blocks
+cargo run --release -- inspect Qwen3.8-27B-Q4_K_M.gguf
+
+# Edit qwen3.8.toml: model.gguf ships as a "/path/to/…" placeholder
+cargo run --release -- --config qwen3.8.toml serve   # port 8091
+```
+
+What that buys, and what it costs:
+
+- **The KV cache is a quarter the size** of an all-attention model of the same
+  shape. Only the 16 attention blocks store keys and values; the 48 recurrent
+  blocks store nothing per position. They still *count* positions, because the
+  runtime requires every layer of a sequence to advance together.
+- **A sequence carries ~144 MB of recurrent state** regardless of its length — the
+  same at ten tokens as at a hundred thousand. That is charged to the prompt cache's
+  byte budget, so `memory.prompt_cache` has to exceed it before a prompt can be
+  cached at all; Garuda warns at startup when it does not.
+- **Speculative decoding is off** for this architecture, and says so rather than
+  guessing wrong. Verifying guesses means being able to discard the rejected ones,
+  and a recurrent state that summarises every token it has read cannot be rewound.
+  `model.draft_gguf` is a startup error here, not a silently ignored key.
+- **Vision is not supported.** Qwen3.8-27B is a vision-language model; its image
+  tower ships as a separate `mmproj-*.gguf` and there is no image input path here.
+  The text half is complete.
+
+On a 16 GB machine a forward pass over this checkpoint takes **~24 s** — every token
+is another pass over 19 GB of memory-mapped weights, and unlike Mixtral there are no
+experts to skip: a dense 27B touches all of it. Budget accordingly, and use
+
+```bash
+cargo run --release --example qwen35_probe -- Qwen3.8-27B-Q4_K_M.gguf "The capital of France is"
+```
+
+to ask a question a single pass answers — the most likely next tokens, with their
+scores — rather than waiting on a dozen decode steps to find out.
+
+Its chat template opens a `<think>` block for the assistant. Garuda closes it
+immediately by default — `enable_thinking = false` in the template's own terms — so a
+reply is the answer and nothing else:
+
+```bash
+curl -s localhost:8091/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"messages":[{"role":"user","content":"What is the capital of Thailand?"}],"max_tokens":40}'
+```
+
+Set `model.thinking = true` to leave the block open, which is what the checkpoint does
+by default. The reasoning then arrives as ordinary content ahead of the answer, so
+raise `sampling.max_tokens` to cover both.
+
+The same architecture at a size that fits comfortably in RAM is the quickest way to
+see it work — `Qwen3.5-0.8B` is 24 blocks of the identical arithmetic:
+
+```bash
+curl -L https://huggingface.co/ggml-org/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q8_0.gguf \
+  -o Qwen3.5-0.8B-Q8_0.gguf
+```
+
+That checkpoint is also what the repository's own real-weights tests run against:
+
+```bash
+GARUDA_QWEN35_GGUF=Qwen3.5-0.8B-Q8_0.gguf \
+  cargo test --release --test qwen35_real -- --nocapture
+```
+
+Without that variable those tests skip, so `cargo test` stays runnable on a machine
+with no checkpoint on it.
 
 For prerequisites, installing onto your PATH, running a real model, and
 troubleshooting, see [INSTALL.md](INSTALL.md).
@@ -376,12 +462,18 @@ registered in `Engine::build` — see **[PLUGIN.md](PLUGIN.md)** and
 
 ### What is still missing
 
-- **Architectures beyond Llama, and the remaining quant formats.** Every type that
-  decodes today has an integer kernel. What is missing is decoders: the `*_1` linear
-  quants (`Q4_1`, `Q5_1`) and the IQ imatrix quants have none, so those checkpoints
-  are refused rather than run.
-- **Architectures beyond Llama.** `LlamaBackend` covers the Llama family (dense and
-  MoE, GQA). Other architectures each need their own `InferenceBackend`.
+- **The remaining quant formats.** Every type that decodes today has an integer
+  kernel. What is missing is decoders: the `*_1` linear quants (`Q4_1`, `Q5_1`) and the
+  IQ imatrix quants have none, so those checkpoints are refused rather than run.
+- **Architectures beyond Llama and Qwen3.5.** `LlamaBackend` covers the Llama family
+  (dense and MoE, GQA) and `Qwen35Backend` the dense Qwen3.5 hybrids. The
+  mixture-of-experts sibling `qwen35moe` (Qwen3.5/3.6-35B-A3B) is refused by name
+  rather than half-run, and every other architecture needs its own
+  `InferenceBackend`.
+- **Anything but text on a Qwen3.5 checkpoint.** These are vision-language models, and
+  the image tower ships as a separate `mmproj` file this runtime has no input path
+  for; their multi-token-prediction block ships separately too (or bundled and unused).
+  Text in, text out is what runs.
 - **A draft model chosen for the target automatically.** `model.draft_gguf` has to be
   pointed at a vocabulary-compatible checkpoint by hand, and getting it wrong is a
   startup error rather than something the runtime can resolve.

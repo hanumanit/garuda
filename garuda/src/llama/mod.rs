@@ -37,7 +37,10 @@ pub const DEFAULT_PREFILL_CHUNK: usize = 256;
 /// `Full` is fast (dequantised once at load) but holds the whole `f32` matrix; `Packed`
 /// trades speed for memory — the model occupies its on-disk (quantised) size, so a
 /// checkpoint far larger than RAM can run via demand paging.
-enum Weight {
+///
+/// Shared with [`crate::qwen35`], which loads a different architecture out of the same
+/// file format and wants the same choice between the two.
+pub(crate) enum Weight {
     Full {
         data: Vec<f32>,
         cols: usize,
@@ -52,7 +55,7 @@ enum Weight {
 
 impl Weight {
     /// `out[r] = dot(row r, x)` over the whole matrix.
-    fn matvec(&self, x: &[f32], out: &mut [f32]) -> Result<(), GarudaError> {
+    pub(crate) fn matvec(&self, x: &[f32], out: &mut [f32]) -> Result<(), GarudaError> {
         self.matvec_rows(0, x, out)
     }
 
@@ -82,7 +85,7 @@ impl Weight {
 
     /// `out[b*n + i] = dot(row (row_start + i), xs[b])` over `n` vectors at once,
     /// where `n = xs.len() / cols`. The batched twin of [`Self::matvec_rows`].
-    fn matmul_rows(
+    pub(crate) fn matmul_rows(
         &self,
         row_start: usize,
         xs: &[f32],
@@ -118,7 +121,7 @@ impl Weight {
     }
 
     /// Dequantise a single row (e.g. one embedding).
-    fn row(&self, r: usize) -> Result<Vec<f32>, GarudaError> {
+    pub(crate) fn row(&self, r: usize) -> Result<Vec<f32>, GarudaError> {
         match self {
             Weight::Full { data, cols } => Ok(data[r * cols..(r + 1) * cols].to_vec()),
             Weight::Packed {
@@ -214,6 +217,71 @@ impl KvTargets<'_, '_> {
     }
 }
 
+/// A small f32 tensor — a norm weight or a bias — expanded whatever the file holds.
+///
+/// These are tiny and read on every token, so there is nothing to gain from keeping
+/// them packed and a per-row dequantisation to lose.
+pub(crate) fn load_norm(
+    g: &Gguf,
+    bytes: &[u8],
+    name: &str,
+    n: usize,
+) -> Result<Vec<f32>, GarudaError> {
+    let data = g.tensor_f32(bytes, name)?;
+    if data.len() != n {
+        return Err(GarudaError::Model(format!(
+            "tensor '{name}' has {} values, expected {n}",
+            data.len()
+        )));
+    }
+    Ok(data)
+}
+
+/// A `rows x cols` weight matrix from a GGUF file: packed in the memory map when
+/// `mmap` is `Some`, expanded to `f32` in RAM when it is `None`.
+///
+/// Shared by every architecture this crate loads — see [`Weight`].
+pub(crate) fn load_weight(
+    g: &Gguf,
+    bytes: &[u8],
+    mmap: &Option<Arc<Mmap>>,
+    name: &str,
+    rows: usize,
+    cols: usize,
+) -> Result<Weight, GarudaError> {
+    let t = g
+        .tensor(name)
+        .ok_or_else(|| GarudaError::Model(format!("tensor '{name}' not found")))?;
+    if t.n_elements() as usize != rows * cols {
+        return Err(GarudaError::Model(format!(
+            "tensor '{name}' has {} elements, expected {}",
+            t.n_elements(),
+            rows * cols
+        )));
+    }
+    match mmap {
+        Some(src) => {
+            let len = quant::byte_size(t.ggml_type, rows * cols)?;
+            let start = g.data_offset + t.offset as usize;
+            if start + len > src.len() {
+                return Err(GarudaError::Model(format!(
+                    "tensor '{name}' runs past the end of the file"
+                )));
+            }
+            Ok(Weight::Packed {
+                qtype: t.ggml_type,
+                cols,
+                src: src.clone(),
+                start,
+            })
+        }
+        None => Ok(Weight::Full {
+            data: g.tensor_f32(bytes, name)?,
+            cols,
+        }),
+    }
+}
+
 /// The three matrices a SwiGLU expert is made of. They are always used together, and
 /// always for the same expert index, so they travel as one.
 #[derive(Clone, Copy)]
@@ -246,7 +314,7 @@ impl LlamaConfig {
     fn from_gguf(g: &Gguf) -> Result<Self, GarudaError> {
         if g.architecture() != Some("llama") {
             return Err(GarudaError::Model(format!(
-                "architecture '{}' is not supported (only llama)",
+                "architecture '{}' is not supported (this runtime loads llama and qwen35)",
                 g.architecture().unwrap_or("unknown")
             )));
         }
@@ -385,51 +453,11 @@ impl LlamaBackend {
         let (d, f, v, hk) = (cfg.d_model, cfg.d_ff, cfg.vocab, cfg.kv_dim());
 
         // A small f32 tensor (norm), always expanded.
-        let norm = |name: &str, n: usize| -> Result<Vec<f32>, GarudaError> {
-            let data = g.tensor_f32(bytes, name)?;
-            if data.len() != n {
-                return Err(GarudaError::Model(format!(
-                    "tensor '{name}' has {} values, expected {n}",
-                    data.len()
-                )));
-            }
-            Ok(data)
-        };
+        let norm = |name: &str, n: usize| load_norm(g, bytes, name, n);
 
         // A weight matrix: packed if mmapping, otherwise expanded to f32.
-        let weight = |name: &str, rows: usize, cols: usize| -> Result<Weight, GarudaError> {
-            let t = g
-                .tensor(name)
-                .ok_or_else(|| GarudaError::Model(format!("tensor '{name}' not found")))?;
-            if t.n_elements() as usize != rows * cols {
-                return Err(GarudaError::Model(format!(
-                    "tensor '{name}' has {} elements, expected {}",
-                    t.n_elements(),
-                    rows * cols
-                )));
-            }
-            match &mmap {
-                Some(src) => {
-                    let len = quant::byte_size(t.ggml_type, rows * cols)?;
-                    let start = g.data_offset + t.offset as usize;
-                    if start + len > src.len() {
-                        return Err(GarudaError::Model(format!(
-                            "tensor '{name}' runs past the end of the file"
-                        )));
-                    }
-                    Ok(Weight::Packed {
-                        qtype: t.ggml_type,
-                        cols,
-                        src: src.clone(),
-                        start,
-                    })
-                }
-                None => Ok(Weight::Full {
-                    data: g.tensor_f32(bytes, name)?,
-                    cols,
-                }),
-            }
-        };
+        let weight =
+            |name: &str, rows: usize, cols: usize| load_weight(g, bytes, &mmap, name, rows, cols);
 
         let token_embd = Arc::new(weight("token_embd.weight", v, d)?);
         let output_norm = norm("output_norm.weight", d)?;
@@ -1346,6 +1374,7 @@ mod tests {
                 dims: b.dims(),
                 kv_dim: lc.kv_dim(),
                 n_layers: lc.n_layers,
+                kv_dims: None,
                 max_positions: 64,
                 max_resident_blocks: 64,
                 sliding_window: None,
@@ -1404,6 +1433,7 @@ mod tests {
                 dims: b.dims(),
                 kv_dim: lc.kv_dim(),
                 n_layers: lc.n_layers,
+                kv_dims: None,
                 max_positions,
                 max_resident_blocks: 1024,
                 sliding_window: None,
@@ -1673,6 +1703,7 @@ mod tests {
             dims,
             kv_dim: lc.kv_dim(),
             n_layers: lc.n_layers,
+            kv_dims: None,
             max_positions: 64,
             max_resident_blocks: 64,
             sliding_window: None,

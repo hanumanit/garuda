@@ -42,6 +42,7 @@ pub mod ollama;
 pub mod predictor;
 pub mod prefetch;
 pub mod quant;
+pub mod qwen35;
 pub mod router;
 pub mod runtime;
 pub mod scheduler;

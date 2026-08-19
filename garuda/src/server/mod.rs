@@ -14,10 +14,11 @@ use crate::memory::MemoryManager;
 use crate::moe::MoeEngine;
 use crate::predictor::ExpertPredictor;
 use crate::prefetch::{GgufPagePrefetcher, PrefetchEngine};
+use crate::qwen35::Qwen35Backend;
 use crate::router::Router;
 use crate::runtime::InferenceRuntime;
 use crate::storage::LocalStorageBackend;
-use crate::tokenizer::{Tokenize, Tokenizer, spm::SpmTokenizer};
+use crate::tokenizer::{Tokenize, Tokenizer, bpe::BpeTokenizer, spm::SpmTokenizer};
 use crate::weights::ModelWeights;
 use anyhow::Context;
 use std::sync::Arc;
@@ -101,6 +102,7 @@ impl Engine {
             dims: draft.dims(),
             kv_dim: dc.kv_dim(),
             n_layers: dc.n_layers,
+            kv_dims: None,
             max_positions: config.model.context.min(dc.context).max(1),
             max_resident_blocks: config.memory.kv_resident_blocks,
             sliding_window: config.sliding_window(),
@@ -161,6 +163,127 @@ impl Engine {
         Ok(Some(Arc::new(LocalStorageBackend::new(dir))))
     }
 
+    /// Load a Qwen3.5-family checkpoint — the hybrid architecture in [`crate::qwen35`].
+    ///
+    /// Three quarters of its blocks keep a fixed-size recurrent state instead of a
+    /// growing KV cache, which changes what this function has to arrange: per-layer
+    /// cache widths (zero for the recurrent blocks), a prompt-cache budget that can
+    /// actually hold one of these sequences, and no draft model, because a state that
+    /// summarises every token it has read cannot be rewound when a guess is rejected.
+    fn build_qwen35(
+        config: &AppConfig,
+        path: &std::path::Path,
+        gguf: &Gguf,
+        bytes: &[u8],
+        mmap: Option<Arc<memmap2::Mmap>>,
+    ) -> anyhow::Result<Self> {
+        let tokenizer: Arc<dyn Tokenize> = Arc::new(BpeTokenizer::from_gguf(gguf)?);
+        let backend = Qwen35Backend::from_gguf(gguf, bytes, mmap)?;
+        let qc = backend.config();
+        let dims = backend.dims();
+        if dims.vocab_size != tokenizer.vocab_size() {
+            anyhow::bail!(
+                "the checkpoint's output head covers {} tokens but its vocabulary lists {} — \
+                 a sampled id would decode to the wrong word",
+                dims.vocab_size,
+                tokenizer.vocab_size()
+            );
+        }
+
+        if let Some(draft) = config.draft_path() {
+            anyhow::bail!(
+                "model.draft_gguf is set ({}), but this architecture cannot verify \
+                 speculated tokens: its recurrent layers summarise every token they \
+                 read and cannot be rewound when a guess is rejected. Clear the key to \
+                 run this checkpoint.",
+                draft.display()
+            );
+        }
+
+        let chunk = Self::prefill_chunk(config);
+        let backend = backend.with_prefill_chunk(chunk);
+        let recurrent = qc.recurrent.iter().filter(|&&r| r).count();
+        tracing::info!(
+            prefill_batch = chunk,
+            checkpoint_mb = bytes.len() / 1_048_576,
+            blocks = qc.n_layers,
+            recurrent_blocks = recurrent,
+            attention_blocks = qc.n_layers - recurrent,
+            heads = format!("{}x{}", qc.n_heads, qc.head_dim),
+            kv_heads = qc.n_kv_heads,
+            recurrent_state_mb = qc.linear_state_bytes() / 1_048_576,
+            "qwen3.5: hybrid attention, {} of {} blocks recurrent",
+            recurrent,
+            qc.n_layers
+        );
+
+        // Never promise a longer context than the model was trained for.
+        let max_positions = config.model.context.min(qc.context).max(1);
+        let kv = KvConfig {
+            dims,
+            kv_dim: qc.kv_dim(),
+            n_layers: qc.n_layers,
+            // Zero for the recurrent blocks: they count positions and store nothing.
+            kv_dims: Some(qc.kv_dims()),
+            max_positions,
+            max_resident_blocks: config.memory.kv_resident_blocks,
+            sliding_window: config.sliding_window(),
+            storage: Self::kv_storage(config)?,
+        };
+        Self::warn_if_kv_spill_thrashes(&kv);
+
+        // A cached prompt carries the recurrent state, whose size does not depend on
+        // the prompt. If one does not fit the budget, nothing ever will — the cache
+        // would take every insertion and decline it.
+        let state_bytes = qc.linear_state_bytes();
+        let budget = config.prompt_cache_bytes()?;
+        if state_bytes > budget {
+            tracing::warn!(
+                recurrent_state_mb = state_bytes / 1_048_576,
+                prompt_cache_mb = budget / 1_048_576,
+                "one sequence's recurrent state is larger than the whole prompt cache, so \
+                 no prompt will ever be cached; raise memory.prompt_cache past {} MB or \
+                 accept that repeated prompts re-run prefill",
+                state_bytes / 1_048_576
+            );
+        }
+
+        let chat = ChatFormat::detect(
+            gguf.get("tokenizer.chat_template")
+                .and_then(crate::gguf::Value::as_str),
+        )
+        .with_thinking(config.model.thinking);
+        let turn_end = chat.turn_end().and_then(|m| tokenizer.token_id(m));
+        tracing::info!(
+            format = chat.as_str(),
+            turn_end = ?turn_end,
+            "chat template"
+        );
+
+        let runtime = Arc::new(
+            InferenceRuntime::new(
+                tokenizer,
+                Arc::new(backend),
+                kv,
+                config.memory.prompt_cache_entries,
+                budget,
+            )
+            .with_turn_end(turn_end),
+        );
+
+        Ok(Self {
+            dims,
+            backend: Backend::Gguf {
+                path: path.display().to_string(),
+                layers: qc.n_layers,
+            },
+            memory: None,
+            runtime,
+            prefetch: None,
+            chat,
+        })
+    }
+
     fn build_gguf(config: &AppConfig, path: &std::path::Path) -> anyhow::Result<Self> {
         // Either memory-map the file (weights stay packed, low RAM) or read it into a
         // buffer and expand every weight to f32 (more RAM, faster).
@@ -187,6 +310,13 @@ impl Engine {
         };
 
         let gguf = Gguf::parse(bytes)?;
+
+        // One file format, more than one architecture inside it. Each loader refuses
+        // what it does not implement, so a checkpoint never half-loads.
+        if gguf.architecture() == Some("qwen35") {
+            return Self::build_qwen35(config, path, &gguf, bytes, mmap.clone());
+        }
+
         let tokenizer: Arc<dyn Tokenize> = Arc::new(SpmTokenizer::from_gguf(&gguf)?);
         let backend = LlamaBackend::from_gguf(&gguf, bytes, mmap.clone())?;
         let lc = backend.config();
@@ -236,6 +366,7 @@ impl Engine {
             dims,
             kv_dim: lc.kv_dim(),
             n_layers: lc.n_layers,
+            kv_dims: None,
             max_positions,
             max_resident_blocks: config.memory.kv_resident_blocks,
             sliding_window: config.sliding_window(),

@@ -2,6 +2,146 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.27.0] - 2026-08-19
+
+Qwen3.8-27B, whose blocks are mostly not attention.
+
+### Added
+
+- **The `qwen35` architecture** — `qwen35::Qwen35Backend`, a second
+  `InferenceBackend` alongside `LlamaBackend`. It runs the dense Qwen3.5 family:
+  **Qwen3.8-27B**, Qwen3.6-27B, and Qwen3.5-0.8B through 27B, which are all the same
+  arithmetic at different widths.
+
+  Three of every four blocks are a **gated delta net** rather than attention: linear
+  attention that folds the whole sequence into a fixed-size recurrent state. Per token
+  and per head, with decay `α`, write strength `β` and L2-normalised `q`/`k`:
+
+  ```text
+  S ← αS + β·k ⊗ (v − Sᵀk)      out = Sᵀ(q/√d)
+  ```
+
+  `Sᵀk` is what the state already predicts for this key, so the update writes the
+  *error* along `k` — a second write of the same key changes nothing, which is a unit
+  test rather than a claim. Ahead of it sits a depthwise causal convolution over the
+  joint query/key/value projection, and after it a gated RMSNorm. `α` comes out of
+  `exp(a · softplus(alpha·x + dt_bias))` with `a` stored negative in the file (checked
+  against the real checkpoint's own `ssm_a` tensor, all 48 values in
+  −0.34…−0.004), so the decay lands in `(0, 1)` and old writes fade.
+
+  The remaining blocks are grouped-query attention, but not Llama's: heads are 256
+  wide against a 5120-wide residual stream, the query projection emits a **per-head
+  output gate** next to each query, queries and keys are RMS-normalised per head
+  before rotation, and only the **first quarter** of each head's dimensions is rotated
+  (`rope.dimension_count = 64` of 256, rotate-half pairs `(i, i+32)` — a different
+  convention from `simd::rope`, and the wrong one produces fluent text that ignores
+  word order).
+
+  Verified against real weights, not only against itself. On `Qwen3.8-27B` Q4_K_M
+  (19 GB, memory-mapped on a 16 GB machine) and on `Qwen3.5-0.8B` Q8_0 and Q4_K_M (24
+  blocks of the identical architecture): greedy continuation of "The capital of France
+  is" → `" Paris"`; a chat turn rendered with the checkpoint's own template →
+  `" Paris"`; the same question in Thai, through the served OpenAI API, → `"กรุงเทพฯ"`
+  from the 27B and `"กรุงเทพมหานคร"` from the 0.8B, streaming included. `tests/qwen35_real.rs` is that check, gated on
+  `GARUDA_QWEN35_GGUF` so the suite still runs with no checkpoint on the machine, and
+  `examples/qwen35_probe.rs` prints the most likely next tokens from a single forward
+  pass, which is how a 24-second question gets asked of a model that takes minutes to
+  decode a sentence.
+
+  **The value heads read the key heads in the order the *file* stores them**, which is
+  `hv % n_k_heads` and not the contiguous run `transformers` writes
+  (`repeat_interleave`, `hv / group`). Both are right for their own weight layout — the
+  GGUF converter writes heads in the order llama.cpp's graph reads them — and picking
+  the wrong one is not a crash or obvious noise: every head still reads a real memory,
+  just one another head wrote, so magnitudes stay normal and the model degenerates into
+  copying its prompt. On the 27B, "The capital of France is" continued as
+  `" capital of France is capital of France is"`. Nothing smaller catches it: a
+  checkpoint with as many value heads as key heads — the 0.8B, and every other size
+  below the 27B — makes the two conventions identical, which is why the small model
+  answered correctly throughout.
+
+- **Byte-level BPE tokenizer** (`tokenizer::bpe::BpeTokenizer`) for `gpt2`
+  vocabularies, which is what Qwen ships — 248 320 entries and 247 587 merges in the
+  27B's file. The three stages are pre-tokenization, the GPT-2 byte alphabet, and the
+  merge list applied lowest rank first.
+
+  The pre-tokenizer is the part that decides everything downstream, and GGUF stores its
+  *name* rather than its pattern. Qwen's pattern is written out by hand here —
+  alternatives tried in order, each greedy within itself, as a backtracking engine
+  would — because the crate has no regex dependency and because two of the
+  alternatives (`\s+(?!\S)`, and `\s*[\r\n]+` after a backtrack) need hand-holding
+  either way; llama.cpp hand-codes the same splits for the same reason. That is what
+  makes `"1234"` four tokens, gives a word its leading space, and keeps Thai vowel
+  signs attached to their consonants.
+
+- **Recurrent state in the sequence cache** (`cache::LinearState`). A hybrid model's
+  recurrent blocks store nothing per position, so `KvConfig::kv_dims` gives them a
+  width of zero: they still count positions — every layer of a sequence has to advance
+  together, or `seq.len()` stops speaking for all of them — and hold nothing. What they
+  do carry is a convolution history and one matrix per head, the same size at ten
+  tokens as at a hundred thousand: **~144 MB for Qwen3.8-27B**, 19 MB for the 0.8B.
+  `SeqState::resident_bytes` counts it, so the prompt cache's byte budget is still
+  honest, and startup warns when one sequence's state exceeds the whole budget —
+  otherwise the cache would accept every insertion and decline it.
+
+- **`model.thinking`** — the Qwen3.5 chat template opens a `<think>` block for the
+  assistant. `false`, the default, closes it immediately (the template's own
+  `enable_thinking = false`), so a reply is the answer and nothing else; `true` leaves
+  it open, which is what the checkpoint does by default, and the reasoning then arrives
+  as ordinary content ahead of the answer. This server has nowhere else to put
+  reasoning, and on the default 256-token budget an answer might otherwise never
+  arrive — hence the default, and hence the switch.
+
+- **[`garuda/qwen3.8.toml`](garuda/qwen3.8.toml)** — a worked config for Qwen3.8-27B
+  Q4_K_M (~19 GB) on a 16 GB machine, and `garuda inspect` now reports a hybrid
+  checkpoint's split (`64 (48 recurrent, 16 attention)`) along with any
+  multi-token-prediction blocks it carries.
+
+### Changed
+
+- **Turn markers are placed as vocabulary entries when the vocabulary holds them.**
+  `encode_chat` put `<|im_start|>` into the prompt as *text*, so a Qwen checkpoint read
+  `<`, `|`, `im`, `_start`, `|`, `>` where it expects one marker — the same class of
+  bug 0.26.0 fixed for the end-of-turn token, one layer up. Each marker is now resolved
+  against the vocabulary and falls back to text only when the entry is genuinely
+  absent, which is what keeps the SentencePiece checkpoints rendering exactly as
+  before. On the real 0.8B this is the difference between a reply of
+  `"<|im_start|>\nThe capital of France is Paris.\n</"` and `" Paris"`.
+
+- **`ModelDims::validate` requires the heads to cover `d_model`, not to equal it.**
+  Qwen3.5 projects 24 heads of 256 dimensions out of a 5120-wide residual stream and
+  narrows the 6144-wide concatenation back down in the output projection. The synthetic
+  `attention::Attention`, which slices `d_model` into its own heads, now checks for
+  equality itself rather than relying on the shared invariant.
+
+- **Speculative decoding is off on `qwen35`, and says why.** A recurrent state
+  summarises every token it has read; there is no arithmetic that takes the last few
+  back out, so a rejected guess cannot be discarded. `speculation_supported()` answers
+  `false` (which keeps the runtime on the plain decode path),
+  `SeqState::truncate` refuses to rewind a sequence carrying such state rather than
+  silently continuing, and `model.draft_gguf` is a startup error with this architecture
+  loaded instead of a key that quietly does nothing.
+
+- **`llama::Weight` and the two GGUF tensor loaders are shared** between the backends
+  rather than copied. Both architectures want the same choice between an expanded `f32`
+  matrix and a packed one dequantised per row out of the memory map.
+
+### Tests
+
+- The delta rule against the recurrence written out longhand, including that the state
+  is unchanged by rewriting the same key with the same value; partial rotation against
+  the rotate-half formula, and that everything past `n_rot` passes through untouched;
+  a batched prefill matching tokens fed one at a time, which is where a recurrence that
+  lost the token order would still return plausible numbers; every layer advancing one
+  position per token on a hybrid stack; mmapped weights agreeing with expanded ones;
+  the mixture-of-experts sibling `qwen35moe` refused by name rather than half-run.
+
+- For the tokenizer: the pre-tokenizer's split, case by case, including Thai and
+  combining marks, plus a property — the split covers its input exactly once, in order,
+  with no empty pieces. And the contract's own invariants: control tokens reachable by
+  name but never produced by `encode`, streaming decode agreeing with batch decode
+  across a character split between tokens.
+
 ## [0.26.0] - 2026-07-30
 
 The prompt format a checkpoint was actually trained on.

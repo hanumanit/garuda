@@ -16,6 +16,15 @@ pub struct Attention {
 impl Attention {
     pub fn new(dims: ModelDims) -> Result<Self, GarudaError> {
         dims.validate()?;
+        // This attention slices the residual stream itself into `n_heads` heads, so
+        // heads wider than `d_model` — which `ModelDims::validate` permits, and
+        // Qwen3.5 uses — would read past the end of every hidden state.
+        if dims.n_heads * dims.head_dim != dims.d_model {
+            return Err(GarudaError::Config(format!(
+                "this attention needs n_heads * head_dim ({} * {}) to equal d_model ({})",
+                dims.n_heads, dims.head_dim, dims.d_model
+            )));
+        }
         Ok(Self { dims })
     }
 

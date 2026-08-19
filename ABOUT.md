@@ -11,9 +11,12 @@ Garuda is a Mixture-of-Experts inference runtime written in Rust. It runs in two
 modes:
 
 - **With a real checkpoint.** Point it at a GGUF file and it loads the weights and
-  generates real text. A Llama-architecture forward pass — grouped-query attention
-  with rotary embeddings, SwiGLU feed-forward, a SentencePiece tokenizer read from
-  the file — flows through the same runtime, scheduler and API as everything else.
+  generates real text. Two architectures run: a Llama-family forward pass —
+  grouped-query attention with rotary embeddings, SwiGLU feed-forward, a SentencePiece
+  tokenizer read from the file — and the Qwen3.5-family hybrid (`qwen35`, which covers
+  Qwen3.8-27B), where three blocks in four are a gated delta net carrying a fixed-size
+  recurrent state instead of a KV cache, and the vocabulary is byte-level BPE. Both
+  flow through the same runtime, scheduler and API as everything else.
 - **Without one.** It runs a synthetic MoE over deterministic pseudo-random weights.
   The arithmetic is real; the weights are not, so the output is meaningless. This
   mode exists to exercise the parts that are the actual point: the scheduling, the

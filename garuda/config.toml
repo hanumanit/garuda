@@ -9,7 +9,11 @@ path = "./models"
 # Path to a GGUF checkpoint. Leave empty to run the synthetic MoE (meaningless
 # output). Set it to load a real model instead — the router/experts/top_k knobs are
 # then ignored. F32/F16/Q4_0/Q8_0 and the k-quants Q2_K-Q6_K decode; MoE experts may
-# be either the merged `..._exps` tensor layout or the older per-expert layout. A
+# be either the merged `..._exps` tensor layout or the older per-expert layout.
+#
+# Two architectures load: `llama` (dense or MoE) and `qwen35`, the Qwen3.5-family
+# hybrid that covers Qwen3.8-27B — see qwen3.8.toml, which is a worked config for it.
+# `garuda inspect <file>` says which one a checkpoint is and whether it will load. A
 # tiny real model to try:
 #   curl -L https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf -o stories260K.gguf
 # gguf = "stories260K.gguf"
@@ -54,9 +58,21 @@ speculative_lookahead = 4
 # nothing at all at 0.8. A draft model guesses anywhere, and is what makes speculation
 # pay at ordinary temperatures — measured 1.7-2.0x on Mixtral at 0.8, against a
 # TinyLlama-1.1B draft. It costs a second checkpoint resident alongside the first.
+#
+# Neither form of speculation is available on a qwen35 checkpoint: its recurrent
+# layers summarise every token they have read, so a rejected guess cannot be taken
+# back out. Setting this key with such a model loaded is a startup error rather than
+# a key that quietly does nothing.
 #   draft_gguf = "/path/to/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
 draft_gguf = ""
 draft_mmap = true
+# Let a reasoning checkpoint reason. Only reaches the Qwen3.5 family, whose chat
+# template opens a `<think>` block for the assistant: false closes it immediately, so
+# a reply is the answer and nothing else, and true leaves it open, which is what the
+# template does by default. With it on, the reasoning arrives as ordinary content
+# ahead of the answer, so sampling.max_tokens has to cover both. Every other
+# checkpoint ignores this rather than being handed markup it never saw.
+thinking = false
 # There is no GPU backend. Setting this to true is a startup error, not a fallback.
 gpu = false
 

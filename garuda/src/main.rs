@@ -77,11 +77,33 @@ fn inspect(path: &std::path::Path) -> anyhow::Result<()> {
     println!("metadata keys {}", gguf.metadata.len());
     println!("data offset   {}", gguf.data_offset);
 
-    // Report loadability honestly: F32/F16/Q4_0/Q8_0/k-quants decode, only the
-    // llama architecture is wired up, and MoE blocks need either the merged
-    // `..._exps` tensors or the older per-expert tensors — matching exactly what
-    // `LlamaBackend::from_gguf` requires, so this never promises a load that fails.
+    // Report loadability honestly: F32/F16/Q4_0/Q8_0/k-quants decode, the llama and
+    // qwen35 architectures are wired up, and MoE blocks need either the merged
+    // `..._exps` tensors or the older per-expert tensors — matching exactly what the
+    // backends require, so this never promises a load that fails.
     let arch = gguf.architecture().unwrap_or("(unknown)");
+
+    // A hybrid checkpoint's shape is worth stating: how many of its blocks are
+    // recurrent decides how large its KV cache is and how much fixed state a sequence
+    // carries, and whether it bundles prediction blocks decides how much of the file
+    // is even executed.
+    if arch == "qwen35" {
+        let blocks = gguf.arch_u64("block_count").unwrap_or(0);
+        let nextn = gguf.arch_u64("nextn_predict_layers").unwrap_or(0);
+        let interval = gguf.arch_u64("full_attention_interval").unwrap_or(4).max(1);
+        let trunk = blocks.saturating_sub(nextn);
+        let attention = (1..=trunk).filter(|l| l % interval == 0).count();
+        println!(
+            "blocks        {trunk} ({} recurrent, {attention} attention)",
+            trunk as usize - attention
+        );
+        if nextn > 0 {
+            println!(
+                "prediction    {nextn} multi-token-prediction block(s), which this runtime \
+                 does not execute"
+            );
+        }
+    }
     let bad_tensor = gguf
         .tensors
         .iter()
@@ -97,8 +119,11 @@ fn inspect(path: &std::path::Path) -> anyhow::Result<()> {
         _ => None,
     };
     println!();
-    if arch != "llama" {
-        println!("loadable      no — only the llama architecture is supported (this is '{arch}').");
+    if arch != "llama" && arch != "qwen35" {
+        println!(
+            "loadable      no — this runtime loads the llama and qwen35 architectures \
+             (this is '{arch}')."
+        );
     } else if let Some(t) = bad_tensor {
         println!(
             "loadable      no — tensor '{}' is {} ({}), which needs a super-block decoder \

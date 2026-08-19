@@ -1,0 +1,68 @@
+# Run config for Qwen3.8-27B in Q4_K_M (~19 GB) on a 16 GB machine.
+#
+# A different shape of model from Mixtral: there are no experts to stream, but three
+# quarters of its 64 blocks are gated delta nets — linear attention carrying a
+# fixed-size recurrent state instead of a growing KV cache. What that changes is set
+# out below, and in the README.
+#
+#   curl -L https://huggingface.co/ggml-org/Qwen3.8-27B-GGUF/resolve/main/Qwen3.8-27B-Q4_K_M.gguf \
+#     -o Qwen3.8-27B-Q4_K_M.gguf
+#
+# `--config` goes before the subcommand: `garuda --config qwen3.8.toml serve`.
+
+[model]
+path = "./models"
+gguf = "/path/to/Qwen3.8-27B-Q4_K_M.gguf"
+# Essential: keep 19 GB packed on disk and dequantise per row. Expanding this
+# checkpoint to f32 would want well over 100 GB of RAM.
+mmap = true
+# 19 GB against 16 GB of RAM, so a prompt token that traverses the model alone
+# re-streams the whole file. Batching drops the working set to one block.
+prefill_batch = 256
+# Qwen3.8 was trained for 262 144 tokens. This caps the KV cache, not correctness —
+# and only the 16 attention blocks store anything per position, so the cache is a
+# quarter of what an all-attention model of this size would want.
+context = 4096
+# Speculation is unavailable for this architecture: a recurrent state summarises
+# every token it has read and cannot be rewound, so a rejected guess cannot be taken
+# back out. Setting model.draft_gguf here is a startup error rather than a key that
+# quietly does nothing.
+draft_gguf = ""
+# Let the model reason. Its template opens a `<think>` block for the assistant;
+# `false` closes it immediately, so a reply is the answer alone. `true` leaves it
+# open, which is the template's own default — raise sampling.max_tokens if you do,
+# because the reasoning arrives as content ahead of the answer.
+thinking = false
+gpu = false
+
+[memory]
+# Enough resident blocks to cover the 4096-token context (4096 / 32 = 128), so the
+# attention blocks never spill and reload under full attention.
+kv_resident_blocks = 128
+# One cached prompt holds this sequence's whole recurrent state — about 144 MB for
+# this checkpoint, whatever the prompt's length. A budget below that caches nothing
+# at all, and Garuda says so at startup.
+prompt_cache_entries = 4
+prompt_cache = "1GB"
+kv_spill = false
+
+[runtime]
+threads = 0
+# Nothing to prefetch: a dense model has no experts to warm.
+prefetch = false
+predictor = false
+
+[server]
+host = "127.0.0.1"
+port = 8091
+# One sequence at a time: paged inference over a checkpoint larger than RAM is
+# memory-sensitive, and every token is another pass over 19 GB.
+max_concurrent = 1
+queue_capacity = 16
+request_timeout_secs = 900
+
+[sampling]
+temperature = 0.7
+top_p = 0.95
+top_k = 40
+max_tokens = 48

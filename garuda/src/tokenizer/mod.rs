@@ -11,10 +11,13 @@
 
 use crate::core::{GarudaError, Token};
 
+pub mod bpe;
 pub mod spm;
 
 /// A tokenizer the runtime can drive. Implemented by the byte-level [`Tokenizer`]
-/// here and by [`spm::SpmTokenizer`], which loads a real model's vocabulary.
+/// here and by the two that load a real model's vocabulary out of a GGUF file:
+/// [`spm::SpmTokenizer`] (SentencePiece, as Llama and Mixtral ship it) and
+/// [`bpe::BpeTokenizer`] (byte-level BPE, as Qwen ships it).
 ///
 /// # Plugin contract
 ///

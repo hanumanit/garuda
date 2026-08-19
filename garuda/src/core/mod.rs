@@ -82,10 +82,23 @@ impl Default for ModelDims {
 }
 
 impl ModelDims {
+    /// Checks the shape invariants every backend must satisfy.
+    ///
+    /// The attention heads have to cover the residual stream, but they are allowed to
+    /// be *wider* than it: Qwen3.5 projects 24 heads of 256 dimensions out of a
+    /// 5120-wide residual stream and narrows the 6144-wide concatenation back down in
+    /// the output projection. A backend that slices `d_model` into its heads — the
+    /// synthetic [`crate::attention::Attention`] does — needs exact equality and
+    /// checks for it itself.
     pub fn validate(&self) -> Result<(), GarudaError> {
-        if self.n_heads * self.head_dim != self.d_model {
+        if self.n_heads == 0 || self.head_dim == 0 {
+            return Err(GarudaError::Config(
+                "n_heads and head_dim must both be non-zero".into(),
+            ));
+        }
+        if self.n_heads * self.head_dim < self.d_model {
             return Err(GarudaError::Config(format!(
-                "n_heads * head_dim ({} * {}) must equal d_model ({})",
+                "n_heads * head_dim ({} * {}) must cover d_model ({})",
                 self.n_heads, self.head_dim, self.d_model
             )));
         }
