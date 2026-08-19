@@ -214,6 +214,50 @@ impl ExpertLoader for GgufPagePrefetcher {
     }
 }
 
+/// How a block is warmed: by advising the map, or by reading the file into a buffer
+/// that is thrown away.
+///
+/// Reading looks wasteful and is not: what it leaves behind is the file's pages in the
+/// unified buffer cache, which is exactly what the forward pass then faults onto, and
+/// it gets to choose the request size while the kernel's own readahead does not.
+enum Warm {
+    Advise(Arc<memmap2::Mmap>),
+    Read(Arc<std::fs::File>, usize),
+}
+
+impl Warm {
+    fn warm(&self, layer: usize, start: usize, len: usize, scratch: &mut Vec<u8>) {
+        match self {
+            Warm::Advise(mmap) => {
+                let len = len.min(mmap.len().saturating_sub(start));
+                if len == 0 {
+                    return;
+                }
+                if let Err(e) = mmap.advise_range(memmap2::Advice::WillNeed, start, len) {
+                    tracing::debug!(layer, error = %e, "madvise(WILLNEED) declined");
+                }
+            }
+            Warm::Read(file, chunk) => {
+                use std::os::unix::fs::FileExt;
+                scratch.resize(*chunk, 0);
+                let mut at = start;
+                let end = start + len;
+                while at < end {
+                    let take = (end - at).min(*chunk);
+                    match file.read_at(&mut scratch[..take], at as u64) {
+                        Ok(0) => break,
+                        Ok(n) => at += n,
+                        Err(e) => {
+                            tracing::debug!(layer, error = %e, "prefetch read failed");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Warms the *next* block's weights while the current one computes.
 ///
 /// A dense model has nothing to predict: every token reads every byte of every
@@ -258,22 +302,54 @@ impl LayerPrefetcher {
     /// [`Self::with_workers`] for what more of them buys.
     pub const WORKERS: usize = 3;
 
+    /// How much of a block to ask for per read, when warming by reading.
+    ///
+    /// The kernel's own readahead was issuing 64-90 KB per device request and pulling
+    /// 1.2-1.8 GB/s from a drive that does 3.9 GB/s sequentially. Asking in 32 MB
+    /// pieces takes the request size to 220-250 KB and the rate to 2.2-2.6 GB/s, which
+    /// took a forward pass over Qwen3.8-27B from 13-15 s to ~7 s. Sizes from 4 MB to
+    /// 64 MB all land within a second of each other; this is the middle of that range.
+    pub const CHUNK: usize = 32 << 20;
+
+    /// Warm by reading the file directly, in large chunks, rather than by advising the
+    /// map.
+    ///
+    /// Same effect — the bytes land in the unified buffer cache either way, and the
+    /// forward pass then faults onto warm pages — but this one controls the request
+    /// size. Measured during a pass driven by `madvise`: 1.2-1.8 GB/s at 64-90 KB per
+    /// transfer, against 3.9 GB/s for a `dd` reading the same file in 1 MB blocks. The
+    /// kernel's readahead was not asking for enough at a time.
+    pub fn reading(
+        file: Arc<std::fs::File>,
+        spans: Vec<(usize, usize)>,
+        workers: usize,
+        chunk: usize,
+    ) -> Self {
+        Self::spawn(Warm::Read(file, chunk.max(1 << 20)), spans, workers)
+    }
+
     pub fn with_workers(
         mmap: Arc<memmap2::Mmap>,
         spans: Vec<(usize, usize)>,
         workers: usize,
     ) -> Self {
+        Self::spawn(Warm::Advise(mmap), spans, workers)
+    }
+
+    fn spawn(how: Warm, spans: Vec<(usize, usize)>, workers: usize) -> Self {
         // Bounded by the worker count: a hint that cannot be picked up promptly is a
         // *staler* block by the time anyone gets to it, and the forward pass has
         // already moved on. Dropping it is better than queueing it.
         let (tx, rx) = std::sync::mpsc::sync_channel::<usize>(workers.max(1));
         let rx = Arc::new(Mutex::new(rx));
         let spans = Arc::new(spans);
+        let how = Arc::new(how);
         for w in 0..workers.max(1) {
-            let (rx, spans, mmap) = (rx.clone(), spans.clone(), mmap.clone());
+            let (rx, spans, how) = (rx.clone(), spans.clone(), how.clone());
             std::thread::Builder::new()
                 .name(format!("garuda-prefetch-{w}"))
                 .spawn(move || {
+                    let mut scratch = Vec::new();
                     loop {
                         // Held only across `recv`, never across the read itself, so
                         // the workers genuinely overlap.
@@ -284,13 +360,10 @@ impl LayerPrefetcher {
                         let Some(&(start, len)) = spans.get(layer) else {
                             continue;
                         };
-                        let len = len.min(mmap.len().saturating_sub(start));
                         if len == 0 {
                             continue;
                         }
-                        if let Err(e) = mmap.advise_range(memmap2::Advice::WillNeed, start, len) {
-                            tracing::debug!(layer, error = %e, "madvise(WILLNEED) declined");
-                        }
+                        how.warm(layer, start, len, &mut scratch);
                     }
                 })
                 .expect("spawning a prefetch thread");
@@ -360,19 +433,32 @@ mod tests {
             (64 * 1024, 64 * 1024),
             (128 * 1024, 64 * 1024),
         ];
-        let pf = LayerPrefetcher::new(map, spans);
+        // Both ways of warming a block, since the server picks between them: advising
+        // the map, and reading the file in pieces.
+        let advising = LayerPrefetcher::with_workers(map, spans.clone(), 2);
+        let reading = LayerPrefetcher::reading(
+            Arc::new(std::fs::File::open(&path).unwrap()),
+            spans,
+            2,
+            16 * 1024,
+        );
 
-        for l in 0..3 {
-            pf.hint(l);
+        for pf in [&advising, &reading] {
+            for l in 0..3 {
+                pf.hint(l);
+            }
+            // Past the end of the block list, and past the end of the file: both are
+            // ignored, because a hint is never load-bearing.
+            pf.hint(99);
+            // Two workers, so this asks for the two blocks after layer 0.
+            pf.hint_ahead(0);
+
+            let (launched, skipped) = pf.stats();
+            assert_eq!(launched + skipped, 6, "every hint is accounted for");
         }
-        // Past the end of the block list, and past the end of the file: both are
-        // ignored, because a hint is never load-bearing.
-        pf.hint(99);
 
-        let (launched, skipped) = pf.stats();
-        assert_eq!(launched + skipped, 4, "every hint is accounted for");
-
-        drop(pf); // closes the channel, which ends the worker
+        drop(advising); // closes the channel, which ends the workers
+        drop(reading);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

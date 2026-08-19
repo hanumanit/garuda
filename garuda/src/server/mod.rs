@@ -216,12 +216,28 @@ impl Engine {
         // one computes or the CPU spends the wait idle. Only worth anything when the
         // weights are mapped: an in-RAM checkpoint has nothing to warm.
         let prefetch = if config.runtime.prefetch && backend.is_mmapped() {
-            mmap_for_prefetch.map(|m| {
-                Arc::new(crate::prefetch::LayerPrefetcher::new(
-                    m,
-                    backend.layer_spans().to_vec(),
-                ))
-            })
+            let spans = backend.layer_spans().to_vec();
+            let workers = crate::prefetch::LayerPrefetcher::WORKERS;
+            // Reading the file in large pieces beats advising the map, because it gets
+            // to choose the request size and the kernel's readahead does not — see
+            // `LayerPrefetcher::CHUNK`. Advising is the fallback for when the file
+            // cannot be opened a second time.
+            match std::fs::File::open(path) {
+                Ok(file) => Some(Arc::new(crate::prefetch::LayerPrefetcher::reading(
+                    Arc::new(file),
+                    spans,
+                    workers,
+                    crate::prefetch::LayerPrefetcher::CHUNK,
+                ))),
+                Err(e) => {
+                    tracing::debug!(error = %e, "reopening the checkpoint for prefetch");
+                    mmap_for_prefetch.map(|m| {
+                        Arc::new(crate::prefetch::LayerPrefetcher::with_workers(
+                            m, spans, workers,
+                        ))
+                    })
+                }
+            }
         } else {
             None
         };

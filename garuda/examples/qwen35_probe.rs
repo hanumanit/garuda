@@ -53,16 +53,26 @@ fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    // GARUDA_PREFETCH_READ=8 warms by reading the file in 8 MB chunks instead of
+    // advising the map.
+    let read_mb: usize = std::env::var("GARUDA_PREFETCH_READ")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let backend = if workers > 0 {
-        let pf = Arc::new(garuda::prefetch::LayerPrefetcher::with_workers(
-            map.clone(),
-            backend.layer_spans().to_vec(),
-            workers,
-        ));
-        println!(
-            "prefetch on: {workers} workers over {} blocks",
-            backend.layer_spans().len()
-        );
+        let spans = backend.layer_spans().to_vec();
+        let pf = Arc::new(if read_mb > 0 {
+            println!("prefetch: {workers} workers reading {read_mb} MB chunks");
+            garuda::prefetch::LayerPrefetcher::reading(
+                Arc::new(std::fs::File::open(&path)?),
+                spans,
+                workers,
+                read_mb << 20,
+            )
+        } else {
+            println!("prefetch: {workers} workers advising the map");
+            garuda::prefetch::LayerPrefetcher::with_workers(map.clone(), spans, workers)
+        });
         backend.with_prefetch(pf)
     } else {
         backend

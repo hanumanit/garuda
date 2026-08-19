@@ -2,6 +2,40 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.30.0] - 2026-08-19
+
+Ask the drive for megabytes, not kilobytes.
+
+### Changed
+
+- **Blocks are warmed by reading the file, not by advising the map.** `madvise(WILLNEED)`
+  hands the kernel a whole block and leaves the request size to its readahead, which
+  during a forward pass turned out to be **64-90 KB per device request at 1.2-1.8 GB/s**
+  — against 3.9 GB/s for a `dd` reading the same file in 1 MB blocks. `pread` in 32 MB
+  pieces, into a buffer that is thrown away for the pages it leaves behind, takes that
+  to **220-250 KB and 2.2-2.6 GB/s**.
+
+  A forward pass over Qwen3.8-27B: 13-15 s advising, **~7 s** reading. Chunk sizes from
+  4 MB to 64 MB all land within a second of each other, and two or three workers are
+  the same as six, so the win is in asking for megabytes at all rather than in the exact
+  numbers. Advising remains the fallback for when the checkpoint cannot be opened a
+  second time.
+
+  End to end, the same 10-token reply that took **327 s** before any of this work:
+
+  | | seconds |
+  |---|---|
+  | demand paging, all cores, no speculation | 327 |
+  | + block prefetch, 2 GB pinned, performance cores only | 152 / 154 |
+  | + prompt lookup | 108 |
+  | + a Qwen3.5-0.8B draft model | 58 |
+  | + warming by reading | **42** |
+
+  **7.8×**, checkpoint still 19 GB on a 16 GB machine, output identical throughout.
+  The floor is 19 GB / 3.9 GB/s ≈ 5 s a pass, so the transport is nearly spent; what is
+  left is reading fewer bytes, which means a decoder for the IQ quants rather than
+  another policy.
+
 ## [0.29.0] - 2026-08-19
 
 Fewer passes over the weights, which is the only thing that matters at this size.

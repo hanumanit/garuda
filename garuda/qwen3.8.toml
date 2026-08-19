@@ -72,9 +72,9 @@ threads = 0
 # checkpoint larger than RAM: left to demand paging, the forward pass faults its
 # weights in a page at a time and the CPU idles between faults — measured 140% busy
 # out of 800% available, pulling 0.7 GB/s from a disk that reads 3.9 GB/s. Three
-# background threads handing the kernel whole blocks took a forward pass from 27 s to
-# 12 s on this machine, with the answer unchanged (the hint is advisory; the pass
-# still faults whatever it needs).
+# background threads reading the blocks ahead in 32 MB pieces took a forward pass from
+# 27 s to ~7 s on this machine, with the answer unchanged (warming is advisory; the
+# pass still faults whatever it needs).
 prefetch = true
 # Expert routing history, which a dense model does not have.
 predictor = false
