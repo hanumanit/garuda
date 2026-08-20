@@ -131,7 +131,9 @@ curl -s localhost:8090/v1/chat/completions \
 
 Be patient with it: on a 16 GB machine the first token takes 33–51 s and each one
 after it 5–12 s, because every token is another pass over 26 GB of memory-mapped
-weights. That is also why `sampling.max_tokens` is pinned to 48 there, and why a
+weights. The block streaming that took a Qwen3.8-27B pass from 27 s to 3.7 s is
+`qwen35`-only so far — a mixture-of-experts model wants it per expert rather than per
+block, since a token touches two of eight. That is also why `sampling.max_tokens` is pinned to 48 there, and why a
 benchmark against this config wants a few iterations rather than the default 64:
 `garuda --config mixtral.toml benchmark --iterations 3 --tokens 8`.
 
@@ -166,17 +168,23 @@ curl -s localhost:8091/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"What is the capital of Thailand?"}],"max_tokens":40}'
 ```
 
-Three things differ from a Llama-family checkpoint of this size:
+Four things differ from a Llama-family checkpoint of this size:
 
 - **A sequence carries a fixed ~144 MB of recurrent state**, the same at ten tokens
   as at a hundred thousand, on top of a KV cache that only the 16 attention blocks
   contribute to. If `memory.prompt_cache` is smaller than that state, no prompt can
   ever be cached, and startup says so.
 - **`model.draft_gguf` is where the time goes.** Each token costs a pass over 19 GB,
-  so cutting passes beats everything else: 152 s for a 10-token reply with no
-  speculation, 108 s with prompt lookup, 58 s with a `Qwen3.5-0.8B` draft. The draft
-  must share the target's vocabulary — startup checks — so use a smaller model from
-  the same family.
+  so cutting passes beats everything else. On the same 10-token reply: 152 s with no
+  speculation, 108 s with prompt lookup, 58 s with a `Qwen3.5-0.8B` draft — and 32 s
+  once the streaming path below is doing the reading. The draft must share the target's
+  vocabulary — startup checks — so use a smaller model from the same family.
+- **The weights stream around the page cache.** `runtime.prefetch = true` (the default
+  in that config) reads each block ahead of the pass, with the cache bypassed so those
+  bytes stop evicting whatever is being kept resident. It is worth ~1.5× on this
+  checkpoint and needs nothing from you. `memory.weight_cache` is the other half — how
+  much to hold in buffers the process owns — and 2 GB is the only size measured to
+  help here; 6 GB measured *slower*, because owned memory competes with the cache.
 - **Its chat template opens a `<think>` block.** By default Garuda closes it
   immediately, so replies are answers. `model.thinking = true` leaves it open — the
   checkpoint's own default — and the reasoning then arrives as content ahead of the

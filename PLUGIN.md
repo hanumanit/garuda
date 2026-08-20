@@ -35,8 +35,15 @@ Most plugins are backends or tokenizers, so this guide centres on those.
 ## Walkthrough: a custom `InferenceBackend`
 
 A backend turns a token context into next-token logits. The trait is three required
-methods (plus `logits_batch`, which defaults to calling `logits` per sequence),
-but the work is in honouring five invariants the runtime relies on and does not
+methods — `dims`, `hidden`, `logits` — and three with defaults you may override:
+
+| | default | override it when |
+|---|---|---|
+| `logits_batch` | one `logits` call per sequence | several sequences can share one pass over the weights |
+| `logits_multi` | refuses `n > 1` | you can answer for the last `n` positions from a single pass |
+| `speculation_supported` | `false` | `logits_multi` works *and* the sequence can be rewound when a guess is rejected |
+
+The work is in honouring five invariants the runtime relies on and does not
 re-check. We build a toy backend that satisfies all of them. Like the built-in
 synthetic MoE, it runs real arithmetic over made-up weights, so its output is
 meaningless — the point is the mechanics.
@@ -119,6 +126,12 @@ The two invariants that trip people up:
   is part of `seq` and so travels with it into the prompt cache and is charged to its
   byte budget. State kept anywhere else — in the backend, in a lock — would be shared
   between sequences that have read different text.
+
+  Such a state also cannot be rewound by arithmetic, which is what
+  `speculation_supported` is really asking about. A backend that wants speculation
+  anyway copies the state on the way in: `SeqState::begin_recording` while
+  `logits_multi` consumes the guesses, and `SeqState::truncate` restores from the copy
+  the caller lands on and drops the rest.
 
 ### Step 3 — `logits`: project to the vocabulary, deterministically
 
@@ -237,4 +250,6 @@ backends' test modules show the pattern; the ones worth copying:
 - [ ] `logits` returns a `vocab_size`-length tensor.
 - [ ] Out-of-vocab token, empty context, and context-full all return `Err`, never panic.
 - [ ] Output is deterministic for a fixed context and weights.
+- [ ] `speculation_supported` is `true` only if a rejected guess can be undone —
+      a state the backend cannot rewind means `false`, not a best effort.
 - [ ] Registered in `server::Engine::build`, selected by a config key.
