@@ -647,9 +647,16 @@ registered in `Engine::build` — see **[PLUGIN.md](PLUGIN.md)** and
 - **A draft model chosen for the target automatically.** `model.draft_gguf` has to be
   pointed at a vocabulary-compatible checkpoint by hand, and getting it wrong is a
   startup error rather than something the runtime can resolve.
-- **A draft model.** Prompt lookup only fires where the output echoes the input. A
-  small draft checkpoint sharing the vocabulary would speculate on open-ended text
-  too, at the cost of a second model to load and keep resident.
+- **Streaming for anything but `qwen35`.** `stream::BlockStreamer` reads a block at a
+  time, which is right for a dense model and wrong for a mixture of experts: a Mixtral
+  token touches two experts of eight, so reading whole blocks would move four times the
+  bytes it needs. Mixtral still warms experts through the tiered cache and its own
+  predictor, and still costs 5–12 s a token.
+- **A model's own prediction head as the draft.** Qwen3.5 ships one (`mtp-*.gguf`, a
+  single block trained to guess the next token from the target's hidden state), and it
+  should be accepted more often than a separate small checkpoint is. It does not fit
+  the `InferenceBackend` a drafter is expected to be — it needs the target's hidden
+  state, not a context — so the runtime would need a second shape of drafter.
 
 ---
 
