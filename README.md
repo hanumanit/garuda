@@ -9,9 +9,11 @@
   <a href="ABOUT.md">About</a> · <a href="INSTALL.md">Install</a> · <a href="PLUGIN.md">Write a plugin</a>
 </p>
 
-Garuda is an inference **engine** for Mixture-of-Experts models: a scheduler, a
-tiered expert cache, a paged KV cache, and an OpenAI-compatible API, written in
-Rust.
+Garuda is an inference **engine** for models larger than the machine's RAM: a
+scheduler, tiered storage for the weights, a paged KV cache, and an OpenAI-compatible
+API, written in Rust. It began around mixture-of-experts models, where a token needs
+only the experts it routes to, and now also runs dense hybrids — `Qwen3.8-27B`, 19 GB
+on a 16 GB machine — by streaming their blocks past the arithmetic.
 
 ## Read this first
 
@@ -54,8 +56,8 @@ the streaming, the cancellation, the load shedding.
 | Tiered expert storage (L1 RAM → L2 disk → L3 archive) | Real, tested |
 | Paged KV cache with disk spill (multi-layer, GQA-aware) | Real, tested — pair spilling with `sliding_window`; under full attention every step reads the whole prefix, so a spilled block is reloaded the moment it is written. Garuda warns at startup when the configuration would do that |
 | Scheduler (priority, concurrency limits, cancellation, timeouts, backpressure) | Real, tested |
-| Speculative decoding (prompt lookup, no draft model) | Real, measured — on Mixtral (25 GB, 16 GB RAM) a grounded prompt decodes **2.6× faster** (12.5 → 4.8 s/token) and an open-ended one is unaffected (13.2 → 11.6 s/token). Guesses are copied from earlier in the context; greedy output is unchanged token for token, sampled output keeps the caller's distribution. With prompt lookup the speedup is a greedy one — at `temperature = 0.8` acceptance is too low to measure a gain. With a **draft model** (`model.draft_gguf`, vocabulary-checked at startup) it pays at ordinary temperatures too: **1.7–2.0× at `temperature = 0.8`** on Mixtral against a TinyLlama-1.1B draft (9.0 → 4.6–5.3 s/token). Each sequence sizes its own lookahead to what its guesses have been winning |
-| Continuous batching — concurrent requests decode in one pass over the weights | Real, tested — ~1.6–1.8× aggregate throughput and about half the median latency at 8 concurrent, measured against one task per request |
+| Speculative decoding (prompt lookup, and draft models) | Real, measured — on Mixtral (25 GB, 16 GB RAM) a grounded prompt decodes **2.6× faster** (12.5 → 4.8 s/token) and an open-ended one is unaffected (13.2 → 11.6 s/token). Guesses are copied from earlier in the context; greedy output is unchanged token for token, sampled output keeps the caller's distribution. With prompt lookup the speedup is a greedy one — at `temperature = 0.8` acceptance is too low to measure a gain. With a **draft model** (`model.draft_gguf`, vocabulary-checked at startup) it pays at ordinary temperatures too: **1.7–2.0× at `temperature = 0.8`** on Mixtral against a TinyLlama-1.1B draft (9.0 → 4.6–5.3 s/token). Each sequence sizes its own lookahead to what its guesses have been winning |
+| Continuous batching — concurrent requests decode in one pass over the weights | Real, tested — ~1.6–1.8× aggregate throughput and about half the median latency at 8 concurrent, measured against one task per request. On a checkpoint larger than RAM it does not engage: three concurrent requests measured *slower* than three sequential ones, because the scheduler does not present them to `logits_batch` in lockstep. See [What is still missing](#what-is-still-missing) |
 | Chunked prefill — a long prompt does not stall the clients already streaming | Real, tested — the worst inter-token gap a streamer sees while a 1474-token prompt is absorbed drops from ~13 s to ~0.2 s. Chunk size is measured from what a decode step actually costs, not fixed |
 | OpenAI + Ollama + Anthropic + llama.cpp + TGI APIs, SSE / NDJSON / WebSocket | Real, tested |
 | Dequantisation: F32 / F16 / Q4_0 / Q8_0 / Q2_K–Q6_K | Real, tested (runs Q2_K…Q5_K_M models) |
@@ -277,6 +279,12 @@ graph LR
     F32 --> Matmul
 ```
 
+A note on reading these figures: the absolute numbers drift with whatever else the
+machine happens to be holding — the same configuration measured 7 s one afternoon and
+5.5 s the next morning, after 8 GB of swap pressure had been released. Every comparison
+below alternates between the conditions being compared, back to back, so that drift
+cannot be what the difference is made of.
+
 | Prefetch | Seconds per forward pass, Qwen3.8-27B Q4_K_M |
 |---|---|
 | off | 27.1 / 30.7 / 27.6 |
@@ -394,7 +402,7 @@ What that buys, and what it costs:
   shape. Only the 16 attention blocks store keys and values; the 48 recurrent
   blocks store nothing per position. They still *count* positions, because the
   runtime requires every layer of a sequence to advance together.
-- **A sequence carries ~144 MB of recurrent state** regardless of its length — the
+- **A sequence carries ~149 MB of recurrent state** regardless of its length — the
   same at ten tokens as at a hundred thousand. That is charged to the prompt cache's
   byte budget, so `memory.prompt_cache` has to exceed it before a prompt can be
   cached at all; Garuda warns at startup when it does not.
@@ -403,20 +411,21 @@ What that buys, and what it costs:
   time on. Verifying guesses means being able to discard the rejected ones, and no
   arithmetic takes a token back out of a recurrent summary, so the state is copied on
   the way in instead: one copy per position, held for the length of a round. Measured
-  on the same 10-token reply: **152 s** with none, **108 s** with prompt lookup, and
-  **58 s** with a Qwen3.5-0.8B draft — output identical token for token. A draft has
+  on the same 10-token reply: **152 s** with none, **108 s** with prompt lookup, **58 s**
+  with a Qwen3.5-0.8B draft, and **32 s** once the streaming path below is doing the
+  reading — output identical token for token throughout. A draft has
   to share the target's vocabulary, which in practice means a smaller model from the
   same family.
 - **Vision is not supported.** Qwen3.8-27B is a vision-language model; its image
   tower ships as a separate `mmproj-*.gguf` and there is no image input path here.
   The text half is complete.
 
-On a 16 GB machine a forward pass over this checkpoint takes **~12 s** — every token
-is another pass over 19 GB of memory-mapped weights, and unlike Mixtral there are no
-experts to skip: a dense 27B touches all of it. That figure is with block prefetching
-on (`runtime.prefetch = true`, the default in that config); without it the same pass
-takes 27–31 s, because demand paging fetches the weights a page at a time with the CPU
-idle in between. See [Streaming a model larger than RAM](#streaming-a-model-larger-than-ram).
+On a 16 GB machine a forward pass over this checkpoint takes **3.6–3.8 s** — every
+token is another pass over 19 GB of weights, and unlike Mixtral there are no experts to
+skip: a dense 27B touches all of it. That figure is with `runtime.prefetch = true`, the
+default in that config, which streams each block past the arithmetic; without it the
+same pass takes 27–31 s, because demand paging fetches the weights a page at a time
+with the CPU idle in between. See [Streaming a model larger than RAM](#streaming-a-model-larger-than-ram).
 Budget accordingly, and use
 
 ```bash
@@ -500,7 +509,7 @@ OpenAI's envelope with the status code clients act on (`429` rate limit, `503` b
 | `POST /v1/chat/completions` | `stream: true` for SSE |
 | `POST /v1/completions` | |
 | `POST /v1/embeddings` | Real pooled hidden states, up to 256 inputs per request. Untrained, so they carry no meaning — see below |
-| `GET /v1/models` · `GET /v1/stats` · `GET /health` | Models list, measured counters, health |
+| `GET /v1/models` · `GET /v1/stats` · `GET /health` | Models list; measured counters, the context window and the sampling defaults a request inherits; health |
 | `WS /v1/ws` | Bidirectional streaming with `{"cancel": true}` |
 
 **Ollama** — NDJSON streaming (not SSE), params under `options`.
