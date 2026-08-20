@@ -96,13 +96,34 @@ kv_resident_blocks = 512
 # nothing in the first case and 32 GB in the second.
 prompt_cache_entries = 64
 prompt_cache = "512MB"
+# Weights to hold in buffers this process owns rather than leaving to the page cache,
+# for a checkpoint larger than RAM. "0" pins nothing, which is the default.
+#
+# Small is what pays. Measured on Qwen3.8-27B Q4_K_M (19 GB, 16 GB machine), seconds
+# per forward pass: 12.5 with none pinned, 11.8 at 2 GB, 13.7 at 6 GB, 25.8 at 9 GB.
+# Owned memory competes with the page cache and gets compressed or swapped once the
+# machine is tight, while a mapped weight is a clean page the kernel can drop for free
+# and read back sequentially. 2 GB covers the output head — which every token reads in
+# full — plus a block; past that it backfires.
+weight_cache = "0"
 # Cold archive tier. Empty disables L3.
 archive_path = ""
 kv_spill = true
 
 [runtime]
-# Compute threads. 0 uses every core.
+# Compute threads. 0 uses every core, which is not always fastest on a CPU whose cores
+# are not alike: on an 8+4 Apple Silicon machine, all twelve ran a forward pass in ~37 s
+# against ~31 s on the eight performance cores, because a slow core holding up a batch
+# costs more than it adds.
 threads = 0
+# Fetch each block's weights ahead of the pass that needs them.
+#
+# For a mixture of experts this warms the experts a predictor thinks will fire next. For
+# a dense checkpoint larger than RAM it does something more useful: the blocks that are
+# not held resident are read with the page cache bypassed, into a small ring of buffers,
+# so the bytes moving past stop evicting the ones being kept. Measured on Qwen3.8-27B:
+# 27 s per pass with this off, 3.7 s with it on. Warming is advisory either way — the
+# pass still faults or reads whatever it actually needs, so the answer cannot change.
 prefetch = true
 predictor = true
 
