@@ -86,18 +86,22 @@ graph TD
     Client([Client]) -->|REST / SSE / WS| API[axum API]
     API -->|submit| Sched[Scheduler: priority heap,<br/>bounded concurrency]
     Sched -->|one token at a time| RT[Runtime: decode loop + sampler]
+    RT <-.->|"k guesses, checked in one pass;<br/>rejected ones rolled back"| Spec["Speculation: prompt lookup,<br/>or a small checkpoint"]
 
     RT --> Embed[Embedding]
 
     subgraph Block["Transformer block — ×1 for the synthetic MoE,<br/>×N layers for a real checkpoint"]
         direction TB
         In[block input] --> AN[RMSNorm]
-        AN --> Attn["Causal attention + RoPE<br/>MHA (synthetic) / GQA (real)"]
+        AN --> Mix{token mixer}
+        Mix -->|attention block| Attn["Causal attention + RoPE<br/>MHA (synthetic) / GQA (real)"]
+        Mix -->|"3 blocks in 4 — qwen35"| DNet["Gated delta net:<br/>causal conv + delta rule"]
         Attn --> AR(("＋"))
+        DNet --> AR
         In -.->|residual| AR
         AR --> FN[RMSNorm]
         FN --> Router["Router: mixtral / deepseek / qwen<br/>synthetic engine only"]:::synthOnly
-        Router --> Experts[Top-k SwiGLU experts]
+        Router --> Experts["Top-k SwiGLU experts<br/>(a dense SwiGLU on qwen35)"]
         Experts --> FR(("＋"))
         AR -.->|residual| FR
     end
@@ -109,6 +113,7 @@ graph TD
 
     Attn <-->|read / append| KV[Paged KV cache]
     KV -.->|spill / reload| Disk[(Disk)]
+    DNet <-->|read / write| RS["Recurrent state — fixed size,<br/>whatever the sequence length"]
 
     Experts -->|load| MM[Memory manager]
     MM --> L1[L1 RAM: byte-budgeted LRU]
@@ -128,11 +133,12 @@ using a fixed Mixtral-style gate instead (see [Read this first](#read-this-first
 Likewise, GQA and the ×N layer loop are real-checkpoint-only: the synthetic engine
 is a single block with plain multi-head attention.
 
-The diagram draws the Llama-family block. A Qwen3.5-family checkpoint keeps the same
-outline — norm, token mixer, residual, norm, feed-forward, residual — but three blocks
-in four replace the attention node with a gated delta net, which reads and writes a
-fixed-size recurrent state instead of the KV cache; only the fourth block touches the
-cache at all. See [A hybrid checkpoint](#a-hybrid-checkpoint--qwen38-27b).
+The token mixer is where the architectures part. A Llama-family block always attends,
+and its keys and values pile up in the paged cache. A Qwen3.5-family block attends only
+every fourth time; the other three fold the sequence into a recurrent state that is the
+same size at a hundred thousand tokens as at ten — which is why a hybrid checkpoint's
+KV cache is a quarter the size, and why its sequences cannot be rewound without a copy
+taken on the way in (see [A hybrid checkpoint](#a-hybrid-checkpoint--qwen38-27b)).
 
 **Expert streaming** means what it says: a token pulls in only the `top_k` experts
 it routes to, through the tiered cache — not the whole layer. The predictor learns
@@ -249,6 +255,27 @@ So `runtime.prefetch` now means something for a dense model too: three backgroun
 threads that hand the kernel whole blocks to read ahead of the pass. A block's tensors
 are written together by the converter, so warming one is a single large sequential
 read — the access pattern the drive is fast at.
+
+Where a block's weights come from, and who fetched them:
+
+```mermaid
+graph LR
+    Pass["Forward pass:<br/>block l, then l+1, …"] -->|"needs block l"| Where{"where do<br/>its bytes live?"}
+
+    Where -->|"resident tier —<br/>memory.weight_cache"| Owned["Buffers this process owns,<br/>read once at load"]
+    Where -->|streamed tier| Ring["Ring of 3 slots — one is<br/>borrowed while the block computes"]
+    Where -->|"mmap = false"| F32["Expanded to f32 in RAM"]
+
+    Readers["Reader threads"] -->|"pread, F_NOCACHE:<br/>the page cache never sees it"| Ring
+    Disk[(Checkpoint on disk)] --> Readers
+    Pass -.->|"hint l+1 … l+3"| Readers
+
+    Fallback["Page-cache prefetcher —<br/>when the file cannot be reopened"] -.->|madvise WILLNEED| Disk
+
+    Owned --> Matmul[Quantised matmul]
+    Ring --> Matmul
+    F32 --> Matmul
+```
 
 | Prefetch | Seconds per forward pass, Qwen3.8-27B Q4_K_M |
 |---|---|
